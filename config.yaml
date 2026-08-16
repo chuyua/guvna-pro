@@ -36,41 +36,23 @@ providers:
     models:
       - gemini-2.5-flash
       - gemini-3-flash-preview
+  # --- Orcarouter: aggregator with big-context free tiers (adaptor appends /v1).
+  # Prefixes let clients call any catalog model directly as <prefix>/<model>,
+  # e.g. orcarouter/free, openai/gpt-5.6-luna. ---
+  - name: orcarouter
+    type: openai
+    base_url: https://api.orcarouter.ai
+    key_env: ORCA_1_KEY
+    prefixes:
+      - orcarouter
+      - openai
+      - anthropic
+      - google
+    models:
+      - orcarouter/free
+      - deepseek/deepseek-v4-flash-free
+      - qwen/qwen3.8-27b-free
 
-# Chains: named routes of (provider, model) steps. First successful step serves.
-# Clients send a chain name or any model name below; unknown names hit default_chain.
-chains:
-  - name: free
-    steps:
-      - provider: bazaarlink
-        model: qwen/qwen3.7-flash:free
-      - provider: bazaarlink
-        model: deepseek/deepseek-v4-flash:free
-      - provider: groq
-        model: llama-3.3-70b-versatile
-  - name: fast
-    steps:
-      - provider: groq
-        model: llama-3.3-70b-versatile
-      - provider: groq
-        model: gpt-oss-120b
-      - provider: bazaarlink
-        model: qwen/qwen3.7-flash:free
-  - name: smart
-    steps:
-      - provider: gemini
-        model: gemini-2.5-flash
-      - provider: gemini
-        model: gemini-3-flash-preview
-      - provider: groq
-        model: llama-3.3-70b-versatile
-  - name: coder
-    steps:
-      - provider: mistral
-        model: codestral-latest
-      - provider: groq
-        model: llama-3.3-70b-versatile
-      - provider: gemini
-        model: gemini-2.5-flash
-
-default_chain: free
+# No default chains. Every chain is created per use case by the client
+# (POST /v1/chains, persisted to <data-dir>/chains.yaml). Clients may also
+# call provider-prefixed model names directly, e.g. "groq/llama-3.3-70b-versatile".

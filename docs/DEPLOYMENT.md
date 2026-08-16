@@ -54,6 +54,25 @@ bruvroute-cli logs -n 100     # tail the in-memory ring
 
 Admin endpoints (`/admin/status`, `/admin/logs`) are admin-key-only; nothing new is exposed on the network.
 
+### Chains (no default chains — clients create their own)
+
+The gateway starts with **zero chains**. Clients (any valid API key — apps self-provision) create them per use case; chains persist in `/data/chains.yaml` (volume) and survive restarts. Config-defined chains also load (merged, conflicts skipped with a warning).
+
+```sh
+# API (client key)
+curl -X POST https://gateway.example.com:9443/v1/chains \
+  -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"myfree","steps":[{"provider":"bazaarlink","model":"qwen/qwen3.7-flash:free"},{"provider":"groq","model":"llama-3.3-70b-versatile"}]}'
+curl -X DELETE https://gateway.example.com:9443/v1/chains/myfree -H "Authorization: Bearer $CLIENT_KEY"
+
+# CLI (same surface, remote-capable)
+bruvroute-cli chains list
+bruvroute-cli chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
+bruvroute-cli chains rm myfree
+```
+
+Chat with a chain name, or bypass chains entirely with a provider-prefixed model (`groq/llama-3.3-70b-versatile`, or any `orcarouter`-namespaced model like `openai/gpt-5.6-luna`). Unknown model → 404 with a pointer to the creation API.
+
 ### Gotchas learned
 
 - the VPS's docker **cannot create bridge networks** (iptables setup fails) → `network_mode: host`

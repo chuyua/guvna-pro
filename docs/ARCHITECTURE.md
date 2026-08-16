@@ -13,8 +13,8 @@ app / any OpenAI-compatible client
 │  │  adaptors  │ │  pipeline     │        │
 │  └────────────┘ └───────────────┘        │
 │  ┌────────────┐ ┌───────────────┐        │
-│  │  Catalog   │ │  Telemetry    │        │
-│  │  (synced)  │ │  (SQLite)     │        │
+│  │  Chains    │ │  Telemetry    │        │
+│  │  (runtime) │ │  (SQLite)     │        │
 │  └────────────┘ └───────────────┘        │
 └───────────────┬──────────────────────────┘
                 │ outbound HTTPS
@@ -23,14 +23,17 @@ app / any OpenAI-compatible client
         └────────────────┘
 
 Separate, optional:  read-only web UI binary  (never in core)
-CLI:                bruvroute connect / status / logs (scoped tokens)
+CLI:                bruvroute status / logs / chains (local + remote over gateway)
 ```
 
 ## Components
 
 ### 1. Router (built)
 - `/v1/chat/completions` (+ `/v1/models`) OpenAI-compatible, streaming SSE passthrough, 15s keep-alives
-- **Chain routing is the core primitive**: config defines named chains = ordered (provider, model) steps. Clients send chain names or any model inside a chain; unknown names hit `default_chain`. `/v1/models` exposes chain names. First 2xx step serves; non-2xx walks to the next step; all steps failed → last upstream response propagated as-is. No silent mid-stream restarts.
+- **Chain routing is the core primitive**: chains = ordered (provider, model) steps. First 2xx step serves; non-2xx walks to the next step; all steps failed → last upstream response propagated as-is. No silent mid-stream restarts. Chains are retried (2 retries, 250ms→1s backoff) and failure-marked (3 consecutive failures → cool-off 60s doubling to 10min, auto-recovery).
+- **No default chains**: every chain is created per use case by the client via `POST /v1/chains` (any valid API key — apps self-provision; persisted to `<data-dir>/chains.yaml`, atomic rewrite). `DELETE /v1/chains/{name}` removes runtime chains. `/v1/models` lists chains (empty until the client creates them). Unknown model → 404 with a pointer to the creation API — no silent fallback.
+- **Provider-prefixed passthrough**: any model named `<prefix>/<model>` routes directly to that provider, bypassing chains. Prefixes are per-provider in config (`prefixes:` list, defaults to the provider name). If the suffix is in the provider's known models, only the suffix is sent upstream (e.g. `groq/llama-3.3-70b-versatile` → groq, model `llama-3.3-70b-versatile`); otherwise the full name is sent (namespaced catalogs, e.g. `openai/gpt-5.6-luna` → orcarouter, model `openai/gpt-5.6-luna`).
+- **Loose validation, no catalogs**: chain creation validates provider exists and model is non-empty — NOT model existence. The upstream provider IS the catalog; a stale local catalog would reject valid new models (upstream 404s at request time and the chain falls over instead).
 - **Model rewrite**: relay rewrites the request's `model` field per step (clients send logical names; upstream needs the real model). Everything else passes through untouched.
 - Provider adaptors: small per-provider interface (`Chat(ctx, body) (*http.Response, error)`), pattern from new-api's `relay_adaptor.go`. Two types built: `openai` (base + `/v1/chat/completions`) and `gemini` (base + `/v1beta/openai` + chat path — Gemini's official OpenAI-compat endpoint, passthrough no translation). Outbound requests carry `User-Agent: bruvroute/0.1` (bazaarlink throttles UA-less requests).
 - Auth: Bearer admin key (`ADMIN_KEY`) or client key (`API_KEYS`), always on; `/healthz` unauthenticated

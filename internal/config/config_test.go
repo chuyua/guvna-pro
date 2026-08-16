@@ -100,14 +100,15 @@ func TestValidateUnknownChainProvider(t *testing.T) {
 	}
 }
 
-func TestValidateMissingDefaultChain(t *testing.T) {
+func TestValidateNoChainsOK(t *testing.T) {
 	cfg, err := Load(writeTemp(t, sample))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.Chains = nil
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected no-chains error")
+	cfg.DefaultChain = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("no-chains config must validate: %v", err)
 	}
 	cfg, err = Load(writeTemp(t, sample))
 	if err != nil {
@@ -116,6 +117,18 @@ func TestValidateMissingDefaultChain(t *testing.T) {
 	cfg.DefaultChain = "missing"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected missing default chain error")
+	}
+}
+
+func TestValidateEmptyModelsOK(t *testing.T) {
+	cfg, err := Load(writeTemp(t, sample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers[0].Models = nil
+	cfg.Providers[0].Prefixes = []string{"groq"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("models-less provider must validate: %v", err)
 	}
 }
 

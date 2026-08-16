@@ -17,6 +17,7 @@ import (
 
 	"github.com/alisa/bruvroute/internal/adaptors"
 	"github.com/alisa/bruvroute/internal/auth"
+	"github.com/alisa/bruvroute/internal/chains"
 	"github.com/alisa/bruvroute/internal/config"
 	"github.com/alisa/bruvroute/internal/health"
 	"github.com/alisa/bruvroute/internal/logring"
@@ -39,13 +40,14 @@ type Server struct {
 	tm        *telemetry.Telemetry
 	hlth      *health.Tracker
 	logs      *logring.Ring
+	store     *chains.Store
 	started   time.Time
 	env       func(string) string
 	retryWait func(attempt int) time.Duration
 }
 
-func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *telemetry.Telemetry, hlth *health.Tracker, logs *logring.Ring) *Server {
-	return &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
+func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *telemetry.Telemetry, hlth *health.Tracker, logs *logring.Ring, store *chains.Store) *Server {
+	return &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
 }
 
 // defaultRetryWait backs off 250ms then 1s for the two retry attempts.
@@ -61,6 +63,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("GET /v1/models", s.auth.Middleware(http.HandlerFunc(s.handleModels)))
 	mux.Handle("POST /v1/chat/completions", s.auth.Middleware(http.HandlerFunc(s.handleChat)))
+	mux.Handle("GET /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainList)))
+	mux.Handle("POST /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainCreate)))
+	mux.Handle("DELETE /v1/chains/{name}", s.auth.Middleware(http.HandlerFunc(s.handleChainDelete)))
 	mux.Handle("GET /admin/status", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminStatus)))
 	mux.Handle("GET /admin/logs", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminLogs)))
 	return mux
@@ -89,13 +94,11 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		Uptime    string              `json:"uptime"`
 		Chains    []string            `json:"chains"`
-		Default   string              `json:"default_chain"`
 		Steps     []health.StepStatus `json:"steps"`
 		StepsDown int                 `json:"steps_down"`
 		Usage     telemetry.Stats     `json:"usage"`
 	}{Uptime: time.Since(s.started).Round(time.Second).String()}
 	resp.Chains = s.rtr.ChainNames()
-	resp.Default = s.cfg.DefaultChain
 	resp.Steps = steps
 	resp.StepsDown = stepsDown
 	resp.Usage = stats
@@ -140,6 +143,94 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleChainList returns the current chains (config + runtime) with sources.
+func (s *Server) handleChainList(w http.ResponseWriter, r *http.Request) {
+	resp := struct {
+		Chains []chainInfo `json:"chains"`
+	}{}
+	for _, c := range s.rtr.ListChains() {
+		steps := make([]chainStep, 0, len(c.Steps))
+		for _, st := range c.Steps {
+			steps = append(steps, chainStep{Provider: st.Provider, Model: st.Model})
+		}
+		resp.Chains = append(resp.Chains, chainInfo{Name: c.Name, Source: c.Source, Steps: steps})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+type chainStep struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+type chainInfo struct {
+	Name   string      `json:"name"`
+	Source string      `json:"source"`
+	Steps  []chainStep `json:"steps"`
+}
+
+type chainCreateRequest struct {
+	Name  string      `json:"name"`
+	Steps []chainStep `json:"steps"`
+}
+
+// handleChainCreate adds a runtime chain and persists it. Any valid key
+// (admin or client) may create chains — apps self-provision their routes.
+func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
+	var req chainCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
+		return
+	}
+	steps := make([]router.Step, 0, len(req.Steps))
+	for _, st := range req.Steps {
+		steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model})
+	}
+	if err := s.rtr.AddChain(req.Name, steps); err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "already exists") {
+			status = http.StatusConflict
+		}
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), status)
+		return
+	}
+	if s.store != nil {
+		if err := s.store.Save(s.rtr); err != nil {
+			log.Printf("chains: persist failed: %v", err)
+			http.Error(w, `{"error":{"message":"chain added but not persisted"}}`, http.StatusInternalServerError)
+			return
+		}
+	}
+	log.Printf("chains: created %q (%d steps)", req.Name, len(steps))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(chainInfo{Name: req.Name, Source: "runtime", Steps: req.Steps})
+}
+
+// handleChainDelete removes a runtime chain. Config-defined chains are
+// refused — they live in config.yaml.
+func (s *Server) handleChainDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.rtr.RemoveChain(name); err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), status)
+		return
+	}
+	if s.store != nil {
+		if err := s.store.Save(s.rtr); err != nil {
+			log.Printf("chains: persist failed: %v", err)
+			http.Error(w, `{"error":{"message":"chain removed but not persisted"}}`, http.StatusInternalServerError)
+			return
+		}
+	}
+	log.Printf("chains: deleted %q", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type chatRequest struct {
 	Model  string `json:"model"`
 	Stream bool   `json:"stream"`
@@ -156,9 +247,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
 	}
-	chain, steps, ok := s.rtr.Resolve(req.Model)
-	if !ok {
-		http.Error(w, `{"error":{"message":"no default chain configured"}}`, http.StatusInternalServerError)
+	chain, steps, err := s.rtr.Resolve(req.Model)
+	if err != nil {
+		if errors.Is(err, router.ErrNotFound) {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"unknown chain or model %q — create a chain via POST /v1/chains or use a provider-prefixed model"}}`, req.Model), http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":{"message":"resolve failed"}}`, http.StatusInternalServerError)
 		return
 	}
 	log.Printf("chat: chain=%s model=%q steps=%d stream=%v", chain, req.Model, len(steps), req.Stream)

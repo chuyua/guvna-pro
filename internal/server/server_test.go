@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alisa/bruvroute/internal/auth"
+	"github.com/alisa/bruvroute/internal/chains"
 	"github.com/alisa/bruvroute/internal/config"
 	"github.com/alisa/bruvroute/internal/health"
 	"github.com/alisa/bruvroute/internal/logring"
@@ -22,14 +23,14 @@ type testEnv map[string]string
 
 func (e testEnv) get(k string) string { return e[k] }
 
-func testServer(t *testing.T, providers []config.Provider, chains []config.Chain, env map[string]string) (*Server, *httptest.Server) {
+func testServer(t *testing.T, providers []config.Provider, ch []config.Chain, env map[string]string) (*Server, *httptest.Server) {
 	t.Helper()
-	return testServerDefault(t, providers, chains, env, "main")
+	return testServerDefault(t, providers, ch, env, "main")
 }
 
-func testServerDefault(t *testing.T, providers []config.Provider, chains []config.Chain, env map[string]string, defaultChain string) (*Server, *httptest.Server) {
+func testServerDefault(t *testing.T, providers []config.Provider, ch []config.Chain, env map[string]string, defaultChain string) (*Server, *httptest.Server) {
 	t.Helper()
-	cfg := &config.Config{Port: 20128, Providers: providers, Chains: chains, DefaultChain: defaultChain}
+	cfg := &config.Config{Port: 20128, Providers: providers, Chains: ch, DefaultChain: defaultChain}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +41,8 @@ func testServerDefault(t *testing.T, providers []config.Provider, chains []confi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { tm.Close() })
-	s := New(cfg, rtr, a, tm, health.New(), logring.New(64))
+	store := chains.New(t.TempDir())
+	s := New(cfg, rtr, a, tm, health.New(), logring.New(64), store)
 	s.env = testEnv(env).get
 	s.retryWait = func(int) time.Duration { return 0 }
 	ts := httptest.NewServer(s.Handler())
@@ -512,5 +514,115 @@ func TestAdminLogsReturnsRecentLines(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("logs status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func postChain(t *testing.T, ts *httptest.Server, token string, name string, steps []chainStep) *http.Response {
+	t.Helper()
+	body, _ := json.Marshal(chainCreateRequest{Name: name, Steps: steps})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chains", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestChainsCreateWithClientKey(t *testing.T) {
+	up := completionUpstream(t, http.StatusOK, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`, false)
+	defer up.Close()
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	resp := postChain(t, ts, "client-1", "mychain", []chainStep{{Provider: "a", Model: "m"}})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", resp.StatusCode)
+	}
+	// Chat through the new chain.
+	chat := doChat(t, ts, "mychain", false)
+	defer chat.Body.Close()
+	if chat.StatusCode != http.StatusOK {
+		t.Fatalf("chat via new chain = %d, want 200", chat.StatusCode)
+	}
+}
+
+func TestChainsCreateDuplicateConflict(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	if resp := postChain(t, ts, "client-1", "dup", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first create = %d, want 201", resp.StatusCode)
+	}
+	resp := postChain(t, ts, "client-1", "dup", []chainStep{{Provider: "a", Model: "m"}})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create = %d, want 409", resp.StatusCode)
+	}
+}
+
+func TestChainsCreateRejectsBadNameAndUnknownProvider(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	if resp := postChain(t, ts, "client-1", "Bad_Name", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad name = %d, want 400", resp.StatusCode)
+	}
+	if resp := postChain(t, ts, "client-1", "okname", []chainStep{{Provider: "nope", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown provider = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestChatUnknownModelNotFound(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	resp := doChat(t, ts, "does-not-exist", false)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model chat = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestChainsDeletePersistsAndUnroutes(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	if resp := postChain(t, ts, "client-1", "temp", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create = %d, want 201", resp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/chains/temp", nil)
+	req.Header.Set("Authorization", "Bearer client-1")
+	del, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del.Body.Close()
+	if del.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete = %d, want 204", del.StatusCode)
+	}
+	chat := doChat(t, ts, "temp", false)
+	defer chat.Body.Close()
+	if chat.StatusCode != http.StatusNotFound {
+		t.Fatalf("chat after delete = %d, want 404", chat.StatusCode)
+	}
+}
+
+func TestChainsDeleteConfigChainRefused(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/chains/main", nil)
+	req.Header.Set("Authorization", "Bearer client-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("config chain delete = %d, want 400", resp.StatusCode)
 	}
 }

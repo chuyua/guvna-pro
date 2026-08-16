@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/alisa/bruvroute/internal/auth"
+	"github.com/alisa/bruvroute/internal/chains"
 	"github.com/alisa/bruvroute/internal/config"
 	"github.com/alisa/bruvroute/internal/health"
 	"github.com/alisa/bruvroute/internal/logring"
@@ -75,13 +76,17 @@ func main() {
 	defer tm.Close()
 
 	rtr := router.New(cfg)
+	chainStore := chains.New(*dataDir)
+	if err := chainStore.Load(rtr); err != nil {
+		log.Printf("chains: %v", err)
+	}
 	authn := auth.New(adminKey, clientKeys)
 	hlth := health.New()
 	ring := logring.New(512)
 	log.SetOutput(io.MultiWriter(os.Stderr, ring))
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           server.New(cfg, rtr, authn, tm, hlth, ring).Handler(),
+		Handler:           server.New(cfg, rtr, authn, tm, hlth, ring, chainStore).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

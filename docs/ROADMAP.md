@@ -10,7 +10,7 @@ Build order with definition of done per phase. No time estimates — this is a p
 
 - Go module, single static binary, HTTP server on port 20128
 - `GET /v1/models` (chain names) + `POST /v1/chat/completions`, non-streaming + SSE streaming passthrough (keep-alives, error propagation mid-stream)
-- Chain-based routing core: named chains = (provider, model) steps, model rewrite per step, fallback across steps, `default_chain` catch-all
+- Chain-based routing core: named chains = (provider, model) steps, model rewrite per step, fallback across steps, `default_chain` catch-all — **superseded (see Phase 4b): no default chains, clients create chains**
 - Two adaptor types: `openai` (bazaarlink, groq, mistral) and `gemini` (via OpenAI-compat endpoint)
 - Config-as-code YAML (providers, chains, keys from env), `~/.bruvroute/config.yaml` override
 - Auth: admin key (`ADMIN_KEY`) + client keys (`API_KEYS`), always on; `/healthz` unauthenticated
@@ -42,11 +42,20 @@ Build order with definition of done per phase. No time estimates — this is a p
 - **Not yet:** `connect` subcommand with revocable scoped tokens, `config`, `providers`
 - **Done when:** `bruvroute-cli status` from laptop shows real usage/health of the the VPS instance — verified live
 
+## Phase 4b — Custom chains API (DONE 2026-08-16)
+
+- **No default chains** — every chain is created per use case by the client; `/v1/models` starts empty; unknown model → 404 with a pointer to the creation API (no silent fallback)
+- `POST /v1/chains` (any valid API key — apps self-provision), `DELETE /v1/chains/{name}`, `GET /v1/chains`; persisted to `<data-dir>/chains.yaml` (atomic rewrite), merged over config at startup
+- Provider-prefixed passthrough: `<prefix>/<model>` routes directly to a provider (strip suffix when known, else full name; per-provider `prefixes:` in config)
+- Loose validation: provider must exist, model non-empty — no model-existence checks (upstream is the catalog; stale local catalogs would reject valid new models)
+- `bruvroute-cli chains list|add|rm` (local + remote)
+- **Done:** create a chain via API from the laptop, chat through it, survive a container restart — verified live on the VPS (chain `myfree` persisted across `docker restart`)
+
 ---
 
-## Phase 5 — Catalog sync
+## Phase 5 — Catalog sync (parked — superseded by loose validation)
 
-- Subscribe-sync script: pull OmniRoute MIT catalog files, normalize, diff + commit to git
+- ~~Subscribe-sync script: pull OmniRoute MIT catalog files, normalize, diff + commit to git~~ — **cancelled 2026-08-16**: catalogs go stale (orcarouter ships new free models weekly); a stale catalog rejects valid new models — worse than a typo failing at request time. The upstream provider IS the catalog for a single-user gateway. Revisit only if chain creation needs model discovery/completion.
 - `bruvroute providers list` / `providers test` CLI
 - Free-tier health flags (per-provider hasFree + freeNote from catalog)
 - **Done when:** a fresh sync produces a clean git commit and provider list is queryable

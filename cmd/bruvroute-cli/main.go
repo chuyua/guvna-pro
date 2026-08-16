@@ -1,13 +1,17 @@
-// bruvroute-cli — local and remote status/logs for a BruvRoute gateway.
-// Local: talks to http://127.0.0.1:20128 (or BRUVROUTE_URL).
+// bruvroute-cli — local and remote status, logs, and chain management for a
+// BruvRoute gateway. Local: talks to http://127.0.0.1:20128 (or BRUVROUTE_URL).
 // Remote: point --url at the gateway's HTTPS endpoint (caddy) — the admin
 // key travels as a Bearer token; no new port is exposed.
 //
 //	bruvroute-cli status [--url URL] [--token KEY]
 //	bruvroute-cli logs [-n 100] [--url URL] [--token KEY]
+//	bruvroute-cli chains [list]
+//	bruvroute-cli chains add NAME --step provider:model [--step ...]
+//	bruvroute-cli chains rm NAME
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +35,8 @@ func main() {
 		err = statusCmd(os.Args[2:])
 	case "logs":
 		err = logsCmd(os.Args[2:])
+	case "chains":
+		err = chainsCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -45,11 +51,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `bruvroute-cli — gateway status and logs
+	fmt.Fprintf(os.Stderr, `bruvroute-cli — gateway status, logs, chain management
 
 usage:
   bruvroute-cli status [flags]
   bruvroute-cli logs [-n lines] [flags]
+  bruvroute-cli chains [list]
+  bruvroute-cli chains add NAME --step provider:model [--step ...]
+  bruvroute-cli chains rm NAME
 
 flags:
   --url    gateway base URL (default: %s or $BRUVROUTE_URL)
@@ -78,31 +87,50 @@ func envOr(key, def string) string {
 }
 
 func (cf commonFlags) get(path string, out any) error {
+	return cf.do(http.MethodGet, path, nil, out)
+}
+
+// do performs an HTTP request against the gateway with the Bearer token and
+// decodes a JSON response body into out (when out is non-nil).
+func (cf commonFlags) do(method, path string, body any, out any) error {
 	if cf.token == "" {
 		return fmt.Errorf("no admin key: pass --token or set BRUVROUTE_ADMIN_KEY")
 	}
-	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(cf.url, "/")+path, nil)
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, strings.TrimRight(cf.url, "/")+path, rd)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cf.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("GET %s: %s %s", path, resp.Status, strings.TrimSpace(string(body)))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		eb, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s %s: %s %s", method, path, resp.Status, strings.TrimSpace(string(eb)))
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
 }
 
 type statusResp struct {
 	Uptime    string   `json:"uptime"`
 	Chains    []string `json:"chains"`
-	Default   string   `json:"default_chain"`
 	Steps     []step   `json:"steps"`
 	StepsDown int      `json:"steps_down"`
 	Usage     struct {
@@ -146,7 +174,6 @@ func statusCmd(args []string) error {
 	}
 
 	fmt.Printf("BruvRoute %s  (uptime %s)\n", cf.url, st.Uptime)
-	fmt.Printf("default chain: %s\n\n", st.Default)
 	fmt.Printf("chains: %s\n\n", strings.Join(st.Chains, "  "))
 
 	fmt.Printf("%-12s %-28s %8s  %s\n", "PROVIDER", "MODEL", "FAILURES", "STATE")
@@ -199,4 +226,135 @@ func printJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+type chainResp struct {
+	Chains []chainInfo `json:"chains"`
+}
+
+type chainInfo struct {
+	Name   string      `json:"name"`
+	Source string      `json:"source"`
+	Steps  []chainStep `json:"steps"`
+}
+
+type chainStep struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+func chainsCmd(args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		return chainsListCmd(args)
+	}
+	switch args[0] {
+	case "add":
+		return chainsAddCmd(args[1:])
+	case "rm", "remove":
+		return chainsRmCmd(args[1:])
+	default:
+		return fmt.Errorf("unknown chains subcommand %q (want list|add|rm)", args[0])
+	}
+}
+
+func chainsListCmd(args []string) error {
+	fs := flag.NewFlagSet("chains", flag.ExitOnError)
+	var cf commonFlags
+	parseCommon(fs, &cf)
+	fs.Parse(args)
+
+	var out chainResp
+	if err := cf.get("/v1/chains", &out); err != nil {
+		return err
+	}
+	if cf.json {
+		return printJSON(out)
+	}
+	fmt.Printf("%-20s %-8s  %s\n", "NAME", "SOURCE", "STEPS")
+	for _, c := range out.Chains {
+		steps := make([]string, 0, len(c.Steps))
+		for _, s := range c.Steps {
+			steps = append(steps, s.Provider+":"+s.Model)
+		}
+		fmt.Printf("%-20s %-8s  %s\n", c.Name, c.Source, strings.Join(steps, " -> "))
+	}
+	return nil
+}
+
+// reorderArgs moves flag tokens (and their values) before positional args so
+// Go's flag package, which stops at the first non-flag argument, still parses
+// commands like "chains add mychain --step a:b".
+func reorderArgs(args []string) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			if !strings.Contains(a, "=") && a != "-" && a != "--" {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		pos = append(pos, a)
+	}
+	return append(flags, pos...)
+}
+
+func chainsAddCmd(args []string) error {
+	var steps []chainStep
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--step" || args[i] == "-step" {
+			if i+1 >= len(args) {
+				return fmt.Errorf("--step needs provider:model")
+			}
+			p, m, found := strings.Cut(args[i+1], ":")
+			if !found || p == "" || m == "" {
+				return fmt.Errorf("bad step %q — want provider:model", args[i+1])
+			}
+			steps = append(steps, chainStep{Provider: p, Model: m})
+			i++
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	if len(steps) == 0 {
+		return fmt.Errorf("chains add needs at least one --step")
+	}
+	fs := flag.NewFlagSet("chains add", flag.ExitOnError)
+	var cf commonFlags
+	parseCommon(fs, &cf)
+	fs.Parse(reorderArgs(rest))
+
+	name := fs.Arg(0)
+	if name == "" {
+		return fmt.Errorf("chains add NAME --step provider:model [--step ...]")
+	}
+	var created chainInfo
+	if err := cf.do(http.MethodPost, "/v1/chains", map[string]any{"name": name, "steps": steps}, &created); err != nil {
+		return err
+	}
+	if cf.json {
+		return printJSON(created)
+	}
+	fmt.Printf("created chain %q (%d steps, persisted)\n", created.Name, len(created.Steps))
+	return nil
+}
+
+func chainsRmCmd(args []string) error {
+	fs := flag.NewFlagSet("chains rm", flag.ExitOnError)
+	var cf commonFlags
+	parseCommon(fs, &cf)
+	fs.Parse(reorderArgs(args))
+
+	name := fs.Arg(0)
+	if name == "" {
+		return fmt.Errorf("chains rm NAME")
+	}
+	if err := cf.do(http.MethodDelete, "/v1/chains/"+name, nil, nil); err != nil {
+		return err
+	}
+	fmt.Printf("removed chain %q\n", name)
+	return nil
 }

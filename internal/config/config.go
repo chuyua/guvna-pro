@@ -18,11 +18,12 @@ type Config struct {
 }
 
 type Provider struct {
-	Name    string   `yaml:"name"`
-	Type    string   `yaml:"type"`
-	BaseURL string   `yaml:"base_url"`
-	KeyEnv  string   `yaml:"key_env"`
-	Models  []string `yaml:"models"`
+	Name     string   `yaml:"name"`
+	Type     string   `yaml:"type"`
+	BaseURL  string   `yaml:"base_url"`
+	KeyEnv   string   `yaml:"key_env"`
+	Models   []string `yaml:"models"`
+	Prefixes []string `yaml:"prefixes"`
 }
 
 type Chain struct {
@@ -77,7 +78,8 @@ func (c *Config) Validate() error {
 		}
 	}
 	if len(c.Chains) == 0 {
-		return errors.New("no chains defined")
+		// chains are optional: clients create their own per use case
+		return nil
 	}
 	chainNames := make(map[string]bool, len(c.Chains))
 	for _, ch := range c.Chains {
@@ -100,10 +102,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	if c.DefaultChain == "" {
-		return errors.New("default_chain is required")
-	}
-	if !chainNames[c.DefaultChain] {
+	if c.DefaultChain != "" && !chainNames[c.DefaultChain] {
 		return fmt.Errorf("default_chain %q not found", c.DefaultChain)
 	}
 	return nil
