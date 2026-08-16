@@ -1,0 +1,27 @@
+# BruvRoute on the VPS. Secrets come from .env (see .env.the VPS.example).
+# host network: the VPS's docker can't create bridge networks (no iptables),
+# and caddy (also host-network) reaches the app on 127.0.0.1:20128.
+services:
+  bruvroute:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: bruvroute:latest
+    container_name: bruvroute
+    restart: unless-stopped
+    mem_limit: 400m
+    network_mode: host
+    environment:
+      - GOMEMLIMIT=256MiB
+    env_file: .env
+    volumes:
+      - bruvroute-data:/data
+    healthcheck:
+      test: ["CMD", "/bruvroute", "-healthcheck", "-config", "/config.yaml"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  bruvroute-data:

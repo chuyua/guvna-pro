@@ -1,0 +1,76 @@
+# BruvRoute config — config-as-code, in git. Keys live in env only (.env.providers),
+# referenced here by name. See docs/ARCHITECTURE.md.
+port: 20128
+
+providers:
+  # --- Bazaarlink: OpenRouter-style free models ---
+  - name: bazaarlink
+    type: openai
+    base_url: https://bazaarlink.ai/api
+    key_env: BAZAARLINK_1_KEY
+    models:
+      - qwen/qwen3.7-flash:free
+      - deepseek/deepseek-v4-flash:free
+  # --- Groq: fast, generous free tier ---
+  - name: groq
+    type: openai
+    base_url: https://api.groq.com/openai
+    key_env: GROQ_1_KEY
+    models:
+      - llama-3.3-70b-versatile
+      - gpt-oss-120b
+  # --- Mistral: coder models ---
+  - name: mistral
+    type: openai
+    base_url: https://api.mistral.ai
+    key_env: MISTRAL_1_KEY
+    models:
+      - codestral-latest
+      - devstral-latest
+      - mistral-small-latest
+  # --- Gemini (Google AI Studio) via its OpenAI-compatible endpoint ---
+  - name: gemini
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com
+    key_env: GEMINI_1_KEY
+    models:
+      - gemini-2.5-flash
+      - gemini-3-flash-preview
+
+# Chains: named routes of (provider, model) steps. First successful step serves.
+# Clients send a chain name or any model name below; unknown names hit default_chain.
+chains:
+  - name: free
+    steps:
+      - provider: bazaarlink
+        model: qwen/qwen3.7-flash:free
+      - provider: bazaarlink
+        model: deepseek/deepseek-v4-flash:free
+      - provider: groq
+        model: llama-3.3-70b-versatile
+  - name: fast
+    steps:
+      - provider: groq
+        model: llama-3.3-70b-versatile
+      - provider: groq
+        model: gpt-oss-120b
+      - provider: bazaarlink
+        model: qwen/qwen3.7-flash:free
+  - name: smart
+    steps:
+      - provider: gemini
+        model: gemini-2.5-flash
+      - provider: gemini
+        model: gemini-3-flash-preview
+      - provider: groq
+        model: llama-3.3-70b-versatile
+  - name: coder
+    steps:
+      - provider: mistral
+        model: codestral-latest
+      - provider: groq
+        model: llama-3.3-70b-versatile
+      - provider: gemini
+        model: gemini-2.5-flash
+
+default_chain: free

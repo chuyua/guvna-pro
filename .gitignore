@@ -1,0 +1,5 @@
+# Secrets — never commit
+.env*
+!.env.example
+!deploy/.env.the VPS.example
+*.db
