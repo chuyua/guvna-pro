@@ -45,6 +45,8 @@ providers:
     models:
       - gemini-2.5-flash
       - gemini-3-flash-preview
+      - gemma-4-31b-it
+      - gemma-4-26b-a4b-it
   # --- Orcarouter: aggregator with big-context free tiers (adaptor appends /v1).
   # Prefixes let clients call any catalog model directly as <prefix>/<model>,
   # e.g. orcarouter/free, openai/gpt-5.6-luna. ---
