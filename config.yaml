@@ -24,6 +24,11 @@ providers:
     models:
       - llama-3.3-70b-versatile
       - gpt-oss-120b
+      - openai/gpt-oss-20b
+      - openai/gpt-oss-120b
+      - qwen/qwen3.6-27b
+      - groq/compound
+      - llama-3.1-8b-instant
   # --- Mistral: coder models ---
   - name: mistral
     type: openai
@@ -34,6 +39,11 @@ providers:
       - codestral-latest
       - devstral-latest
       - mistral-small-latest
+      - mistral-large-latest
+      - mistral-medium-3-5
+      - mistral-small-2603
+      - ministral-3b-2512
+      - ministral-8b-2512
   # --- Gemini (Google AI Studio) via its OpenAI-compatible endpoint ---
   - name: gemini
     type: gemini
