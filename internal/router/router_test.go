@@ -147,6 +147,25 @@ func TestAddChainLooseValidation(t *testing.T) {
 	}
 }
 
+func TestAddChainParamsValidation(t *testing.T) {
+	r := testRouter(t)
+	good := map[string]any{"reasoning_effort": "high", "max_tokens": 8192, "stop": []any{"END"}, "temperature": 0.7}
+	if err := r.AddChain("tuned", []Step{{Provider: "groq", Model: "x", Params: good}}); err != nil {
+		t.Fatalf("valid params rejected: %v", err)
+	}
+	for name, params := range map[string]map[string]any{
+		"reserved-model":    {"model": "gemini-2.5-flash"},
+		"reserved-stream":   {"stream": true},
+		"reserved-messages": {"messages": []any{}},
+		"bad-char":          {"max tokens": 100},
+		"empty-key":         {"": 1},
+	} {
+		if err := r.AddChain(name, []Step{{Provider: "groq", Model: "x", Params: params}}); err == nil {
+			t.Fatalf("params %#v accepted", params)
+		}
+	}
+}
+
 func TestAddChainResolvesAndPersists(t *testing.T) {
 	r := testRouter(t)
 	if err := r.AddChain("custom", []Step{{Provider: "gemini", Model: "gemini-2.5-flash"}}); err != nil {

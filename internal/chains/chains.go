@@ -10,15 +10,19 @@ import (
 )
 
 type fileFormat struct {
-	Chains []fileChain `yaml:"chains"`
+	Version int         `yaml:"version,omitempty"`
+	Chains  []fileChain `yaml:"chains"`
+}
+
+type fileStep struct {
+	Provider string         `yaml:"provider"`
+	Model    string         `yaml:"model"`
+	Params   map[string]any `yaml:"params,omitempty"`
 }
 
 type fileChain struct {
-	Name  string `yaml:"name"`
-	Steps []struct {
-		Provider string `yaml:"provider"`
-		Model    string `yaml:"model"`
-	} `yaml:"steps"`
+	Name  string     `yaml:"name"`
+	Steps []fileStep `yaml:"steps"`
 }
 
 // Store persists runtime chains to <data-dir>/chains.yaml with atomic rewrites.
@@ -47,7 +51,7 @@ func (s *Store) Load(r *router.Router) error {
 	for _, ch := range f.Chains {
 		steps := make([]router.Step, 0, len(ch.Steps))
 		for _, st := range ch.Steps {
-			steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model})
+			steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model, Params: st.Params})
 		}
 		if err := r.AddChain(ch.Name, steps); err != nil {
 			fmt.Printf("chains: skipping %q from chains.yaml: %v\n", ch.Name, err)
@@ -59,17 +63,11 @@ func (s *Store) Load(r *router.Router) error {
 // Save writes the current runtime chains atomically (tmp file + rename).
 func (s *Store) Save(r *router.Router) error {
 	runtime := r.RuntimeChains()
-	f := fileFormat{Chains: make([]fileChain, 0, len(runtime))}
+	f := fileFormat{Version: 2, Chains: make([]fileChain, 0, len(runtime))}
 	for name, steps := range runtime {
-		ch := fileChain{Name: name, Steps: make([]struct {
-			Provider string `yaml:"provider"`
-			Model    string `yaml:"model"`
-		}, 0, len(steps))}
+		ch := fileChain{Name: name, Steps: make([]fileStep, 0, len(steps))}
 		for _, st := range steps {
-			ch.Steps = append(ch.Steps, struct {
-				Provider string `yaml:"provider"`
-				Model    string `yaml:"model"`
-			}{Provider: st.Provider, Model: st.Model})
+			ch.Steps = append(ch.Steps, fileStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
 		}
 		f.Chains = append(f.Chains, ch)
 	}

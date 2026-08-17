@@ -15,6 +15,7 @@ var ErrNotFound = errors.New("no chain or model matches")
 type Step struct {
 	Provider string
 	Model    string
+	Params   map[string]any
 }
 
 type Router struct {
@@ -44,7 +45,7 @@ func New(cfg *config.Config) *Router {
 func stepsFromConfig(steps []config.Step) []Step {
 	out := make([]Step, 0, len(steps))
 	for _, s := range steps {
-		out = append(out, Step{Provider: s.Provider, Model: s.Model})
+		out = append(out, Step{Provider: s.Provider, Model: s.Model, Params: s.Params})
 	}
 	return out
 }
@@ -74,6 +75,9 @@ func (r *Router) AddChain(name string, steps []Step) error {
 		}
 		if s.Model == "" {
 			return fmt.Errorf("step for %q has no model", s.Provider)
+		}
+		if err := config.ValidateStepParams(s.Params); err != nil {
+			return fmt.Errorf("step for %q: %w", s.Provider, err)
 		}
 	}
 	r.mu.Lock()

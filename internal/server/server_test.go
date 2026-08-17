@@ -713,3 +713,150 @@ func TestAdminStatusShowsKeys(t *testing.T) {
 		t.Errorf("key1 state = %q, want healthy", out.Keys[1].State)
 	}
 }
+
+// captureUpstream serves 200 and records the raw request body it received.
+func captureUpstream(t *testing.T, bodies chan []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies <- raw
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+}
+
+func bodyField(t *testing.T, body []byte, field string) any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m[field]
+}
+
+func TestStepParamsMergedFillMissing(t *testing.T) {
+	bodies := make(chan []byte, 1)
+	up := captureUpstream(t, bodies)
+	defer up.Close()
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{
+		{Provider: "a", Model: "m-a", Params: map[string]any{"reasoning_effort": "high", "max_tokens": 8192}},
+	}}}
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+
+	// Client sends neither field — step params must fill both.
+	resp := doChat(t, ts, "main", false)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Bruvroute-Step"); got != "a/m-a" {
+		t.Errorf("X-Bruvroute-Step = %q, want a/m-a", got)
+	}
+	body := <-bodies
+	if bodyField(t, body, "reasoning_effort") != "high" {
+		t.Errorf("reasoning_effort not filled: %s", body)
+	}
+	if bodyField(t, body, "max_tokens") != float64(8192) {
+		t.Errorf("max_tokens not filled: %s", body)
+	}
+}
+
+func TestStepParamsClientWins(t *testing.T) {
+	bodies := make(chan []byte, 1)
+	up := captureUpstream(t, bodies)
+	defer up.Close()
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{
+		{Provider: "a", Model: "m-a", Params: map[string]any{"max_tokens": 8192}},
+	}}}
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+
+	body, _ := json.Marshal(map[string]any{"model": "main", "stream": false, "max_tokens": 2048})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer client-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := <-bodies
+	if bodyField(t, got, "max_tokens") != float64(2048) {
+		t.Errorf("client max_tokens overridden by step param: %s", got)
+	}
+}
+
+func TestStepParamsStreamAndModelNeverMerged(t *testing.T) {
+	up := completionUpstream(t, http.StatusOK, `{"choices":[{}]}`, false)
+	defer up.Close()
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	// Reserved keys are rejected at chain creation, so a config chain with
+	// them must fail config validation — the gateway never relays them.
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{
+		{Provider: "a", Model: "m-a", Params: map[string]any{"stream": true}},
+	}}}
+	cfg := &config.Config{Port: 20128, Providers: providers, Chains: chains, DefaultChain: "main"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("config with reserved param key accepted")
+	}
+}
+
+func TestChainsCreateParamsRejectedReserved(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	resp := postChain(t, ts, "client-1", "bad", []chainStep{{Provider: "a", Model: "m", Params: map[string]any{"messages": []any{}}}})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create with reserved param = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestChainsCreateEchoesParams(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
+	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+
+	params := map[string]any{"reasoning_effort": "high", "max_tokens": 8192}
+	resp := postChain(t, ts, "client-1", "tuned", []chainStep{{Provider: "a", Model: "m", Params: params}})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", resp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/chains", nil)
+	req.Header.Set("Authorization", "Bearer client-1")
+	lresp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lresp.Body.Close()
+	var out struct {
+		Chains []struct {
+			Name  string `json:"name"`
+			Steps []struct {
+				Provider string         `json:"provider"`
+				Model    string         `json:"model"`
+				Params   map[string]any `json:"params"`
+			} `json:"steps"`
+		} `json:"chains"`
+	}
+	if err := json.NewDecoder(lresp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range out.Chains {
+		if c.Name != "tuned" {
+			continue
+		}
+		found = true
+		if len(c.Steps) != 1 || c.Steps[0].Params["reasoning_effort"] != "high" {
+			t.Fatalf("params not echoed: %+v", c.Steps)
+		}
+	}
+	if !found {
+		t.Fatal("chain tuned not listed")
+	}
+}

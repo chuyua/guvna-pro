@@ -82,8 +82,35 @@ type Chain struct {
 }
 
 type Step struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
+	Provider string         `yaml:"provider"`
+	Model    string         `yaml:"model"`
+	Params   map[string]any `yaml:"params,omitempty"`
+}
+
+// ParamsExcluded lists request-body fields that step params may never set.
+// model is rewritten by the gateway; stream is always the client's call;
+// messages would replace the conversation wholesale.
+var ParamsExcluded = map[string]bool{"model": true, "stream": true, "messages": true}
+
+// ValidateStepParams checks a step's params map: non-empty keys, safe field
+// names (alphanumeric + underscore), and no excluded fields. Values are
+// intentionally unconstrained — the gateway doesn't know model catalogs and
+// providers decide whether to accept or ignore a field.
+func ValidateStepParams(params map[string]any) error {
+	for k := range params {
+		if k == "" {
+			return errors.New("step params: empty key")
+		}
+		if ParamsExcluded[k] {
+			return fmt.Errorf("step params: %q is not allowed (reserved by the gateway)", k)
+		}
+		for _, r := range k {
+			if r != '_' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+				return fmt.Errorf("step params: key %q must be alphanumeric + underscore", k)
+			}
+		}
+	}
+	return nil
 }
 
 func Load(path string) (*Config, error) {
@@ -165,6 +192,9 @@ func (c *Config) Validate() error {
 			}
 			if s.Model == "" {
 				return fmt.Errorf("chain %q: step for %q has no model", ch.Name, s.Provider)
+			}
+			if err := ValidateStepParams(s.Params); err != nil {
+				return fmt.Errorf("chain %q: step for %q: %w", ch.Name, s.Provider, err)
 			}
 		}
 	}

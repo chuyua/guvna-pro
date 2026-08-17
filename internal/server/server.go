@@ -166,7 +166,7 @@ func (s *Server) handleChainList(w http.ResponseWriter, r *http.Request) {
 	for _, c := range s.rtr.ListChains() {
 		steps := make([]chainStep, 0, len(c.Steps))
 		for _, st := range c.Steps {
-			steps = append(steps, chainStep{Provider: st.Provider, Model: st.Model})
+			steps = append(steps, chainStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
 		}
 		resp.Chains = append(resp.Chains, chainInfo{Name: c.Name, Source: c.Source, Steps: steps})
 	}
@@ -175,8 +175,9 @@ func (s *Server) handleChainList(w http.ResponseWriter, r *http.Request) {
 }
 
 type chainStep struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider string         `json:"provider"`
+	Model    string         `json:"model"`
+	Params   map[string]any `json:"params,omitempty"`
 }
 
 type chainInfo struct {
@@ -200,7 +201,7 @@ func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	steps := make([]router.Step, 0, len(req.Steps))
 	for _, st := range req.Steps {
-		steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model})
+		steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model, Params: st.Params})
 	}
 	if err := s.rtr.AddChain(req.Name, steps); err != nil {
 		status := http.StatusBadRequest
@@ -339,7 +340,7 @@ func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.
 		pool, _ = keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine)
 		s.pools[step.Provider] = pool
 	}
-	payload := withModel(body, step.Model)
+	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
 	for attempt := 0; attempt <= retries; attempt++ {
 		if attempt > 0 && s.retryWait != nil {
@@ -412,6 +413,34 @@ func withModel(body []byte, model string) []byte {
 	return out
 }
 
+// mergeParams applies a step's params as fill-missing defaults: a param is set
+// on the body only when the client didn't supply that field. Explicit client
+// values always win. The body is returned unchanged on any parse failure.
+func mergeParams(body []byte, params map[string]any) []byte {
+	if len(params) == 0 {
+		return body
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	for k, v := range params {
+		if _, present := m[k]; present {
+			continue
+		}
+		enc, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		m[k] = enc
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func (s *Server) provider(name string) (config.Provider, bool) {
 	for _, p := range s.cfg.Providers {
 		if p.Name == name {
@@ -449,6 +478,7 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 		in, out := telemetry.ParseUsage(body)
 		s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.Header().Set("X-Bruvroute-Step", step.Provider+"/"+step.Model)
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
 		return
@@ -465,6 +495,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Bruvroute-Step", step.Provider+"/"+step.Model)
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
 
