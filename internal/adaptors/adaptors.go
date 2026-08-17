@@ -10,8 +10,10 @@ package adaptors
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/alisa/bruvroute/internal/config"
 )
@@ -25,8 +27,36 @@ type Adaptor interface {
 	Chat(ctx context.Context, body []byte) (*http.Response, error)
 }
 
+var defaultDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+
+// preferV4DialContext dials IPv4 when A records exist. Some networks serve
+// dead AAAA records (e.g. the the VPS VPS behind a DNS virtual gateway: AAAA
+// TCP connects but TLS never completes), which Go's Happy Eyeballs prefers and
+// turns into EOF/timeouts. Falling back to the default dialer when the host is
+// an IP literal or has no A records keeps v6-only hosts working.
+func preferV4DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(host) != nil {
+		return defaultDialer.DialContext(ctx, network, addr)
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil || len(ips) == 0 {
+		return defaultDialer.DialContext(ctx, network, addr)
+	}
+	return defaultDialer.DialContext(ctx, "tcp4", net.JoinHostPort(ips[0].String(), port))
+}
+
 // Client is shared across adaptors and reused for keep-alive.
-var Client = &http.Client{Timeout: 0} // no overall timeout; streaming may run long
+var Client = &http.Client{
+	Timeout:   0, // no overall timeout; streaming may run long
+	Transport: preferV4Transport(),
+}
+
+func preferV4Transport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = preferV4DialContext
+	return t
+}
 
 type openAICompat struct {
 	name string
