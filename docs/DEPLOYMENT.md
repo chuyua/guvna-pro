@@ -14,10 +14,27 @@ Facts (verified 2026-08-14): Debian 13 trixie, x86_64, 1 core, 967MiB RAM (~281M
 
 ### Layout on the VPS
 
-- `/home/alex/bruvroute/docker-compose.yml` + `.env` (chmod 600 — ADMIN_KEY, API_KEYS, provider keys)
-- Named volume `bruvroute_bruvroute-data` mounted at `/data` (SQLite telemetry lives there)
+- `/home/alex/bruvroute/docker-compose.yml` + `.env` (chmod 600 — ADMIN_KEY, API_KEYS, provider keys; **values must be UNQUOTED** — docker `--env-file` does not strip quotes, unlike shell sourcing)
+- Named volume `bruvroute_bruvroute-data` mounted at `/data` (SQLite telemetry lives there; chains.yaml too)
 - Container: `bruvroute:latest`, distroless static:nonroot, ~13MB image, `mem_limit: 400m`, `GOMEMLIMIT=256MiB`, restart unless-stopped
 - Healthcheck: `/bruvroute -healthcheck -config /config.yaml` (binary probes own /healthz — no shell in image)
+
+### Keys & rotation
+
+Provider keys live in the container env via `key_envs` lists in config.yaml. Multiple keys per provider form a rotation pool:
+
+- `rotation:` per provider — `round_robin` (default) / `least_used` / `sequential`
+- Class-based quarantine — 401/403 → `auth` (24h), 429 → `rate_limit` (60s), 5xx/network → `transient` (60s); doubles per consecutive failure; success resets
+- On a quarantinable response the same request retries on the next healthy key (within the step retry budget); all keys down → chain falls to the next step
+- Per-key state is in `/admin/status` → `keys` (state/reason/failures/cool-off remaining/requests/tokens); telemetry rows carry the serving `key`
+- Quarantine is in-memory — a restart clears it (all keys start healthy)
+
+To add or rotate a provider key: edit `.env` on the VPS (unquoted `KEY=value`), `docker compose up -d --force-recreate`. Deliberately breaking a key is the documented way to test failover:
+
+```sh
+sed -i 's/^BAZAARLINK_2_KEY=.*/BAZAARLINK_2_KEY=sk-invalid/' /home/alex/bruvroute/.env
+docker compose up -d --force-recreate   # next rotation hit quarantines it, chain still serves
+```
 
 ### Ops commands
 

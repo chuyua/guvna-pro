@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,12 +19,61 @@ type Config struct {
 }
 
 type Provider struct {
-	Name     string   `yaml:"name"`
-	Type     string   `yaml:"type"`
-	BaseURL  string   `yaml:"base_url"`
-	KeyEnv   string   `yaml:"key_env"`
-	Models   []string `yaml:"models"`
-	Prefixes []string `yaml:"prefixes"`
+	Name       string        `yaml:"name"`
+	Type       string        `yaml:"type"`
+	BaseURL    string        `yaml:"base_url"`
+	KeyEnv     string        `yaml:"key_env"`
+	KeyEnvs    []string      `yaml:"key_envs"`
+	Rotation   string        `yaml:"rotation"`
+	Quarantine QuarantineCfg `yaml:"quarantine"`
+	Models     []string      `yaml:"models"`
+	Prefixes   []string      `yaml:"prefixes"`
+}
+
+// AllKeyEnvs returns the provider's key env vars as a list: KeyEnvs if set,
+// else the single KeyEnv. At least one entry is guaranteed after Validate.
+func (p *Provider) AllKeyEnvs() []string {
+	if len(p.KeyEnvs) > 0 {
+		return p.KeyEnvs
+	}
+	if p.KeyEnv != "" {
+		return []string{p.KeyEnv}
+	}
+	return nil
+}
+
+// QuarantineCfg holds per-failure-class cool-off durations for a provider's
+// key pool. Zero values fall back to DefaultQuarantine.
+type QuarantineCfg struct {
+	Auth      Duration `yaml:"auth"`
+	RateLimit Duration `yaml:"rate_limit"`
+	Transient Duration `yaml:"transient"`
+}
+
+// DefaultQuarantine mirrors the step cooldown pattern: 401/403 = long (key is
+// dead or quota gone), 429 = rate limit (recovers quickly), 5xx = hiccup.
+var DefaultQuarantine = QuarantineCfg{
+	Auth:      Duration{24 * time.Hour},
+	RateLimit: Duration{time.Minute},
+	Transient: Duration{time.Minute},
+}
+
+// Duration is a time.Duration that unmarshals from YAML strings like "60s".
+type Duration struct {
+	time.Duration
+}
+
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	var s string
+	if err := node.Decode(&s); err != nil {
+		return fmt.Errorf("duration must be a string like \"60s\": %w", err)
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	d.Duration = dur
+	return nil
 }
 
 type Chain struct {
@@ -73,8 +123,24 @@ func (c *Config) Validate() error {
 		if p.BaseURL == "" {
 			return fmt.Errorf("provider %q: missing base_url", p.Name)
 		}
-		if p.KeyEnv == "" {
-			return fmt.Errorf("provider %q: missing key_env", p.Name)
+		if p.KeyEnv == "" && len(p.KeyEnvs) == 0 {
+			return fmt.Errorf("provider %q: missing key_env or key_envs", p.Name)
+		}
+		if p.KeyEnv != "" && len(p.KeyEnvs) > 0 {
+			return fmt.Errorf("provider %q: set either key_env or key_envs, not both", p.Name)
+		}
+		for _, env := range p.AllKeyEnvs() {
+			if env == "" {
+				return fmt.Errorf("provider %q: empty key env name", p.Name)
+			}
+		}
+		switch p.Rotation {
+		case "", "round_robin", "least_used", "sequential":
+		default:
+			return fmt.Errorf("provider %q: unknown rotation %q (round_robin, least_used, sequential)", p.Name, p.Rotation)
+		}
+		if p.Quarantine.Auth.Duration < 0 || p.Quarantine.RateLimit.Duration < 0 || p.Quarantine.Transient.Duration < 0 {
+			return fmt.Errorf("provider %q: quarantine durations must be >= 0", p.Name)
 		}
 	}
 	if len(c.Chains) == 0 {

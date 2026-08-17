@@ -14,6 +14,7 @@ import (
 	"github.com/alisa/bruvroute/internal/chains"
 	"github.com/alisa/bruvroute/internal/config"
 	"github.com/alisa/bruvroute/internal/health"
+	"github.com/alisa/bruvroute/internal/keypool"
 	"github.com/alisa/bruvroute/internal/logring"
 	"github.com/alisa/bruvroute/internal/router"
 	"github.com/alisa/bruvroute/internal/telemetry"
@@ -624,5 +625,91 @@ func TestChainsDeleteConfigChainRefused(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("config chain delete = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestChatFailsOverAcrossKeys: a dead key (401) must rotate to the next key
+// within the retry budget, and the telemetry row records the serving key.
+func TestChatFailsOverAcrossKeys(t *testing.T) {
+	var hits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"invalid key"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	defer up.Close()
+
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnvs: []string{"KEY_A1", "KEY_A2"}}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	s, ts := testServer(t, providers, chains, map[string]string{"KEY_A1": "bad", "KEY_A2": "good"})
+
+	resp := doChat(t, ts, "main", false)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat = %d, want 200 via key failover", resp.StatusCode)
+	}
+	if hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (bad key then good key)", hits)
+	}
+
+	if err := s.tm.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	var tokensOut int64
+	if err := s.tm.DB().QueryRow(`SELECT key, tokens_out FROM requests`).Scan(&key, &tokensOut); err != nil {
+		t.Fatal(err)
+	}
+	if key != "KEY_A2" {
+		t.Errorf("serving key = %q, want KEY_A2", key)
+	}
+	if tokensOut != 3 {
+		t.Errorf("tokens_out = %d, want 3", tokensOut)
+	}
+	// The dead key must be quarantined with reason auth.
+	if ks := s.pools["a"].Keys(); ks[0].State != "quarantined" || ks[0].Reason != "auth" {
+		t.Errorf("key0 state = %q/%q, want quarantined/auth", ks[0].State, ks[0].Reason)
+	}
+}
+
+func TestAdminStatusShowsKeys(t *testing.T) {
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnvs: []string{"KEY_A1", "KEY_A2"}}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
+	s, ts := testServer(t, providers, chains, map[string]string{"KEY_A1": "k", "KEY_A2": "k"})
+	s.pools["a"].Mark("KEY_A1", keypool.ClassAuth)
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/status", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Keys []struct {
+			Provider string `json:"provider"`
+			Env      string `json:"env"`
+			State    string `json:"state"`
+			Reason   string `json:"reason"`
+			Failures int    `json:"failures"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Keys) != 2 {
+		t.Fatalf("keys = %d entries, want 2", len(out.Keys))
+	}
+	if out.Keys[0].Provider != "a" || out.Keys[0].Env != "KEY_A1" ||
+		out.Keys[0].State != "quarantined" || out.Keys[0].Reason != "auth" || out.Keys[0].Failures != 1 {
+		t.Errorf("key0 = %+v, want quarantined KEY_A1 auth 1 failure", out.Keys[0])
+	}
+	if out.Keys[1].State != "healthy" {
+		t.Errorf("key1 state = %q, want healthy", out.Keys[1].State)
 	}
 }

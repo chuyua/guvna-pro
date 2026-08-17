@@ -22,6 +22,7 @@ type Event struct {
 	Status    int
 	TokensIn  int64
 	TokensOut int64
+	Key       string
 	Err       string
 	Ts        time.Time
 }
@@ -52,8 +53,13 @@ func Open(path string, interval time.Duration) (*Telemetry, error) {
 		status INTEGER NOT NULL,
 		tokens_in INTEGER NOT NULL DEFAULT 0,
 		tokens_out INTEGER NOT NULL DEFAULT 0,
+		key TEXT NOT NULL DEFAULT '',
 		err TEXT NOT NULL DEFAULT ''
 	)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -63,6 +69,37 @@ func Open(path string, interval time.Duration) (*Telemetry, error) {
 		go t.flusher(interval)
 	}
 	return t, nil
+}
+
+// migrate adds columns introduced after the initial schema to existing
+// databases (e.g. the the VPS volume) without dropping data.
+func migrate(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(requests)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !cols["key"] {
+		if _, err := db.Exec(`ALTER TABLE requests ADD COLUMN key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *Telemetry) Record(e Event) {
@@ -101,8 +138,8 @@ func (t *Telemetry) Flush() error {
 		return err
 	}
 	stmt, err := tx.Prepare(`INSERT INTO requests
-		(ts, provider, chain, model, stream, status, tokens_in, tokens_out, err)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(ts, provider, chain, model, stream, status, tokens_in, tokens_out, key, err)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -110,7 +147,7 @@ func (t *Telemetry) Flush() error {
 	defer stmt.Close()
 	for _, e := range events {
 		if _, err := stmt.Exec(e.Ts.UTC().Format(time.RFC3339), e.Provider, e.Chain,
-			e.Model, e.Stream, e.Status, e.TokensIn, e.TokensOut, e.Err); err != nil {
+			e.Model, e.Stream, e.Status, e.TokensIn, e.TokensOut, e.Key, e.Err); err != nil {
 			tx.Rollback()
 			return err
 		}
