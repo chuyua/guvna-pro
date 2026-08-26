@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alisa/bruvroute/internal/config"
+	"github.com/creamy-ghost/bruvroute/internal/config"
 )
 
 const chatPath = "/v1/chat/completions"

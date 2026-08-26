@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/alisa/bruvroute/internal/router"
+	"github.com/creamy-ghost/bruvroute/internal/router"
 	"gopkg.in/yaml.v3"
 )
 

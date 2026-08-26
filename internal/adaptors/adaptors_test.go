@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alisa/bruvroute/internal/config"
+	"github.com/creamy-ghost/bruvroute/internal/config"
 )
 
 func testUpstream(t *testing.T, wantPath, wantKey string) *httptest.Server {

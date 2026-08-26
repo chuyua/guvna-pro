@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/alisa/bruvroute/internal/config"
-	"github.com/alisa/bruvroute/internal/router"
+	"github.com/creamy-ghost/bruvroute/internal/config"
+	"github.com/creamy-ghost/bruvroute/internal/router"
 )
 
 func newRouter() *router.Router {

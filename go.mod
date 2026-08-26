@@ -1,4 +1,4 @@
-module github.com/alisa/bruvroute
+module github.com/creamy-ghost/bruvroute
 
 go 1.26.6
 

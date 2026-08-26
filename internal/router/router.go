@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/alisa/bruvroute/internal/config"
+	"github.com/creamy-ghost/bruvroute/internal/config"
 )
 
 var ErrNotFound = errors.New("no chain or model matches")
