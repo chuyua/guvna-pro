@@ -242,6 +242,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			OwnedBy string `json:"owned_by"`
 		}{ID: n, Object: "model", Created: time.Now().Unix(), OwnedBy: "guvna"})
 	}
+	// "auto" is a virtual model: the gateway picks the best real model at
+	// request time. Listing it lets clients discover it from /v1/models.
+	resp.Data = append(resp.Data, struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}{ID: "auto", Object: "model", Created: time.Now().Unix(), OwnedBy: "guvna"})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
