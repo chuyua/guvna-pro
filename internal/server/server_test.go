@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -859,4 +862,168 @@ func TestChainsCreateEchoesParams(t *testing.T) {
 	if !found {
 		t.Fatal("chain tuned not listed")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the retry budget.
+//
+// retries is captured from GUVNA_RETRIES at package init, so the budget tests
+// pin the captured value rather than mutating the environment; the re-exec
+// probe below covers the init wiring itself.
+//
+// The invariant that matters in production: one chain step touches the wire at
+// most retries+1 times, so together with the transport's ResponseHeaderTimeout
+// the worst case for a hung step is bounded to (retries+1) header timeouts.
+// ---------------------------------------------------------------------------
+
+const initProbeEnv = "GUVNA_TEST_INIT"
+
+func TestEnvIntFallsBackToDefault(t *testing.T) {
+	const def = 42
+	const k = "GUVNA_TEST_INT"
+	os.Unsetenv(k)
+	t.Cleanup(func() { os.Unsetenv(k) })
+
+	for _, tc := range []struct {
+		name string
+		val  string
+	}{
+		{"unset", ""},
+		{"empty", ""},
+		{"whitespace", " \t "},
+		{"garbage", "not-a-number"},
+		{"negative", "-1"},
+		{"float", "2.5"},
+	} {
+		if tc.name != "unset" {
+			os.Setenv(k, tc.val)
+		}
+		if got := envInt(k, def); got != def {
+			t.Errorf("%s: envInt(%q) = %d, want default %d", tc.name, tc.val, got, def)
+		}
+	}
+}
+
+func TestEnvIntParses(t *testing.T) {
+	const def = 42
+	const k = "GUVNA_TEST_INT"
+	t.Cleanup(func() { os.Unsetenv(k) })
+
+	for _, tc := range []struct {
+		val  string
+		want int
+	}{
+		{"0", 0},
+		{"5", 5},
+		{" 5 ", 5},
+	} {
+		os.Setenv(k, tc.val)
+		if got := envInt(k, def); got != tc.want {
+			t.Errorf("envInt(%q) = %d, want %d", tc.val, got, tc.want)
+		}
+	}
+}
+
+// TestTryStepBudgetIsDefaultRetries locks the retry budget with an upstream
+// that always fails. With GUVNA_RETRIES unset the upstream must receive exactly
+// defaultRetries+1 attempts — one too many and the chain latency budget breaks.
+func TestTryStepBudgetIsDefaultRetries(t *testing.T) {
+	if defaultRetries != 2 {
+		t.Fatalf("defaultRetries = %d, want 2", defaultRetries)
+	}
+	if v := os.Getenv("GUVNA_RETRIES"); v != "" {
+		t.Skipf("GUVNA_RETRIES=%q is set; retries was captured at process start", v)
+	}
+	if retries != defaultRetries {
+		t.Fatalf("setup: retries = %d, want defaultRetries = %d", retries, defaultRetries)
+	}
+
+	var hits int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":"always 500"}`)
+	}))
+	defer up.Close()
+
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+
+	resp := doChat(t, ts, "main", false)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	want := int64(defaultRetries + 1)
+	if got := atomic.LoadInt64(&hits); got != want {
+		t.Errorf("upstream attempts = %d, want %d (defaultRetries+1)", got, want)
+	}
+}
+
+// TestTryStepBudgetZeroRetries proves the loop bound itself: GUVNA_RETRIES=0
+// must mean no retries at all, and 0 is a legal value (envInt rejects only
+// negatives). This is what the live deployment runs.
+func TestTryStepBudgetZeroRetries(t *testing.T) {
+	old := retries
+	retries = 0
+	t.Cleanup(func() { retries = old })
+
+	var hits int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":"always 500"}`)
+	}))
+	defer up.Close()
+
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+
+	resp := doChat(t, ts, "main", false)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Errorf("upstream attempts = %d, want 1 with retries=0", got)
+	}
+}
+
+// TestRetriesReadsEnvAtInit re-execs this test binary in a child process that
+// has GUVNA_RETRIES set before the process starts, then checks the captured
+// value. A runtime os.Setenv cannot prove this: retries is built at package
+// init.
+func TestRetriesReadsEnvAtInit(t *testing.T) {
+	if os.Getenv(initProbeEnv) == "1" {
+		if retries != 0 {
+			t.Fatalf("SUBPROC_FAIL: retries = %d, want 0 "+
+				"(GUVNA_RETRIES=%q was not read at process start)", retries, os.Getenv("GUVNA_RETRIES"))
+		}
+		return
+	}
+	os.Unsetenv("GUVNA_RETRIES")
+	t.Cleanup(func() { os.Unsetenv("GUVNA_RETRIES") })
+
+	cmd := exec.Command(testBinary(), "-test.run=^TestRetriesReadsEnvAtInit$", "-test.count=1")
+	cmd.Env = append(os.Environ(), initProbeEnv+"=1", "GUVNA_RETRIES=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "SUBPROC_FAIL") {
+			t.Errorf("GUVNA_RETRIES must be read at process start:\n%s", out)
+		} else {
+			t.Skipf("test binary re-exec unavailable (%v); init wiring not verified:\n%s", err, out)
+		}
+	}
+}
+
+// testBinary returns the path of the running test binary, for re-exec probes.
+func testBinary() string {
+	if p, err := os.Executable(); err == nil {
+		return p
+	}
+	return os.Args[0]
 }

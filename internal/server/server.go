@@ -1,5 +1,8 @@
 // Package server wires the HTTP surface: /healthz, /v1/models, and the
-// /v1/chat/completions relay with chain-based fallback and SSE passthrough.
+// relays. /v1/chat/completions is raw passthrough; /v1/responses is the same
+// chain-based fallback with protocol translation on both edges (see package
+// responses and responses_route.go), because no upstream implements the
+// Responses API.
 package server
 
 import (
@@ -14,16 +17,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/creamy-ghost/guvna/internal/adaptors"
 	"github.com/creamy-ghost/guvna/internal/auth"
 	"github.com/creamy-ghost/guvna/internal/chains"
 	"github.com/creamy-ghost/guvna/internal/config"
+	"github.com/creamy-ghost/guvna/internal/ctxsize"
 	"github.com/creamy-ghost/guvna/internal/health"
 	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/logring"
 	"github.com/creamy-ghost/guvna/internal/router"
+	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
 )
 
@@ -33,7 +39,33 @@ const KeepAliveInterval = 15 * time.Second
 
 // retries is how many times a step is retried (beyond the first attempt) on
 // transient failures (429/5xx/network) before the chain moves to the next step.
-const retries = 2
+// Overridable via GUVNA_RETRIES.
+//
+// This is a budget multiplier, not a robustness knob: with the transport's
+// ResponseHeaderTimeout at H, one step can now sit on the wire for
+// (retries+1)*H plus backoff before the chain moves on, so a chain of N steps
+// can take up to N*(retries+1)*H. The defaults were 3 steps x 3 attempts x 45s
+// = 405s, which no client waits for. A gateway whose job is failover should
+// spend that budget on other providers rather than re-hitting one hung
+// endpoint, so the live deployment runs GUVNA_RETRIES=1 with a 20s header
+// timeout: 3 steps x 2 attempts x 20s = 120s worst case.
+const defaultRetries = 2
+
+var retries = envInt("GUVNA_RETRIES", defaultRetries)
+
+// envInt reads a non-negative integer override from the environment, falling
+// back to def on any empty, unparsable, or negative value.
+func envInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
 
 type Server struct {
 	cfg       *config.Config
@@ -47,6 +79,18 @@ type Server struct {
 	started   time.Time
 	env       func(string) string
 	retryWait func(attempt int) time.Duration
+
+	// /v1/auto selector state. ctxLen answers "how big is this model's
+	// window"; the decide* fields hold the decider target and its cached
+	// answer. decideMu guards decideCandidates, decideCache and the snapshot
+	// they are built from.
+	ctxLen           func(model string) int
+	decideProvider   string
+	decideModel      string
+	decideInterval   time.Duration
+	decideMu         sync.Mutex
+	decideCandidates []selector.Candidate
+	decideCache      selector.Cache
 }
 
 func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *telemetry.Telemetry, hlth *health.Tracker, logs *logring.Ring, store *chains.Store) *Server {
@@ -56,7 +100,44 @@ func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *tele
 			pools[p.Name] = pool
 		}
 	}
-	return &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, pools: pools, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
+	s := &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, pools: pools, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
+	s.ctxLen, s.decideProvider, s.decideModel, s.decideInterval = loadAutoConfig()
+	return s
+}
+
+// loadAutoConfig reads the /v1/auto knobs. The registry is advisory and never
+// fatal — a missing or malformed file must not take the gateway down.
+func loadAutoConfig() (func(string) int, string, string, time.Duration) {
+	reg, err := ctxsize.Load(envOr("GUVNA_CONTEXT_REGISTRY", ""))
+	if err != nil {
+		log.Printf("auto: context registry %v (using built-ins)", err)
+		reg = &ctxsize.Registry{DefaultContext: ctxsize.DefaultContext}
+	}
+	if reg == nil {
+		reg = &ctxsize.Registry{DefaultContext: ctxsize.DefaultContext}
+	}
+	forCtx := reg.For
+	provider, model := envOr("GUVNA_DECIDER_PROVIDER", ""), envOr("GUVNA_DECIDER_MODEL", "")
+	interval := envDuration("GUVNA_DECIDE_INTERVAL", DefaultDecideInterval)
+	return forCtx, provider, model, interval
+}
+
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+func envDuration(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	return def
 }
 
 // defaultRetryWait backs off 250ms then 1s for the two retry attempts.
@@ -72,6 +153,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("GET /v1/models", s.auth.Middleware(http.HandlerFunc(s.handleModels)))
 	mux.Handle("POST /v1/chat/completions", s.auth.Middleware(http.HandlerFunc(s.handleChat)))
+	mux.Handle("POST /v1/auto", s.auth.Middleware(http.HandlerFunc(s.handleAuto)))
+	mux.Handle("POST /v1/responses", s.auth.Middleware(http.HandlerFunc(s.handleResponses)))
+	mux.Handle("GET /v1/models/{id}", s.auth.Middleware(http.HandlerFunc(s.handleModelInfo)))
+	mux.Handle("GET /v1/responses/{id}", s.auth.Middleware(http.HandlerFunc(s.handleResponseLookup)))
+	mux.Handle("DELETE /v1/responses/{id}", s.auth.Middleware(http.HandlerFunc(s.handleResponseDelete)))
+	mux.Handle("POST /v1/responses/{id}/cancel", s.auth.Middleware(http.HandlerFunc(s.handleResponseCancel)))
 	mux.Handle("GET /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainList)))
 	mux.Handle("POST /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainCreate)))
 	mux.Handle("DELETE /v1/chains/{name}", s.auth.Middleware(http.HandlerFunc(s.handleChainDelete)))
