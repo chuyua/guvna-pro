@@ -7,6 +7,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -348,6 +349,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
+		return
+	}
+	if strings.EqualFold(req.Model, "auto") {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		s.handleAuto(w, r)
 		return
 	}
 	chain, steps, err := s.rtr.Resolve(req.Model)
