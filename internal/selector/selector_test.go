@@ -23,6 +23,31 @@ func TestParseRanking(t *testing.T) {
 	}
 }
 
+func TestParseRankingHandlesReasoningContent(t *testing.T) {
+	// Thinking models (glm-5.3, deepseek) put the answer in reasoning_content
+	// and leave content null. The ranking must still parse.
+	body := []byte(`{"choices":[{"message":{"content":null,"reasoning_content":"{\"order\":[\"nvidia/Fast\",\"amd/Slow\"]}"}}]}`)
+	ranked, err := ParseRanking(body)
+	if err != nil {
+		t.Fatalf("ParseRanking: %v", err)
+	}
+	if ranked["nvidia/Fast"] != 0 || ranked["amd/Slow"] != 1 {
+		t.Fatalf("ranked = %v; want nvidia/Fast=0, amd/Slow=1", ranked)
+	}
+}
+
+// content should win over reasoning_content when both are present.
+func TestParseRankingPrefersContent(t *testing.T) {
+	body := []byte(`{"choices":[{"message":{"content":"{\"order\":[\"amd/A\"]}","reasoning_content":"{\"order\":[\"nvidia/B\"]}"}}]}`)
+	ranked, err := ParseRanking(body)
+	if err != nil {
+		t.Fatalf("ParseRanking: %v", err)
+	}
+	if ranked["amd/A"] != 0 {
+		t.Fatalf("ranked = %v; want amd/A=0 (content wins)", ranked)
+	}
+}
+
 func TestParseRankingRejectsGibberish(t *testing.T) {
 	for _, body := range []string{
 		`{"choices":[{"message":{"content":"the best one is amd"}}]}`,

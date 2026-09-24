@@ -240,11 +240,16 @@ type Cache struct {
 // ParseRanking reads a decider answer of the form {"order":["amd/X","nvidia/Y"]}.
 // Anything unparsable yields an error; the caller then falls back. Positions are
 // 1-based in the decider's head but are stored as 0-based scores here.
+//
+// Thinking models (glm-5.3, deepseek, ...) put their output in reasoning_content
+// and leave content null. ParseRanking checks both fields: content first, then
+// reasoning_content, so a thinking decider works without special configuration.
 func ParseRanking(body []byte) (map[string]int, error) {
 	var resp struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -255,6 +260,9 @@ func ParseRanking(body []byte) (map[string]int, error) {
 		return nil, fmt.Errorf("no choices")
 	}
 	content := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if content == "" || content == "null" {
+		content = strings.TrimSpace(resp.Choices[0].Message.ReasoningContent)
+	}
 	var want struct {
 		Order []string `json:"order"`
 	}

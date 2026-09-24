@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -27,7 +28,11 @@ type Adaptor interface {
 	Chat(ctx context.Context, body []byte) (*http.Response, error)
 }
 
-var defaultDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+// Dial timeout lives on the Dialer, not the Transport: http.Transport no longer
+// exposes DialTimeout, and DialContext is what's actually consulted. 10s is
+// plenty for the handshake to a host that answers; a host that doesn't answer
+// at TCP level should fail fast so the chain can move on.
+var defaultDialer = &net.Dialer{Timeout: envDuration("GUVNA_DIAL_TIMEOUT", 10*time.Second), KeepAlive: 30 * time.Second}
 
 // preferV4DialContext dials IPv4 when A records exist. Some networks serve
 // dead AAAA records (e.g. a VPS behind a DNS virtual gateway: AAAA
@@ -47,21 +52,75 @@ func preferV4DialContext(ctx context.Context, network, addr string) (net.Conn, e
 }
 
 // Client is shared across adaptors and reused for keep-alive.
+//
+// Timeout stays 0 on purpose: a streaming response may run for minutes and a
+// whole-request deadline would cut it off mid-stream. Instead the transport
+// bounds the wait for response headers (ResponseHeaderTimeout) — that is the
+// failure mode that actually happens, an upstream that accepts the TCP/TLS
+// handshake and then never answers. That deadline does not touch a body that
+// has already started flowing, so a long stream is unaffected.
+//
+// A per-attempt context timeout is deliberately not used: net/http ties the
+// request context to body reads, and on the 2xx path the body is handed to the
+// caller, so there is no safe moment to cancel without risking a mid-read cut.
 var Client = &http.Client{
 	Timeout:   0, // no overall timeout; streaming may run long
 	Transport: preferV4Transport(),
 }
 
+// DeciderClient is a dedicated client for /v1/auto decider calls. Thinking
+// models (glm-5.3, deepseek) need more time to reason about a candidate list
+// than the global GUVNA_HEADER_TIMEOUT (20s on the live server). The decider
+// is a single small JSON ranking, not a streaming completion, so a longer
+// header timeout is safe — it only bounds the wait for the first byte.
+var DeciderClient = &http.Client{
+	Timeout:   0,
+	Transport: deciderTransport(),
+}
+
+func deciderTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = preferV4DialContext
+	t.TLSHandshakeTimeout = envDuration("GUVNA_TLS_TIMEOUT", 15*time.Second)
+	t.ExpectContinueTimeout = envDuration("GUVNA_EXPECT_TIMEOUT", time.Second)
+	t.IdleConnTimeout = 90 * time.Second
+	// 90s: generous for glm-5.3 reasoning over 10+ candidates with health stats.
+	t.ResponseHeaderTimeout = envDuration("GUVNA_DECIDER_HEADER_TIMEOUT", 90*time.Second)
+	return t
+}
+
+// envDuration reads a duration override from the environment, falling back to
+// def on any empty, unparsable, or non-positive value.
+func envDuration(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
 func preferV4Transport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = preferV4DialContext
+	t.TLSHandshakeTimeout = envDuration("GUVNA_TLS_TIMEOUT", 15*time.Second)
+	t.ExpectContinueTimeout = envDuration("GUVNA_EXPECT_TIMEOUT", 1*time.Second)
+	t.IdleConnTimeout = envDuration("GUVNA_IDLE_TIMEOUT", 90*time.Second)
+	// The critical one. Without this a hung upstream blocks a step forever and
+	// chain failover can never happen. 45s default: generous enough for slow
+	// first-token inference, tight enough to move on within a sane budget.
+	t.ResponseHeaderTimeout = envDuration("GUVNA_HEADER_TIMEOUT", 45*time.Second)
 	return t
 }
 
 type openAICompat struct {
-	name string
-	url  string
-	key  string
+	name   string
+	url    string
+	key    string
+	client *http.Client // nil uses the shared Client
 }
 
 // NewOpenAICompat builds an OpenAI-protocol adaptor (type "openai").
@@ -89,6 +148,19 @@ func New(p config.Provider, key string) (Adaptor, error) {
 	}
 }
 
+// NewDecider builds an adaptor that uses DeciderClient (longer header timeout)
+// instead of the shared Client. For the /v1/auto decider call only.
+func NewDecider(p config.Provider, key string) (Adaptor, error) {
+	switch p.Type {
+	case "openai":
+		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + chatPath, key: key, client: DeciderClient}, nil
+	case "gemini":
+		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai" + chatPath, key: key, client: DeciderClient}, nil
+	default:
+		return nil, fmt.Errorf("provider %q: unknown type %q", p.Name, p.Type)
+	}
+}
+
 func (a *openAICompat) Chat(ctx context.Context, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.url, strings.NewReader(string(body)))
 	if err != nil {
@@ -97,5 +169,8 @@ func (a *openAICompat) Chat(ctx context.Context, body []byte) (*http.Response, e
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+a.key)
 	req.Header.Set("User-Agent", "guvna/0.1")
+	if a.client != nil {
+		return a.client.Do(req)
+	}
 	return Client.Do(req)
 }

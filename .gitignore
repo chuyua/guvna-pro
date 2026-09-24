@@ -12,4 +12,4 @@ docs/runbook-*.md
 
 # Go vendor tree — regenerated via `go mod vendor`, shipped to the VPS by
 # scp (docs/DASHBOARD.md), never committed (140MB+, mostly modernc sqlite)
-vendor/
+vendor/guvna-linux-amd64

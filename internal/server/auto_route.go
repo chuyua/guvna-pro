@@ -53,6 +53,27 @@ type autoRequest struct {
 	MaxContext int    `json:"max_context"`
 }
 
+// stripAutoFields removes auto-only keys from a chat completion body so the
+// upstream never sees them. min_context and max_context are selector knobs that
+// upstreams reject with 400 "Unsupported parameter"; model is rewritten
+// per-step by withModel, so stripping it here is belt-and-braces.
+//
+// On any parse error the original body is returned: failing to strip is better
+// than failing to forward.
+func stripAutoFields(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	delete(m, "min_context")
+	delete(m, "max_context")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // handleAuto selects a model, then reuses the same tryStep/relaySuccess path as
 // handleChat. It does not build a chain: a chain would make the decision
 // visible to POST /v1/chains, where a client could overwrite the pool order.
@@ -82,6 +103,13 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Strip the auto-only fields before forwarding: min_context and max_context
+	// are selector knobs, not chat completion parameters, and upstreams reject
+	// them with 400 "Unsupported parameter". The "model":"auto" value is
+	// rewritten per-step by withModel, so leaving it would be harmless, but
+	// stripping it keeps the body honest.
+	body = stripAutoFields(body)
+
 	pool := s.rtr.ListChains()
 	if len(pool) == 0 {
 		http.Error(w, `{"error":{"message":"no chains configured"}}`, http.StatusServiceUnavailable)
@@ -107,7 +135,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ordered, decided, source := selector.Decide(
+	ordered, _, source := selector.Decide(
 		cands,
 		s.deciderFor(cands, r.Context()),
 		s.providerOrder(),
@@ -116,7 +144,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		&s.decideCache,
 	)
 	log.Printf("auto: min=%d max=%d eligible=%d source=%s order=%s",
-		minCtx, req.MaxContext, len(cands), source, joinDecided(decided))
+		minCtx, req.MaxContext, len(cands), source, joinSteps(ordered))
 
 	var lastErr error
 	var lastStatus int
@@ -185,43 +213,56 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 	}
 	p, ok := s.provider(s.decideProvider)
 	if !ok {
+		log.Printf("auto: decider provider %q not in config", s.decideProvider)
 		return nil, fmt.Errorf("decider provider %q not in config", s.decideProvider)
 	}
 	pool := s.pools[s.decideProvider]
 	if pool == nil {
+		log.Printf("auto: decider provider %q has no key pool", s.decideProvider)
 		return nil, fmt.Errorf("decider provider %q has no key pool", s.decideProvider)
 	}
 	keyEnv := pool.Pick()
 	key := s.env(keyEnv)
 	if key == "" {
+		log.Printf("auto: decider key env %q not set", keyEnv)
 		return nil, fmt.Errorf("decider key env %q not set", keyEnv)
 	}
-	a, err := adaptors.New(p, key)
+	a, err := adaptors.NewDecider(p, key)
 	if err != nil {
+		log.Printf("auto: decider adaptor: %v", err)
 		return nil, err
 	}
 	payload, err := json.Marshal(map[string]any{
 		"model":       s.decideModel,
 		"messages":    deciderMessages(s.decidePrompt(cands)),
-		"max_tokens":  300,
+		"max_tokens":  2000,
 		"temperature": 0,
 	})
 	if err != nil {
+		log.Printf("auto: decider payload: %v", err)
 		return nil, err
 	}
 	resp, err := a.Chat(ctx, payload)
 	if err != nil {
+		log.Printf("auto: decider call: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("auto: decider read: %v", err)
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("auto: decider status %d: %s", resp.StatusCode, truncate(raw, 200))
 		return nil, fmt.Errorf("decider status %d: %s", resp.StatusCode, truncate(raw, 200))
 	}
-	return selector.ParseRanking(raw)
+	ranked, err := selector.ParseRanking(raw)
+	if err != nil {
+		log.Printf("auto: decider parse: %v (body: %s)", err, truncate(raw, 300))
+		return nil, err
+	}
+	return ranked, nil
 }
 
 // decidePrompt renders the pool the decider is ordering, with each candidate's
@@ -267,10 +308,10 @@ func (s *Server) providerOrder() []string {
 	return out
 }
 
-func joinDecided(d []selector.Decided) string {
-	names := make([]string, 0, len(d))
-	for _, e := range d {
-		names = append(names, e.Step)
+func joinSteps(c []selector.Candidate) string {
+	names := make([]string, 0, len(c))
+	for _, e := range c {
+		names = append(names, e.Step.Provider+"/"+e.Step.Model)
 	}
 	return strings.Join(names, " > ")
 }
