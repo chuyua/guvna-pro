@@ -84,9 +84,11 @@ func main() {
 	hlth := health.New()
 	ring := logring.New(512)
 	log.SetOutput(io.MultiWriter(os.Stderr, ring))
+	api := server.New(cfg, rtr, authn, tm, hlth, ring, chainStore)
+	api.StartAutoDecider()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           server.New(cfg, rtr, authn, tm, hlth, ring, chainStore).Handler(),
+		Handler:           api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

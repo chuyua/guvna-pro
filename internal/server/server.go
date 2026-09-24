@@ -32,6 +32,7 @@ import (
 	"github.com/creamy-ghost/guvna/internal/router"
 	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
+	"github.com/creamy-ghost/guvna/internal/vision"
 )
 
 // KeepAliveInterval is how long the relay waits without upstream data before
@@ -86,6 +87,7 @@ type Server struct {
 	// answer. decideMu guards decideCandidates, decideCache and the snapshot
 	// they are built from.
 	ctxLen           func(model string) int
+	visionReg        *vision.Registry
 	decideProvider   string
 	decideModel      string
 	decideInterval   time.Duration
@@ -102,13 +104,13 @@ func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *tele
 		}
 	}
 	s := &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, pools: pools, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
-	s.ctxLen, s.decideProvider, s.decideModel, s.decideInterval = loadAutoConfig()
+	s.ctxLen, s.visionReg, s.decideProvider, s.decideModel, s.decideInterval = loadAutoConfig()
 	return s
 }
 
 // loadAutoConfig reads the /v1/auto knobs. The registry is advisory and never
 // fatal — a missing or malformed file must not take the gateway down.
-func loadAutoConfig() (func(string) int, string, string, time.Duration) {
+func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.Duration) {
 	reg, err := ctxsize.Load(envOr("GUVNA_CONTEXT_REGISTRY", ""))
 	if err != nil {
 		log.Printf("auto: context registry %v (using built-ins)", err)
@@ -118,9 +120,14 @@ func loadAutoConfig() (func(string) int, string, string, time.Duration) {
 		reg = &ctxsize.Registry{DefaultContext: ctxsize.DefaultContext}
 	}
 	forCtx := reg.For
+	vreg, err := vision.Load(envOr("GUVNA_VISION_REGISTRY", ""))
+	if err != nil {
+		log.Printf("auto: vision registry %v (using built-ins)", err)
+		vreg = nil
+	}
 	provider, model := envOr("GUVNA_DECIDER_PROVIDER", ""), envOr("GUVNA_DECIDER_MODEL", "")
 	interval := envDuration("GUVNA_DECIDE_INTERVAL", DefaultDecideInterval)
-	return forCtx, provider, model, interval
+	return forCtx, vreg, provider, model, interval
 }
 
 func envOr(name, def string) string {
@@ -432,6 +439,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 // not — body left open for the caller to relay), or (nil, "", err) when every
 // attempt failed at the network level.
 func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
+	return s.tryStepAdaptor(r, step, body, adaptors.New)
+}
+
+// tryStepAuto serves one /v1/auto step through AutoClient: the short header
+// timeout bounds a hung upstream to a few seconds so the candidate walk stays
+// inside the caller's patience, instead of the chain-sized wait.
+func (s *Server) tryStepAuto(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
+	return s.tryStepAdaptor(r, step, body, adaptors.NewAuto)
+}
+
+func (s *Server) tryStepAdaptor(r *http.Request, step router.Step, body []byte, mkAdaptor func(config.Provider, string) (adaptors.Adaptor, error)) (*http.Response, string, error) {
 	p, ok := s.provider(step.Provider)
 	if !ok {
 		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
@@ -455,7 +473,7 @@ func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.
 			lastErr = err
 			continue
 		}
-		a, err := adaptors.New(p, key)
+		a, err := mkAdaptor(p, key)
 		if err != nil {
 			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			lastErr = err

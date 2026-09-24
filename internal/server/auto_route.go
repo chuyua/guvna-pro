@@ -37,6 +37,7 @@ import (
 	"github.com/creamy-ghost/guvna/internal/adaptors"
 	"github.com/creamy-ghost/guvna/internal/health"
 	"github.com/creamy-ghost/guvna/internal/selector"
+	"github.com/creamy-ghost/guvna/internal/vision"
 )
 
 // DefaultMinContext applies when a caller does not send min_context.
@@ -102,6 +103,9 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"max_context must be >= min_context"}}`, http.StatusBadRequest)
 		return
 	}
+	// Detect images on the original body: stripAutoFields re-marshals but does
+	// not touch messages, so either works — this is just the earlier one.
+	hasImages := vision.RequestHasImages(body)
 
 	// Strip the auto-only fields before forwarding: min_context and max_context
 	// are selector knobs, not chat completion parameters, and upstreams reject
@@ -143,8 +147,26 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		&s.decideMu,
 		&s.decideCache,
 	)
-	log.Printf("auto: min=%d max=%d eligible=%d source=%s order=%s",
-		minCtx, req.MaxContext, len(cands), source, joinSteps(ordered))
+	// Vision filtering happens after ordering, not in Eligible: the decider's
+	// cached ranking is keyed on the full pool, so filtering first would force
+	// every image request onto a cold cache. Skipping non-vision models in rank
+	// order keeps the warm ranking and only narrows the walk.
+	if hasImages {
+		kept := make([]selector.Candidate, 0, len(ordered))
+		for _, c := range ordered {
+			if s.visionReg.Has(c.Step.Model) {
+				kept = append(kept, c)
+			}
+		}
+		log.Printf("auto: images=true kept=%d/%d vision-capable", len(kept), len(ordered))
+		ordered = kept
+		if len(ordered) == 0 {
+			http.Error(w, `{"error":{"message":"no vision-capable model available for image request"}}`, http.StatusNotFound)
+			return
+		}
+	}
+	log.Printf("auto: min=%d max=%d eligible=%d images=%v source=%s order=%s",
+		minCtx, req.MaxContext, len(cands), hasImages, source, joinSteps(ordered))
 
 	var lastErr error
 	var lastStatus int
@@ -156,7 +178,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			log.Printf("auto: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
-		resp, keyEnv, err := s.tryStep(r, step, body)
+		resp, keyEnv, err := s.tryStepAuto(r, step, body)
 		if err != nil {
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
@@ -190,6 +212,49 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", lastCT)
 	w.WriteHeader(lastStatus)
 	w.Write(lastBody)
+}
+
+// StartAutoDecider refreshes the decider ranking in the background so requests
+// read a warm cache instead of paying the decider's latency. The request path
+// still calls the decider on a cache miss (cold start, or the pool changed
+// since the last refresh) — the negative cache bounds that to one call per
+// interval. This is a process-lifetime goroutine; it stops with the process.
+func (s *Server) StartAutoDecider() {
+	if s.decideProvider == "" || s.decideModel == "" {
+		return
+	}
+	go func() {
+		s.refreshDecide()
+		t := time.NewTicker(s.decideInterval)
+		defer t.Stop()
+		for range t.C {
+			s.refreshDecide()
+		}
+	}()
+}
+
+// refreshDecide rebuilds the candidate pool the way handleAuto does with the
+// default context filter and runs one Decide to refresh the cache. The cache
+// key is the candidate list itself, so this only warms requests that use the
+// default min_context — narrower filters fall back to a synchronous call.
+func (s *Server) refreshDecide() {
+	pool := s.rtr.ListChains()
+	if len(pool) == 0 {
+		return
+	}
+	cands, _ := selector.Eligible(pool, DefaultMinContext, 0, s.ctxLen, s.hlth)
+	if len(cands) <= 1 {
+		return
+	}
+	ordered, _, source := selector.Decide(
+		cands,
+		s.deciderFor(cands, nil),
+		s.providerOrder(),
+		s.decideInterval,
+		&s.decideMu,
+		&s.decideCache,
+	)
+	log.Printf("auto: background refresh source=%s order=%s", source, joinSteps(ordered))
 }
 
 // deciderFor builds the closure Decide calls. It captures cands and the request

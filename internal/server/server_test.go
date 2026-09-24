@@ -246,7 +246,8 @@ func TestModelsListsChainNames(t *testing.T) {
 	for _, d := range out.Data {
 		got[d.ID] = true
 	}
-	if !got["fast"] || !got["smart"] || len(out.Data) != 2 {
+	// "auto" is always listed: the virtual router model clients discover.
+	if !got["fast"] || !got["smart"] || !got["auto"] || len(out.Data) != 3 {
 		t.Errorf("models = %v", got)
 	}
 }

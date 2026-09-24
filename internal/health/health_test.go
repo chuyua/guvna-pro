@@ -122,3 +122,65 @@ func TestIsolationBetweenSteps(t *testing.T) {
 		t.Fatal("healthy model of same provider must not be affected")
 	}
 }
+
+func TestSingleBadRequestMarksDown(t *testing.T) {
+	tkr := fakeTracker(t, time.Now())
+	tkr.Mark("p", "m", 400, nil)
+	if !tkr.IsDown("p", "m") {
+		t.Fatal("single 400 must mark step down immediately")
+	}
+	ss := tkr.Snapshot()
+	if len(ss) != 1 {
+		t.Fatalf("expected 1 step in snapshot, got %d", len(ss))
+	}
+	if !ss[0].Down {
+		t.Fatal("snapshot must report Down=true after single 400")
+	}
+	if d := ss[0].DownFor; d <= 0 || d > PermanentCooldown {
+		t.Fatalf("cool-off %v, want (0, %v]", d, PermanentCooldown)
+	}
+}
+
+func TestSingleNotFoundMarksDown(t *testing.T) {
+	tkr := fakeTracker(t, time.Now())
+	tkr.Mark("p", "m", 404, nil)
+	if !tkr.IsDown("p", "m") {
+		t.Fatal("single 404 must mark step down immediately")
+	}
+}
+
+func TestPermanentCooldownExpires(t *testing.T) {
+	start := time.Now()
+	tkr := fakeTracker(t, start)
+	tkr.Mark("p", "m", 400, nil)
+	if !tkr.IsDown("p", "m") {
+		t.Fatal("precondition: step down")
+	}
+	advance(tkr, PermanentCooldown)
+	if tkr.IsDown("p", "m") {
+		t.Fatal("step must be retried after permanent cool-off expires")
+	}
+}
+
+func TestSingleRateLimitNotDown(t *testing.T) {
+	tkr := fakeTracker(t, time.Now())
+	tkr.Mark("p", "m", 429, nil)
+	if tkr.IsDown("p", "m") {
+		t.Fatal("single 429 must not mark step down before threshold")
+	}
+}
+
+func TestSuccessResetsPermanentDown(t *testing.T) {
+	tkr := fakeTracker(t, time.Now())
+	tkr.Mark("p", "m", 404, nil)
+	if !tkr.IsDown("p", "m") {
+		t.Fatal("precondition: step down")
+	}
+	tkr.MarkSuccess("p", "m")
+	if tkr.IsDown("p", "m") {
+		t.Fatal("success must reset permanent down state")
+	}
+	if ss := tkr.Snapshot(); ss[0].Down || ss[0].Failures != 0 {
+		t.Fatalf("snapshot not reset: %+v", ss[0])
+	}
+}

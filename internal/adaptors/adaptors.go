@@ -89,6 +89,26 @@ func deciderTransport() *http.Transport {
 	return t
 }
 
+// AutoClient bounds each /v1/auto serving step to a short header wait. The
+// auto router's whole budget is the client's patience (tens of seconds); a
+// chain-timeout-sized wait (45s) lets one hung upstream eat the entire budget
+// before the next candidate is tried. ResponseHeaderTimeout only bounds the
+// wait for the first byte, so an accepted long stream is never cut mid-body.
+var AutoClient = &http.Client{
+	Timeout:   0,
+	Transport: autoTransport(),
+}
+
+func autoTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = preferV4DialContext
+	t.TLSHandshakeTimeout = envDuration("GUVNA_TLS_TIMEOUT", 15*time.Second)
+	t.ExpectContinueTimeout = envDuration("GUVNA_EXPECT_TIMEOUT", time.Second)
+	t.IdleConnTimeout = 90 * time.Second
+	t.ResponseHeaderTimeout = envDuration("GUVNA_AUTO_HEADER_TIMEOUT", 5*time.Second)
+	return t
+}
+
 // envDuration reads a duration override from the environment, falling back to
 // def on any empty, unparsable, or non-positive value.
 func envDuration(name string, def time.Duration) time.Duration {
@@ -151,11 +171,22 @@ func New(p config.Provider, key string) (Adaptor, error) {
 // NewDecider builds an adaptor that uses DeciderClient (longer header timeout)
 // instead of the shared Client. For the /v1/auto decider call only.
 func NewDecider(p config.Provider, key string) (Adaptor, error) {
+	return withClient(p, key, DeciderClient)
+}
+
+// NewAuto builds an adaptor for /v1/auto serving steps: AutoClient bounds each
+// step's header wait to a few seconds so failover stays inside the client's
+// patience instead of the chain's.
+func NewAuto(p config.Provider, key string) (Adaptor, error) {
+	return withClient(p, key, AutoClient)
+}
+
+func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) {
 	switch p.Type {
 	case "openai":
-		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + chatPath, key: key, client: DeciderClient}, nil
+		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + chatPath, key: key, client: c}, nil
 	case "gemini":
-		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai" + chatPath, key: key, client: DeciderClient}, nil
+		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai" + chatPath, key: key, client: c}, nil
 	default:
 		return nil, fmt.Errorf("provider %q: unknown type %q", p.Name, p.Type)
 	}

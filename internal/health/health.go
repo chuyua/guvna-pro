@@ -17,6 +17,8 @@ const (
 	CooldownBase = 60 * time.Second
 	// CooldownMax caps exponential cool-off growth.
 	CooldownMax = 10 * time.Minute
+	// PermanentCooldown is the fixed cool-off applied on a single 400/404.
+	PermanentCooldown = 5 * time.Minute
 )
 
 // StepStatus is a snapshot of one step's health state.
@@ -50,6 +52,14 @@ func New() *Tracker {
 
 // Mark records a failure for a step. Cool-off grows exponentially with
 // consecutive failures: 1m, 2m, 4m, ..., capped at CooldownMax.
+//
+// A 400 or 404 means the request is incompatible with this model — bad
+// request shape for the model, or the model does not exist on the provider.
+// Such errors are permanent at the model level and do not heal on retry, so
+// one occurrence is enough to mark the step down; the cool-off is fixed
+// rather than exponential because there is nothing to back off from — after
+// PermanentCooldown the step is probed once to see if the model was added or
+// restored, and re-marked immediately if not.
 func (t *Tracker) Mark(provider, model string, status int, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -60,6 +70,13 @@ func (t *Tracker) Mark(provider, model string, status int, err error) {
 		st.lastErr = err.Error()
 	} else {
 		st.lastErr = fmt.Sprintf("status %d", status)
+	}
+	if status == 400 || status == 404 {
+		if st.failures < FailureThreshold {
+			st.failures = FailureThreshold
+		}
+		st.downUntil = st.lastAt.Add(PermanentCooldown)
+		return
 	}
 	// Cool-off starts at CooldownBase when the step first goes down and
 	// doubles for each consecutive failure beyond the threshold: 1m, 2m,
