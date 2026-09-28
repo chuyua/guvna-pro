@@ -93,23 +93,31 @@ func deciderTransport() *http.Transport {
 	return t
 }
 
-// AutoClient bounds each /v1/auto serving step to a short header wait. The
-// auto router's whole budget is the client's patience (tens of seconds); a
-// chain-timeout-sized wait (45s) lets one hung upstream eat the entire budget
-// before the next candidate is tried. ResponseHeaderTimeout only bounds the
-// wait for the first byte, so an accepted long stream is never cut mid-body.
+// AutoClient (streaming steps) and AutoClientNonStream bound each /v1/auto
+// serving step's header wait. The two exist because the header means different
+// things: for a stream it is the first-token budget (short); for a non-stream
+// completion the upstream sends headers only after generating the whole body,
+// so the same 5s would fail every inference model — and feed timeouts into
+// health/keypool, marking healthy providers down for the /v1/chat chain too.
+// The auto router's total budget is the client's patience (tens of seconds); a
+// chain-sized 45s wait lets one hung upstream eat it all.
 var AutoClient = &http.Client{
 	Timeout:   0,
-	Transport: autoTransport(),
+	Transport: autoTransport(envDuration("GUVNA_AUTO_HEADER_TIMEOUT", 5*time.Second)),
 }
 
-func autoTransport() *http.Transport {
+var AutoClientNonStream = &http.Client{
+	Timeout:   0,
+	Transport: autoTransport(envDuration("GUVNA_AUTO_HEADER_TIMEOUT_NONSTREAM", 30*time.Second)),
+}
+
+func autoTransport(headerTimeout time.Duration) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = preferV4DialContext
 	t.TLSHandshakeTimeout = envDuration("GUVNA_TLS_TIMEOUT", 15*time.Second)
 	t.ExpectContinueTimeout = envDuration("GUVNA_EXPECT_TIMEOUT", time.Second)
 	t.IdleConnTimeout = 90 * time.Second
-	t.ResponseHeaderTimeout = envDuration("GUVNA_AUTO_HEADER_TIMEOUT", 5*time.Second)
+	t.ResponseHeaderTimeout = headerTimeout
 	return t
 }
 
@@ -182,8 +190,13 @@ func NewDecider(p config.Provider, key string) (Adaptor, error) {
 // NewAuto builds an adaptor for /v1/auto serving steps: AutoClient bounds each
 // step's header wait to a few seconds so failover stays inside the client's
 // patience instead of the chain's.
-func NewAuto(p config.Provider, key string) (Adaptor, error) {
-	return withClient(p, key, AutoClient)
+// NewAuto picks the client by stream-ness: streams get the short first-token
+// budget, non-stream completions the longer whole-generation budget.
+func NewAuto(p config.Provider, key string, stream bool) (Adaptor, error) {
+	if stream {
+		return withClient(p, key, AutoClient)
+	}
+	return withClient(p, key, AutoClientNonStream)
 }
 
 func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) {

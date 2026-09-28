@@ -183,7 +183,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			log.Printf("auto: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
-		resp, keyEnv, err := s.tryStepAuto(r, step, body)
+		resp, keyEnv, err := s.tryStepAuto(r, step, body, chat.Stream)
 		if err != nil {
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
@@ -200,12 +200,15 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lastStatus = resp.StatusCode
-		lastBody, _ = io.ReadAll(resp.Body)
+		lastBody, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
-		if retryable(resp.StatusCode, nil) {
-			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
-		}
+		// Mark unconditionally: Mark itself decides severity. 400/404 are
+		// permanent model-level errors and go to a single-strike cooldown;
+		// 429/5xx keep the threshold behavior. Gating here on retryable()
+		// would let a text-only model eat an image request (400) on every
+		// request forever, because it would never enter cool-off.
+		s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
 		log.Printf("auto: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, c.Chain, chat, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode), keyEnv)
 	}
@@ -262,22 +265,38 @@ func (s *Server) refreshDecide() {
 	log.Printf("auto: background refresh source=%s order=%s", source, joinSteps(ordered))
 }
 
+// DefaultBackgroundDecideDeadline caps a whole background decider call,
+// including the body read. The decider client only bounds the wait for
+// response headers; without this a stalled body would hang the refresh loop
+// (and therefore the ranking cache) for the life of the process.
+const DefaultBackgroundDecideDeadline = 3 * time.Minute
+
 // deciderFor builds the closure Decide calls. It captures cands and the request
 // context rather than storing them on the Server, so two concurrent /v1/auto
 // requests cannot hand each other's candidate list to the decider. wait bounds
-// the call: 0 means no added deadline (background refresh), a positive value
-// caps how long a request-path caller may block on the decider.
+// the call: a positive value caps how long a request-path caller may block on
+// the decider (derived from parent, so a client disconnect cancels at once);
+// 0 is the background refresh, which gets a generous total deadline instead.
 func (s *Server) deciderFor(cands []selector.Candidate, parent context.Context, wait time.Duration) func(context.Context) (map[string]int, error) {
 	if s.decideProvider == "" || s.decideModel == "" {
 		return nil
 	}
-	return func(ctx context.Context) (map[string]int, error) {
+	return func(context.Context) (map[string]int, error) {
+		// The ctx argument from Decide is context.Background; deriving from it
+		// would sever the tie to the caller. Derive from parent instead.
+		ctx := context.Background()
+		if parent != nil {
+			ctx = parent
+		}
 		if wait > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, wait)
 			defer cancel()
+			return s.callDecider(parent, ctx, cands)
 		}
-		return s.callDecider(parent, ctx, cands)
+		bgCtx, cancel := context.WithTimeout(context.Background(), DefaultBackgroundDecideDeadline)
+		defer cancel()
+		return s.callDecider(parent, bgCtx, cands)
 	}
 }
 
@@ -359,9 +378,22 @@ func (s *Server) decidePrompt(cands []selector.Candidate) string {
 	for _, c := range cands {
 		st := stats[c.Step.Provider+"/"+c.Step.Model]
 		fmt.Fprintf(&b, "- %s | provider=%s | context=%d | recent_failures=%d | down=%v\n",
-			c.Step.Provider+"/"+c.Step.Model, c.Step.Provider, c.Context, st.failures, st.down)
+			sanitizeLine(c.Step.Provider+"/"+c.Step.Model), c.Step.Provider, c.Context, st.failures, st.down)
 	}
 	return b.String()
+}
+
+// sanitizeLine strips control characters from a chain-supplied string before it
+// goes into the decider prompt. step.Model is client-writable via
+// POST /v1/chains with no character validation; without this, a crafted model
+// name could inject newlines and forge ranking instructions.
+func sanitizeLine(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // providerOrder is the static fallback. GUVNA_PROVIDE_ORDER wins when set;

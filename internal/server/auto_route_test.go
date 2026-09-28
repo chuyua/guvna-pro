@@ -250,3 +250,66 @@ func TestAutoNoChains(t *testing.T) {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 }
+
+// A /v1/auto request may omit "model" entirely; withModel must set it per step
+// rather than only rewriting an existing value, or every upstream 400s.
+func TestAutoWithoutModelField(t *testing.T) {
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"}}]}`)
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
+	chains := []config.Chain{{Name: "fam-a", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	s, ts := autoServer(t, providers, chains, map[string]string{"KEY_A": "k"})
+	_ = s
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/auto",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer client-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+}
+
+// A single 400 must put the model into single-strike cool-off: the next
+// request's Eligible pass excludes it, so the 400ing upstream is not asked
+// again (that is the vision self-healing promise).
+func TestAutoMarks400Down(t *testing.T) {
+	bad, badCalls := countingUpstream(t, http.StatusBadRequest, `{"error":"bad request"}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"}}]}`)
+	providers := []config.Provider{
+		{Name: "a", Type: "openai", BaseURL: bad.URL, KeyEnv: "KEY_A"},
+		{Name: "b", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_B"},
+	}
+	// "a" sorts first in static order, so the first request hits it.
+	chains := []config.Chain{
+		{Name: "fam-a", Steps: []config.Step{{Provider: "a", Model: "m-a"}}},
+		{Name: "fam-b", Steps: []config.Step{{Provider: "b", Model: "m-b"}}},
+	}
+	s, ts := autoServer(t, providers, chains, map[string]string{"KEY_A": "k", "KEY_B": "k"})
+
+	resp := doAuto(t, ts, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200 via failover", resp.StatusCode)
+	}
+	if n := badCalls.Load(); n != 1 {
+		t.Fatalf("bad upstream called %d times on first request; want 1", n)
+	}
+	if !s.hlth.IsDown("a", "m-a") {
+		t.Fatal("single 400 did not put the model into cool-off")
+	}
+
+	// Second request: the 400ing candidate is excluded before the walk.
+	resp = doAuto(t, ts, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200", resp.StatusCode)
+	}
+	if n := badCalls.Load(); n != 1 {
+		t.Fatalf("bad upstream called %d times total; want 1 (cool-off excluded it)", n)
+	}
+}

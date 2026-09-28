@@ -128,6 +128,13 @@ func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.
 	}
 	provider, model := envOr("GUVNA_DECIDER_PROVIDER", ""), envOr("GUVNA_DECIDER_MODEL", "")
 	interval := envDuration("GUVNA_DECIDE_INTERVAL", DefaultDecideInterval)
+	// Floor the interval: a typo like "10ms" would otherwise hammer the decider
+	// (each call costs real tokens) and shrink the negative-cache window to
+	// nothing.
+	if interval < time.Second {
+		log.Printf("auto: GUVNA_DECIDE_INTERVAL=%s below 1s, using 1s", interval)
+		interval = time.Second
+	}
 	// A request that hits a cold cache must not inherit the decider client's
 	// 90s header timeout: when the decider provider is down (2026-09-29, nvidia
 	// all-day http2 timeouts), the first request paid 90s before falling back,
@@ -583,11 +590,15 @@ func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.
 	return s.tryStepAdaptor(r, step, body, adaptors.New)
 }
 
-// tryStepAuto serves one /v1/auto step through AutoClient: the short header
-// timeout bounds a hung upstream to a few seconds so the candidate walk stays
-// inside the caller's patience, instead of the chain-sized wait.
-func (s *Server) tryStepAuto(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
-	return s.tryStepAdaptor(r, step, body, adaptors.NewAuto)
+// tryStepAuto serves one /v1/auto step through the auto clients: streams get
+// a short first-token budget, non-stream completions a longer whole-generation
+// budget (the upstream sends headers only after generating the whole body), so
+// a slow upstream costs seconds instead of the chain-sized wait.
+func (s *Server) tryStepAuto(r *http.Request, step router.Step, body []byte, stream bool) (*http.Response, string, error) {
+	mk := func(p config.Provider, key string) (adaptors.Adaptor, error) {
+		return adaptors.NewAuto(p, key, stream)
+	}
+	return s.tryStepAdaptor(r, step, body, mk)
 }
 
 func (s *Server) tryStepAdaptor(r *http.Request, step router.Step, body []byte, mkAdaptor func(config.Provider, string) (adaptors.Adaptor, error)) (*http.Response, string, error) {
@@ -660,11 +671,12 @@ func withModel(body []byte, model string) []byte {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
 	}
-	if m["model"] != nil {
-		enc, err := json.Marshal(model)
-		if err == nil {
-			m["model"] = enc
-		}
+	// Set unconditionally, not just when the field exists: a /v1/auto request
+	// may omit "model" entirely, and every upstream requires it — omitting the
+	// rewrite would fail the whole candidate walk with 400s.
+	enc, err := json.Marshal(model)
+	if err == nil {
+		m["model"] = enc
 	}
 	out, err := json.Marshal(m)
 	if err != nil {

@@ -146,3 +146,15 @@ func mustLoad(path string) *Registry {
 	}
 	return r
 }
+
+func TestHasSuffixVariants(t *testing.T) {
+	r := &Registry{Models: map[string]bool{"deepseek-v4-flash": false}}
+	for _, m := range []string{
+		"nvidia/deepseek-ai/deepseek-v4-flash:free",
+		"deepseek-v4-flash:free",
+	} {
+		if r.Has(m) {
+			t.Errorf("Has(%q) = true; suffix-stripped lookup should hit the blacklist", m)
+		}
+	}
+}

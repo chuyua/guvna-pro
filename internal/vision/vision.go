@@ -14,6 +14,7 @@ package vision
 
 import (
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -86,7 +87,17 @@ func candidateKeys(model string) []string {
 	if len(parts) == 0 {
 		return nil
 	}
-	return []string{model, parts[len(parts)-1]}
+	keys := []string{model, parts[len(parts)-1]}
+	// Deployers suffix ids ("deepseek-v4-flash:free"); the capability is the
+	// base model's, so also try the suffix-stripped forms before falling back
+	// to the optimistic default.
+	if i := strings.IndexByte(model, ':'); i > 0 {
+		keys = append(keys, model[:i])
+	}
+	if tail := parts[len(parts)-1]; strings.IndexByte(tail, ':') > 0 {
+		keys = append(keys, tail[:strings.IndexByte(tail, ':')])
+	}
+	return keys
 }
 
 func splitSlash(s string) []string {
