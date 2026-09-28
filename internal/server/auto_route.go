@@ -46,6 +46,11 @@ const DefaultMinContext = 512
 // DefaultDecideInterval is how long a decider answer is reused.
 const DefaultDecideInterval = 30 * time.Second
 
+// DefaultDeciderRequestWait bounds the synchronous decider call a request may
+// make on a cold cache. The background refresh uses the decider client's full
+// 90s header timeout; a waiting client must not.
+const DefaultDeciderRequestWait = 10 * time.Second
+
 // autoRequest carries only the fields this handler reads; the rest of the body
 // is forwarded to the upstream via withModel/mergeParams in tryStep.
 type autoRequest struct {
@@ -141,7 +146,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 
 	ordered, _, source := selector.Decide(
 		cands,
-		s.deciderFor(cands, r.Context()),
+		s.deciderFor(cands, r.Context(), s.decideReqWait),
 		s.providerOrder(),
 		s.decideInterval,
 		&s.decideMu,
@@ -248,7 +253,7 @@ func (s *Server) refreshDecide() {
 	}
 	ordered, _, source := selector.Decide(
 		cands,
-		s.deciderFor(cands, nil),
+		s.deciderFor(cands, nil, 0),
 		s.providerOrder(),
 		s.decideInterval,
 		&s.decideMu,
@@ -259,12 +264,19 @@ func (s *Server) refreshDecide() {
 
 // deciderFor builds the closure Decide calls. It captures cands and the request
 // context rather than storing them on the Server, so two concurrent /v1/auto
-// requests cannot hand each other's candidate list to the decider.
-func (s *Server) deciderFor(cands []selector.Candidate, parent context.Context) func(context.Context) (map[string]int, error) {
+// requests cannot hand each other's candidate list to the decider. wait bounds
+// the call: 0 means no added deadline (background refresh), a positive value
+// caps how long a request-path caller may block on the decider.
+func (s *Server) deciderFor(cands []selector.Candidate, parent context.Context, wait time.Duration) func(context.Context) (map[string]int, error) {
 	if s.decideProvider == "" || s.decideModel == "" {
 		return nil
 	}
 	return func(ctx context.Context) (map[string]int, error) {
+		if wait > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, wait)
+			defer cancel()
+		}
 		return s.callDecider(parent, ctx, cands)
 	}
 }

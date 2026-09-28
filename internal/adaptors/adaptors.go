@@ -20,12 +20,16 @@ import (
 )
 
 const chatPath = "/v1/chat/completions"
+const embedPath = "/v1/embeddings"
 
 // Adaptor forwards a raw chat completion request to one provider.
 type Adaptor interface {
 	// Chat sends body to the upstream and returns the raw response.
 	// Caller owns closing resp.Body.
 	Chat(ctx context.Context, body []byte) (*http.Response, error)
+	// Embed sends an embeddings request to the upstream and returns the raw
+	// response. Caller owns closing resp.Body.
+	Embed(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // Dial timeout lives on the Dialer, not the Transport: http.Transport no longer
@@ -137,23 +141,24 @@ func preferV4Transport() *http.Transport {
 }
 
 type openAICompat struct {
-	name   string
-	url    string
-	key    string
-	client *http.Client // nil uses the shared Client
+	name     string
+	url      string
+	embedURL string
+	key      string
+	client   *http.Client // nil uses the shared Client
 }
 
 // NewOpenAICompat builds an OpenAI-protocol adaptor (type "openai").
 func NewOpenAICompat(p config.Provider, key string) Adaptor {
-	url := strings.TrimRight(p.BaseURL, "/") + chatPath
-	return &openAICompat{name: p.Name, url: url, key: key}
+	base := strings.TrimRight(p.BaseURL, "/")
+	return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key}
 }
 
 // NewGemini builds the Gemini adaptor. Uses Gemini's official OpenAI-compatible
 // endpoint so the body passes through unchanged.
 func NewGemini(p config.Provider, key string) Adaptor {
-	base := strings.TrimRight(p.BaseURL, "/")
-	return &openAICompat{name: p.Name, url: base + "/v1beta/openai" + chatPath, key: key}
+	base := strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai"
+	return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key}
 }
 
 // New returns the adaptor matching the provider's type.
@@ -184,9 +189,11 @@ func NewAuto(p config.Provider, key string) (Adaptor, error) {
 func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) {
 	switch p.Type {
 	case "openai":
-		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + chatPath, key: key, client: c}, nil
+		base := strings.TrimRight(p.BaseURL, "/")
+		return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key, client: c}, nil
 	case "gemini":
-		return &openAICompat{name: p.Name, url: strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai" + chatPath, key: key, client: c}, nil
+		base := strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai"
+		return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key, client: c}, nil
 	default:
 		return nil, fmt.Errorf("provider %q: unknown type %q", p.Name, p.Type)
 	}
@@ -194,6 +201,20 @@ func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) 
 
 func (a *openAICompat) Chat(ctx context.Context, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.url, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.key)
+	req.Header.Set("User-Agent", "guvna/0.1")
+	if a.client != nil {
+		return a.client.Do(req)
+	}
+	return Client.Do(req)
+}
+
+func (a *openAICompat) Embed(ctx context.Context, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.embedURL, strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}

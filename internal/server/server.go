@@ -91,6 +91,7 @@ type Server struct {
 	decideProvider   string
 	decideModel      string
 	decideInterval   time.Duration
+	decideReqWait    time.Duration
 	decideMu         sync.Mutex
 	decideCandidates []selector.Candidate
 	decideCache      selector.Cache
@@ -104,13 +105,13 @@ func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *tele
 		}
 	}
 	s := &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, pools: pools, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
-	s.ctxLen, s.visionReg, s.decideProvider, s.decideModel, s.decideInterval = loadAutoConfig()
+	s.ctxLen, s.visionReg, s.decideProvider, s.decideModel, s.decideInterval, s.decideReqWait = loadAutoConfig()
 	return s
 }
 
 // loadAutoConfig reads the /v1/auto knobs. The registry is advisory and never
 // fatal — a missing or malformed file must not take the gateway down.
-func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.Duration) {
+func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.Duration, time.Duration) {
 	reg, err := ctxsize.Load(envOr("GUVNA_CONTEXT_REGISTRY", ""))
 	if err != nil {
 		log.Printf("auto: context registry %v (using built-ins)", err)
@@ -127,7 +128,13 @@ func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.
 	}
 	provider, model := envOr("GUVNA_DECIDER_PROVIDER", ""), envOr("GUVNA_DECIDER_MODEL", "")
 	interval := envDuration("GUVNA_DECIDE_INTERVAL", DefaultDecideInterval)
-	return forCtx, vreg, provider, model, interval
+	// A request that hits a cold cache must not inherit the decider client's
+	// 90s header timeout: when the decider provider is down (2026-09-29, nvidia
+	// all-day http2 timeouts), the first request paid 90s before falling back,
+	// by which time the client was long gone. The background refresh keeps the
+	// long timeout; the request path gets this bounded wait instead.
+	reqWait := envDuration("GUVNA_DECIDER_REQUEST_WAIT", DefaultDeciderRequestWait)
+	return forCtx, vreg, provider, model, interval, reqWait
 }
 
 func envOr(name, def string) string {
@@ -161,6 +168,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("GET /v1/models", s.auth.Middleware(http.HandlerFunc(s.handleModels)))
 	mux.Handle("POST /v1/chat/completions", s.auth.Middleware(http.HandlerFunc(s.handleChat)))
+	mux.Handle("POST /v1/embeddings", s.auth.Middleware(http.HandlerFunc(s.handleEmbeddings)))
 	mux.Handle("POST /v1/auto", s.auth.Middleware(http.HandlerFunc(s.handleAuto)))
 	mux.Handle("POST /v1/responses", s.auth.Middleware(http.HandlerFunc(s.handleResponses)))
 	mux.Handle("GET /v1/models/{id}", s.auth.Middleware(http.HandlerFunc(s.handleModelInfo)))
@@ -426,6 +434,139 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", lastCT)
 	w.WriteHeader(lastStatus)
 	w.Write(lastBody)
+}
+
+// handleEmbeddings relays an embeddings request to the resolved provider.
+// Embeddings are non-streaming: the request is forwarded raw to the upstream's
+// /v1/embeddings endpoint and the response is passed through byte-identical.
+// Model names follow the same provider-prefixed convention as chat (e.g.
+// nvidia/nemotron-3-embed-1b), resolved through the router's passthrough path
+// when the model is not a named chain.
+func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
+		return
+	}
+	var req chatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
+		return
+	}
+	if req.Model == "" {
+		http.Error(w, `{"error":{"message":"missing model"}}`, http.StatusBadRequest)
+		return
+	}
+	_, steps, err := s.rtr.Resolve(req.Model)
+	if err != nil {
+		if errors.Is(err, router.ErrNotFound) {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"unknown model %q — use a provider-prefixed model"}}`, req.Model), http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":{"message":"resolve failed"}}`, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("embed: model=%q steps=%d", req.Model, len(steps))
+
+	var lastErr error
+	var lastStatus int
+	var lastBody []byte
+	var lastCT string
+	for _, step := range steps {
+		if s.hlth.IsDown(step.Provider, step.Model) {
+			log.Printf("embed: skipping %s/%s (cool-off)", step.Provider, step.Model)
+			continue
+		}
+		resp, keyEnv, err := s.tryEmbed(r, step, body)
+		if err != nil {
+			log.Printf("embed: step %s/%s failed: %v", step.Provider, step.Model, err)
+			lastErr = err
+			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			continue
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			s.hlth.MarkSuccess(step.Provider, step.Model)
+			if p := s.pools[step.Provider]; p != nil {
+				p.MarkSuccess(keyEnv)
+			}
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
+			return
+		}
+		lastStatus = resp.StatusCode
+		lastBody, _ = io.ReadAll(resp.Body)
+		lastCT = resp.Header.Get("Content-Type")
+		resp.Body.Close()
+		if retryable(resp.StatusCode, nil) {
+			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+		}
+		log.Printf("embed: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
+	}
+	log.Printf("embed: all steps failed for model %q: %v", req.Model, lastErr)
+	if lastStatus == 0 {
+		http.Error(w, `{"error":{"message":"no providers available"}}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", lastCT)
+	w.WriteHeader(lastStatus)
+	w.Write(lastBody)
+}
+
+// tryEmbed is the embeddings sibling of tryStepAdaptor: same key-pool rotation
+// and retry, but the payload goes to the upstream's /v1/embeddings endpoint.
+func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
+	p, ok := s.provider(step.Provider)
+	if !ok {
+		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
+	}
+	pool := s.pools[step.Provider]
+	if pool == nil {
+		pool, _ = keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine)
+		s.pools[step.Provider] = pool
+	}
+	payload := mergeParams(withModel(body, step.Model), step.Params)
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 && s.retryWait != nil {
+			time.Sleep(s.retryWait(attempt))
+		}
+		keyEnv := pool.Pick()
+		key := s.env(keyEnv)
+		if key == "" {
+			err := fmt.Errorf("provider %q: key env %q not set", p.Name, keyEnv)
+			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
+			lastErr = err
+			continue
+		}
+		a, err := adaptors.New(p, key)
+		if err != nil {
+			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
+			lastErr = err
+			continue
+		}
+		resp, err := a.Embed(r.Context(), payload)
+		if err != nil {
+			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
+			pool.Mark(keyEnv, keypool.ClassFor(0, err))
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, keyEnv, nil
+		}
+		log.Printf("embed: %s/%s attempt %d: status %d", step.Provider, step.Model, attempt+1, resp.StatusCode)
+		if !retryable(resp.StatusCode, nil) && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			return resp, keyEnv, nil // other 4xx: config/request error, never retried
+		}
+		pool.Mark(keyEnv, keypool.ClassFor(resp.StatusCode, nil))
+		if attempt == retries {
+			return resp, keyEnv, nil // transient failures exhausted: last response
+		}
+		resp.Body.Close()
+	}
+	return nil, "", lastErr
 }
 
 // tryStep attempts one chain step, retrying transient failures (429, 5xx,
