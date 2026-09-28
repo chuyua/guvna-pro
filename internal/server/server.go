@@ -530,8 +530,7 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 	}
 	pool := s.pools[step.Provider]
 	if pool == nil {
-		pool, _ = keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine)
-		s.pools[step.Provider] = pool
+		return nil, "", fmt.Errorf("provider %q: no key pool", step.Provider)
 	}
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
@@ -608,8 +607,7 @@ func (s *Server) tryStepAdaptor(r *http.Request, step router.Step, body []byte, 
 	}
 	pool := s.pools[step.Provider]
 	if pool == nil {
-		pool, _ = keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine)
-		s.pools[step.Provider] = pool
+		return nil, "", fmt.Errorf("provider %q: no key pool", step.Provider)
 	}
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
