@@ -173,11 +173,22 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	log.Printf("auto: min=%d max=%d eligible=%d images=%v source=%s order=%s",
 		minCtx, req.MaxContext, len(cands), hasImages, source, joinSteps(ordered))
 
+	// Total wall-clock budget for the whole candidate walk. Decider miss
+	// (≤GUVNA_DECIDER_REQUEST_WAIT) plus a few slow non-stream steps (30s each
+	// without this) could exceed any client's patience; cap the walk so a
+	// wedged pool degrades to a 503 in bounded time instead of chaining a
+	// timeout per candidate.
+	deadline := time.Now().Add(envDuration("GUVNA_AUTO_TOTAL_BUDGET", 45*time.Second))
+
 	var lastErr error
 	var lastStatus int
 	var lastBody []byte
 	var lastCT string
 	for _, c := range ordered {
+		if time.Now().After(deadline) {
+			log.Printf("auto: total budget exceeded, stopping walk")
+			break
+		}
 		step := c.Step
 		if s.hlth.IsDown(step.Provider, step.Model) {
 			log.Printf("auto: skipping %s/%s (cool-off)", step.Provider, step.Model)
@@ -203,12 +214,20 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		lastBody, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
-		// Mark unconditionally: Mark itself decides severity. 400/404 are
-		// permanent model-level errors and go to a single-strike cooldown;
-		// 429/5xx keep the threshold behavior. Gating here on retryable()
-		// would let a text-only model eat an image request (400) on every
-		// request forever, because it would never enter cool-off.
-		s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+		// Mark unconditionally for transient and for 400: Mark itself decides
+		// severity — 400 is the vision self-healing signal (a text-only model
+		// eating an image request enters single-strike cool-off) and we cannot
+		// gate on retryable() or that signal never fires. 404 is different: it
+		// means the model is configured on the chain but absent upstream — a
+		// scheduling residue, not a model-health signal. Judging it down would
+		// spread a config error into /v1/chat's shared health for 5 minutes
+		// (and it never heals, so re-probing is wasted). Skip it every request
+		// (fast) and leave its state untouched.
+		if resp.StatusCode == http.StatusNotFound {
+			log.Printf("auto: step %s/%s not found upstream (config residue), skipping", step.Provider, step.Model)
+		} else {
+			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+		}
 		log.Printf("auto: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, c.Chain, chat, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode), keyEnv)
 	}

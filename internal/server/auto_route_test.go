@@ -313,3 +313,34 @@ func TestAutoMarks400Down(t *testing.T) {
 		t.Fatalf("bad upstream called %d times total; want 1 (cool-off excluded it)", n)
 	}
 }
+
+// A 404 (model configured but absent upstream) must not put the model into
+// permanent cool-off: that would spread a scheduling residue into /v1/chat's
+// shared health. It is skipped fast on every request instead.
+func TestAuto404DoesNotMarkDown(t *testing.T) {
+	nf, nfCalls := countingUpstream(t, http.StatusNotFound, `{"error":"model not found"}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"}}]}`)
+	providers := []config.Provider{
+		{Name: "a", Type: "openai", BaseURL: nf.URL, KeyEnv: "KEY_A"},
+		{Name: "b", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_B"},
+	}
+	chains := []config.Chain{
+		{Name: "fam-a", Steps: []config.Step{{Provider: "a", Model: "m-a"}}},
+		{Name: "fam-b", Steps: []config.Step{{Provider: "b", Model: "m-b"}}},
+	}
+	s, ts := autoServer(t, providers, chains, map[string]string{"KEY_A": "k", "KEY_B": "k"})
+
+	for i := 0; i < 2; i++ {
+		resp := doAuto(t, ts, nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200 via failover", i, resp.StatusCode)
+		}
+	}
+	if n := nfCalls.Load(); n != 2 {
+		t.Fatalf("404 upstream called %d times over 2 requests; want 2 (skipped fast each time, not cool-off)", n)
+	}
+	if s.hlth.IsDown("a", "m-a") {
+		t.Fatal("404 put the model into cool-off; a scheduling residue must not be judged down")
+	}
+}

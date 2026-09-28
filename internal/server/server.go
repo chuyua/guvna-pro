@@ -100,9 +100,17 @@ type Server struct {
 func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *telemetry.Telemetry, hlth *health.Tracker, logs *logring.Ring, store *chains.Store) *Server {
 	pools := make(map[string]*keypool.Pool, len(cfg.Providers))
 	for _, p := range cfg.Providers {
-		if pool, err := keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine); err == nil {
-			pools[p.Name] = pool
+		pool, err := keypool.New(p.Name, p.AllKeyEnvs(), p.Rotation, p.Quarantine)
+		if err != nil {
+			// Fatal: a provider that fails to build its key pool would serve
+			// requests that die at pick time. Silently dropping it here turns an
+			// operator-entered config error into a live 503 (or, in the old lazy
+			// path, a concurrent map write). config.Validate rejects empty pools
+			// and unknown rotations at startup, so this only fires on any future
+			// keypool failure mode — fail loudly, not silently.
+			log.Fatalf("key pool for provider %q: %v", p.Name, err)
 		}
+		pools[p.Name] = pool
 	}
 	s := &Server{cfg: cfg, rtr: rtr, auth: a, tm: tm, hlth: hlth, logs: logs, store: store, pools: pools, started: time.Now(), env: os.Getenv, retryWait: defaultRetryWait}
 	s.ctxLen, s.visionReg, s.decideProvider, s.decideModel, s.decideInterval, s.decideReqWait = loadAutoConfig()
