@@ -187,12 +187,16 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 	if len(cands) <= 1 {
 		return nil, "single_candidate", nil
 	}
+	if decider == nil {
+		return nil, "", fmt.Errorf("decider not configured")
+	}
+	var key string
 	if mu != nil && cache != nil {
-		key := candidatesKey(cands)
+		key = candidatesKey(cands)
 		mu.Lock()
-		// Two states: a ranking was cached, or a decider call was made and
-		// failed. The second one matters — with it a wedged decider costs one
-		// call per interval instead of one per request, which would turn the
+		// Two cached states: a ranking, or a decider call that failed. The
+		// second one matters — with it a wedged decider costs one call per
+		// interval instead of one per request, which would turn the
 		// decider's 20s into the latency of every /v1/auto call.
 		hit := cache.key == key && time.Since(cache.at) < interval
 		if hit && cache.order != nil {
@@ -204,18 +208,45 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 			mu.Unlock()
 			return nil, "", fmt.Errorf("decider cached failure")
 		}
+		// A live call for the same candidate set is already in flight: wait
+		// for it instead of issuing a duplicate decider request.
+		if call, ok := cache.inflight[key]; ok {
+			mu.Unlock()
+			<-call.done
+			if call.err != nil {
+				return nil, "decider_shared", call.err
+			}
+			return call.order, "decider_shared", nil
+		}
+		if cache.inflight == nil {
+			cache.inflight = make(map[string]*decideCall)
+		}
+		call := &decideCall{done: make(chan struct{})}
+		cache.inflight[key] = call
 		mu.Unlock()
-	}
-	if decider == nil {
-		return nil, "", fmt.Errorf("decider not configured")
-	}
-	ranked, err := decider(context.Background())
-	if mu != nil && cache != nil {
-		key := candidatesKey(cands)
+
+		ranked, err := decider(context.Background())
+		if err == nil && ranked == nil {
+			err = fmt.Errorf("decider returned no ranking")
+		}
+		if err != nil {
+			ranked = nil
+		}
 		mu.Lock()
 		// err is nil iff ranked is non-nil, so one store covers both states.
 		cache.key, cache.order, cache.at = key, ranked, time.Now()
+		delete(cache.inflight, key)
 		mu.Unlock()
+		call.order, call.err = ranked, err
+		close(call.done)
+		if err != nil {
+			return nil, "", err
+		}
+		return ranked, "decider", nil
+	}
+	ranked, err := decider(context.Background())
+	if err == nil && ranked == nil {
+		err = fmt.Errorf("decider returned no ranking")
 	}
 	if err != nil {
 		return nil, "", err
@@ -235,6 +266,17 @@ type Cache struct {
 	key   string
 	order map[string]int
 	at    time.Time
+	// inflights merges concurrent cold-cache misses on the same candidate
+	// set into one decider call. Without it, N simultaneous /v1/auto
+	// requests on a cold or expired cache fire N decider calls — paid
+	// tokens and rate-limit pressure for an identical answer.
+	inflight map[string]*decideCall
+}
+
+type decideCall struct {
+	done  chan struct{}
+	order map[string]int
+	err   error
 }
 
 // ParseRanking reads a decider answer of the form {"order":["amd/X","nvidia/Y"]}.

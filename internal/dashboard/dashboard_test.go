@@ -164,28 +164,30 @@ func TestLogsClampN(t *testing.T) {
 	gw := &fakeGateway{logs: `{"lines":["a","b"]}`}
 	_, _, ds := newTestDashboard(t, gw)
 	c := login(t, ds.URL)
-	for path, wantN := range map[string]string{
-		"/partial/logs":        "n=100",
-		"/partial/logs?n=256":  "n=256",
-		"/partial/logs?n=9999": "n=512",
-		"/partial/logs?n=abc":  "n=100",
-		"/partial/logs?n=-5":   "n=100",
-		"/partial/logs?n=512":  "n=512",
-	} {
-		_, body := cget(t, c, ds.URL+path)
-		if !strings.Contains(body, "n="+strings.TrimPrefix(wantN, "n=")) {
-			t.Errorf("%s: poller missing %q", path, wantN)
+	// Sequential with a per-request assertion: map iteration order plus a
+	// single lastReq check made this flaky (pass/fail/pass observed).
+	cases := []struct{ path, wantN string }{
+		{"/partial/logs", "n=100"},
+		{"/partial/logs?n=256", "n=256"},
+		{"/partial/logs?n=9999", "n=512"},
+		{"/partial/logs?n=abc", "n=100"},
+		{"/partial/logs?n=-5", "n=100"},
+		{"/partial/logs?n=0", "n=100"},
+		{"/partial/logs?n=1", "n=1"},
+		{"/partial/logs?n=512", "n=512"},
+		{"/partial/logs?n=513", "n=512"},
+		{"/partial/logs?n=999999999999999999999999999999", "n=100"},
+	}
+	for _, tc := range cases {
+		_, body := cget(t, c, ds.URL+tc.path)
+		if !strings.Contains(body, "n="+strings.TrimPrefix(tc.wantN, "n=")) {
+			t.Errorf("%s: poller missing %q", tc.path, tc.wantN)
 		}
 		if !strings.Contains(body, "a") {
-			t.Errorf("%s: missing log lines", path)
+			t.Errorf("%s: missing log lines", tc.path)
 		}
-	}
-	if q := gw.lastReq.URL.Query().Get("n"); q != "512" {
-		// last request in map order is random; just verify clamping happened
-		// at least once by re-requesting the overflow case.
-		_, _ = cget(t, c, ds.URL+"/partial/logs?n=9999")
-		if q := gw.lastReq.URL.Query().Get("n"); q != "512" {
-			t.Errorf("gateway got n=%q, want 512", q)
+		if q := gw.lastReq.URL.Query().Get("n"); q != strings.TrimPrefix(tc.wantN, "n=") {
+			t.Errorf("%s: gateway got n=%q, want %q", tc.path, q, strings.TrimPrefix(tc.wantN, "n="))
 		}
 	}
 }

@@ -57,7 +57,7 @@ func TestOpenAICompatForwards(t *testing.T) {
 }
 
 func TestGeminiUsesOpenAICompatEndpoint(t *testing.T) {
-	up := testUpstream(t, "/v1beta/openai/v1/chat/completions", "gk-test")
+	up := testUpstream(t, "/v1beta/openai/chat/completions", "gk-test")
 	defer up.Close()
 
 	a := NewGemini(config.Provider{Name: "gemini", BaseURL: up.URL}, "gk-test")
@@ -84,7 +84,7 @@ func TestNewByType(t *testing.T) {
 }
 
 func TestGeminiFailsWithoutKey(t *testing.T) {
-	up := testUpstream(t, "/v1beta/openai/v1/chat/completions", "gk-test")
+	up := testUpstream(t, "/v1beta/openai/chat/completions", "gk-test")
 	defer up.Close()
 	a := NewGemini(config.Provider{Name: "gemini", BaseURL: up.URL}, "")
 	resp, err := a.Chat(context.Background(), []byte(`{}`))

@@ -19,22 +19,24 @@ type Step struct {
 }
 
 type Router struct {
-	mu         sync.RWMutex
-	chains     map[string][]Step
-	modelIndex map[string]string
-	providers  map[string]config.Provider
-	sources    map[string]string // chain name -> "config" | "runtime"
+	mu            sync.RWMutex
+	chains        map[string][]Step
+	modelIndex    map[string][]string // model -> chains in addition order, newest last
+	providers     map[string]config.Provider
+	providerOrder []string          // provider names in configuration order
+	sources       map[string]string // chain name -> "config" | "runtime"
 }
 
 func New(cfg *config.Config) *Router {
 	r := &Router{
 		chains:     make(map[string][]Step, len(cfg.Chains)),
-		modelIndex: make(map[string]string),
+		modelIndex: make(map[string][]string),
 		providers:  make(map[string]config.Provider, len(cfg.Providers)),
 		sources:    make(map[string]string),
 	}
 	for _, p := range cfg.Providers {
 		r.providers[p.Name] = p
+		r.providerOrder = append(r.providerOrder, p.Name)
 	}
 	for _, ch := range cfg.Chains {
 		r.addLocked(ch.Name, stepsFromConfig(ch.Steps), "config")
@@ -53,8 +55,12 @@ func stepsFromConfig(steps []config.Step) []Step {
 func (r *Router) addLocked(name string, steps []Step, source string) {
 	r.chains[name] = steps
 	r.sources[name] = source
+	seen := make(map[string]bool, len(steps))
 	for _, s := range steps {
-		r.modelIndex[s.Model] = name
+		if !seen[s.Model] {
+			r.modelIndex[s.Model] = append(r.modelIndex[s.Model], name)
+			seen[s.Model] = true
+		}
 	}
 }
 
@@ -101,7 +107,18 @@ func (r *Router) RemoveChain(name string) error {
 	}
 	steps := r.chains[name]
 	for _, s := range steps {
-		delete(r.modelIndex, s.Model)
+		owners := r.modelIndex[s.Model]
+		for i, owner := range owners {
+			if owner == name {
+				owners = append(owners[:i], owners[i+1:]...)
+				break
+			}
+		}
+		if len(owners) == 0 {
+			delete(r.modelIndex, s.Model)
+		} else {
+			r.modelIndex[s.Model] = owners
+		}
 	}
 	delete(r.chains, name)
 	delete(r.sources, name)
@@ -118,7 +135,8 @@ func (r *Router) Resolve(model string) (name string, steps []Step, err error) {
 		r.mu.RUnlock()
 		return
 	}
-	if chain, found := r.modelIndex[model]; found {
+	if owners, found := r.modelIndex[model]; found {
+		chain := owners[len(owners)-1]
 		name, steps, err = chain, r.chains[chain], nil
 		r.mu.RUnlock()
 		return
@@ -131,14 +149,15 @@ func (r *Router) Resolve(model string) (name string, steps []Step, err error) {
 }
 
 // passthrough routes a model directly to a provider by prefix. For each
-// provider in config order, for each of its prefixes (provider name plus any
-// configured extras): if the model starts with "<prefix>/", route it there.
+// provider in config order, for each of its configured prefixes (or its name
+// when no prefixes are configured): if the model starts with "<prefix>/", route it there.
 // If the stripped name appears in the provider's static models list, the
 // stripped name is sent (covers bare-name catalogs like groq); otherwise the
 // full original name is sent (covers namespaced catalogs like orcarouter's
 // "openai/gpt-5.6-luna").
 func (r *Router) passthrough(model string) (string, string, bool) {
-	for _, p := range r.providers {
+	for _, providerName := range r.providerOrder {
+		p := r.providers[providerName]
 		prefixes := p.Prefixes
 		if len(prefixes) == 0 {
 			prefixes = []string{p.Name}

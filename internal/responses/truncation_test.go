@@ -18,7 +18,7 @@ func TestFromChatTruncationIsIncomplete(t *testing.T) {
 	}{
 		{"stop", "stop", "completed", false},
 		{"length", "length", "incomplete", true},
-		{"content_filter", "content_filter", "completed", false},
+		{"content_filter", "content_filter", "incomplete", true},
 		{"no choices at all", "", "completed", false},
 	}
 	for _, tc := range cases {
@@ -27,6 +27,16 @@ func TestFromChatTruncationIsIncomplete(t *testing.T) {
 			resp := FromChat(cc, &Request{}, Served{ChatModel: "m"})
 			if resp.Status != tc.wantStatus {
 				t.Errorf("status = %q, want %q", resp.Status, tc.wantStatus)
+			}
+			if tc.wantDetails && resp.IncompleteDetails != nil {
+				wantReason := "max_output_tokens"
+				if tc.finish == "content_filter" {
+					wantReason = "content_filter"
+				}
+				details, ok := resp.IncompleteDetails.(map[string]any)
+				if !ok || details["reason"] != wantReason {
+					t.Errorf("incomplete_details = %v, want reason %s", resp.IncompleteDetails, wantReason)
+				}
 			}
 			if tc.wantDetails && resp.IncompleteDetails == nil {
 				t.Error("incomplete_details = nil, want reason max_output_tokens")
@@ -38,7 +48,7 @@ func TestFromChatTruncationIsIncomplete(t *testing.T) {
 }
 
 // TestStreamTruncationIsIncomplete covers the streaming path: the terminal
-// response.completed must carry the same status, because Codex reads it there.
+// response.incomplete must carry the truncation status and reason.
 func TestStreamTruncationIsIncomplete(t *testing.T) {
 	rec, fl := newStreamRecorder(t)
 	s, err := NewStream(rec, fl, &Request{}, Served{ChatModel: "m"})
@@ -67,6 +77,9 @@ func TestStreamTruncationIsIncomplete(t *testing.T) {
 	}
 	if last == nil {
 		t.Fatal("no terminal event")
+	}
+	if last["type"] != "response.incomplete" {
+		t.Fatalf("terminal type=%v, want response.incomplete", last["type"])
 	}
 	resp, ok := last["response"].(map[string]any)
 	if !ok {

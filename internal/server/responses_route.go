@@ -4,7 +4,6 @@
 package server
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,10 +95,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			s.hlth.MarkSuccess(step.Provider, step.Model)
-			if p := s.pools[step.Provider]; p != nil {
-				p.MarkSuccess(keyEnv)
-			}
+			// Health is marked after the body lands — same rule as handleChat.
 			if req.Stream {
 				s.relayResponsesStream(w, r, step, chain, req, resp, keyEnv)
 			} else {
@@ -141,11 +137,12 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		if r.Context().Err() != nil {
 			return
 		}
-		s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient)
-		s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, err, keyEnv)
+		s.hlth.Mark(step.Provider, step.Model, 0, err)
+		s.poolRecordResult(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, err)
 		responsesErr(w, http.StatusBadGateway, "api_error", "upstream_read_failed", "upstream read failed")
 		return
 	}
+	s.hlth.MarkSuccess(step.Provider, step.Model)
 	var cc responses.ChatCompletion
 	if err := json.Unmarshal(body, &cc); err != nil {
 		// Not a chat completion object — pass the body straight through so the
@@ -153,6 +150,7 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
+		s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, 0, 0, "")
 		return
 	}
 	// The upstream echoes the model that actually served the request, e.g.
@@ -170,10 +168,9 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 	json.NewEncoder(w).Encode(outResp)
 }
 
-// relayResponsesStream converts chat.completion.chunk SSE payloads into
-// response.* events. Keep-alive behaves like the chat relay: it is written only
-// after data returns, so it cannot mask an idle stream — the transport's
-// ResponseHeaderTimeout already bounds the wait for headers.
+// relayResponsesStream translates complete SSE events. Blocking reads run in a
+// separate goroutine so keep-alive and cancellation remain responsive; only this
+// goroutine writes the client response. Once opened, this stream never fails over.
 func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req *responses.Request, resp *http.Response, keyEnv string) {
 	defer resp.Body.Close()
 	fl, ok := w.(http.Flusher)
@@ -181,107 +178,147 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 		responsesErr(w, http.StatusInternalServerError, "api_error", "streaming_unsupported", "streaming unsupported")
 		return
 	}
-	// The upstream's echoed model name is unknown until the first chunk, and
-	// response.created must go out before any content. Use the chain step's
-	// model — what we asked for — which is honest and always available.
-	// Headers must be set before the first byte goes out: NewStream writes
-	// response.created immediately, which commits the headers.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("X-Guvna-Step", step.Provider+"/"+step.Model)
-
 	served := responses.Served{ChatModel: step.Model, ChainModel: step.Model}
-	st, err := responses.NewStream(w, fl, req, served)
+	output := &streamOutput{ResponseWriter: w}
+	st, err := responses.NewStream(output, fl, req, served)
 	if err != nil {
-		s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 500, 0, 0, keypool.ClassTransient)
-		s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 500, err, keyEnv)
 		return
-	}
-
-	br := bufio.NewReader(resp.Body)
-	lastWrite := time.Now()
+	} // a downstream write failure says nothing about upstream health
+	lines, stop := readStreamLines(r.Context(), resp.Body)
+	defer stop()
+	timer := time.NewTimer(KeepAliveInterval)
+	defer timer.Stop()
+	var data sseData
 	var usage *responses.ChatUsage
 	var finish string
-
-	// data accumulates the current SSE data: payload across lines.
-	var data strings.Builder
-	var done bool
-	flushData := func() error {
-		payload := strings.TrimSpace(data.String())
-		data.Reset()
-		if payload == "" || done {
-			return nil
+	chatReq := chatRequest{Model: req.Model, Stream: req.Stream}
+	tokens := func() (int64, int64) {
+		if usage == nil {
+			return 0, 0
 		}
-		if payload == "[DONE]" {
-			done = true
-			return nil
+		return usage.PromptTokens, usage.CompletionTokens
+	}
+	fail := func(err error) {
+		if r.Context().Err() != nil {
+			return
+		}
+		in, out := tokens()
+		s.hlth.Mark(step.Provider, step.Model, 0, err)
+		s.poolRecordResult(keyEnv, step, chain, chatReq, 502, in, out, keypool.ClassTransient, err)
+		_ = st.Fail("upstream stream invalid or interrupted")
+	}
+	complete := func() {
+		if r.Context().Err() != nil {
+			return
+		}
+		if err := st.Finish(finish, usage); err != nil {
+			return
+		}
+		s.hlth.MarkSuccess(step.Provider, step.Model)
+		in, out := tokens()
+		s.poolRecord(keyEnv, step, chain, chatReq, resp.StatusCode, in, out, "")
+	}
+	// Parse errors are upstream failures; Chunk write errors are downstream
+	// failures. Keep these distinct so disconnects cannot quarantine a good key.
+	consume := func(payload string) (done bool, upstreamErr, writeErr error) {
+		if strings.TrimSpace(payload) == "[DONE]" {
+			return true, nil, nil
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &fields); err != nil || fields == nil {
+			return false, errors.New("invalid upstream SSE JSON"), nil
+		}
+		if raw, ok := fields["error"]; ok && string(raw) != "null" {
+			return false, errors.New("upstream SSE error payload"), nil
 		}
 		var cc responses.ChatChunk
 		if err := json.Unmarshal([]byte(payload), &cc); err != nil {
-			return nil // keep-alive comments and malformed lines are ignored
+			return false, errors.New("invalid upstream chat chunk"), nil
+		}
+		if len(cc.Choices) == 0 && cc.Usage == nil {
+			return false, errors.New("upstream SSE payload has no choices or usage"), nil
 		}
 		if cc.Usage != nil {
 			usage = cc.Usage
 		}
-		if len(cc.Choices) > 0 && cc.Choices[0].FinishReason != nil && finish == "" {
-			finish = *cc.Choices[0].FinishReason
+		if len(cc.Choices) > 0 && cc.Choices[0].FinishReason != nil {
+			reason := *cc.Choices[0].FinishReason
+			switch reason {
+			case "stop", "length", "tool_calls", "function_call", "content_filter":
+				finish = reason
+			case "": // some providers emit an empty reason before the terminal chunk
+			default:
+				return false, errors.New("unknown upstream finish_reason"), nil
+			}
 		}
-		return st.Chunk(&cc)
+		output.wrote = false
+		return false, nil, st.Chunk(&cc)
 	}
-
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		default:
-		}
-		if time.Since(lastWrite) > KeepAliveInterval {
+		case <-timer.C:
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
 				return
 			}
 			fl.Flush()
-			lastWrite = time.Now()
-			continue
-		}
-		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			// Only translate; the raw chat line must never reach the client.
-			// lastWrite is refreshed here so the keep-alive below can fire on
-			// an idle-but-alive upstream, but no bytes are written yet.
-			lastWrite = time.Now()
-			if trimmed := strings.TrimSpace(string(line)); strings.HasPrefix(trimmed, "data:") {
-				data.WriteString(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
-				if serr := flushData(); serr != nil {
-					return
-				}
-			}
-		}
-		if err != nil {
+			timer.Reset(KeepAliveInterval)
+		case next := <-lines:
 			if r.Context().Err() != nil {
-				return // client disconnected mid-stream
-			}
-			if errors.Is(err, io.EOF) {
-				_ = flushData()
-				if serr := st.Finish(finish, usage); serr != nil {
-					log.Printf("responses: stream close from %q failed: %v", step.Provider, serr)
-				}
-				s.hlth.MarkSuccess(step.Provider, step.Model)
-				if p := s.pools[step.Provider]; p != nil {
-					p.MarkSuccess(keyEnv)
-				}
-				in, out := int64(0), int64(0)
-				if usage != nil {
-					in, out = usage.PromptTokens, usage.CompletionTokens
-				}
-				s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, in, out, "")
 				return
 			}
-			log.Printf("responses: stream error from %q: %v", step.Provider, err)
-			_ = st.Errorf(http.StatusBadGateway, "upstream stream error")
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
-			s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient)
-			return
+			if len(next.line) > 0 {
+				if payload, ok := data.line(next.line); ok {
+					done, upstreamErr, writeErr := consume(payload)
+					if upstreamErr != nil {
+						fail(upstreamErr)
+						return
+					}
+					if writeErr != nil {
+						return
+					}
+					if output.wrote {
+						resetKeepAlive(timer)
+					}
+					if done {
+						complete()
+						return
+					}
+				}
+			}
+			if next.err != nil {
+				if !errors.Is(next.err, io.EOF) {
+					fail(next.err)
+					return
+				}
+				// EOF dispatches a pending event too, but it is not itself a
+				// successful terminator. A valid finish_reason or DONE is required.
+				if payload, ok := data.flush(); ok {
+					done, upstreamErr, writeErr := consume(payload)
+					if upstreamErr != nil {
+						fail(upstreamErr)
+						return
+					}
+					if writeErr != nil {
+						return
+					}
+					if done {
+						complete()
+						return
+					}
+				}
+				if finish == "" {
+					fail(errors.New("upstream SSE ended without a terminator"))
+					return
+				}
+				complete()
+				return
+			}
 		}
 	}
 }

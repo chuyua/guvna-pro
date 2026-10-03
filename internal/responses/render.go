@@ -26,14 +26,19 @@ import (
 // non-streaming chat completions body.
 func FromChat(cc *ChatCompletion, orig *Request, served Served) *Response {
 	status := "completed"
-	if finishReasonOf(cc) == "length" {
+	reason := finishReasonOf(cc)
+	if reason == "length" || reason == "content_filter" {
 		status = "incomplete"
 	}
 	resp := responseEnvelope(orig, served, status)
 	resp.Output = messageOutputItems(cc)
 	resp.Usage = chatUsageToUsage(chatUsageOf(cc))
 	if status == "incomplete" {
-		resp.IncompleteDetails = map[string]any{"reason": "max_output_tokens"}
+		why := "max_output_tokens"
+		if reason == "content_filter" {
+			why = "content_filter"
+		}
+		resp.IncompleteDetails = map[string]any{"reason": why}
 	}
 	return resp
 }
@@ -552,7 +557,7 @@ func (s *Stream) Finish(reason string, usage *ChatUsage) error {
 		}
 	}
 	status := "completed"
-	if reason == "length" {
+	if reason == "length" || reason == "content_filter" {
 		// The model hit its output budget. The Responses wire carries no
 		// finish_reason field, so status plus incomplete_details are the only
 		// signal a client gets that the answer was cut off - reporting
@@ -563,9 +568,13 @@ func (s *Stream) Finish(reason string, usage *ChatUsage) error {
 	resp.Output = s.finalOutput()
 	resp.Usage = chatUsageToUsage(s.usage)
 	if status == "incomplete" {
-		resp.IncompleteDetails = map[string]any{"reason": "max_output_tokens"}
+		why := "max_output_tokens"
+		if reason == "content_filter" {
+			why = "content_filter"
+		}
+		resp.IncompleteDetails = map[string]any{"reason": why}
 	}
-	if err := s.event("response.completed", map[string]any{"response": resp}); err != nil {
+	if err := s.event("response."+status, map[string]any{"response": resp}); err != nil {
 		return err
 	}
 	return Done(s.w, s.fl)
@@ -702,6 +711,17 @@ func (s *Stream) Errorf(status int, msg string) error {
 			"code":    strconv.Itoa(status),
 		},
 	}); err != nil {
+		return err
+	}
+	return Done(s.w, s.fl)
+}
+
+// Fail abandons any open items without reporting their partial content or tool
+// arguments as completed. The response ID remains the one created at open time.
+func (s *Stream) Fail(msg string) error {
+	resp := s.responseObject("failed")
+	resp.Error = map[string]any{"code": "upstream_stream_error", "message": msg}
+	if err := s.event("response.failed", map[string]any{"response": resp}); err != nil {
 		return err
 	}
 	return Done(s.w, s.fl)

@@ -6,7 +6,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -423,10 +422,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			s.hlth.MarkSuccess(step.Provider, step.Model)
-			if p := s.pools[step.Provider]; p != nil {
-				p.MarkSuccess(keyEnv)
-			}
+			// Health is marked inside relaySuccess/relayStream, after the body
+			// actually lands: a 2xx header followed by a broken body must not
+			// reset the step's failure count (the pre-body MarkSuccess here
+			// used to do exactly that, so a truncating upstream never reached
+			// cool-off).
 			s.relaySuccess(w, r, step, chain, req, resp, keyEnv)
 			return
 		}
@@ -472,7 +472,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"missing model"}}`, http.StatusBadRequest)
 		return
 	}
-	_, steps, err := s.rtr.Resolve(req.Model)
+	chain, steps, err := s.rtr.Resolve(req.Model)
 	if err != nil {
 		if errors.Is(err, router.ErrNotFound) {
 			http.Error(w, fmt.Sprintf(`{"error":{"message":"unknown model %q — use a provider-prefixed model"}}`, req.Model), http.StatusNotFound)
@@ -497,17 +497,29 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			log.Printf("embed: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.record(step, chain, req, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			s.hlth.MarkSuccess(step.Provider, step.Model)
-			if p := s.pools[step.Provider]; p != nil {
-				p.MarkSuccess(keyEnv)
+			// Read the body before committing a status: a silently truncated
+			// 200 with a partial embedding would be worse than a 502 — the
+			// caller cannot tell an incomplete vector from a complete one.
+			embedBody, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				log.Printf("embed: body read failed from %s/%s: %v", step.Provider, step.Model, readErr)
+				if r.Context().Err() == nil {
+					s.hlth.Mark(step.Provider, step.Model, 0, readErr)
+					s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
+					http.Error(w, `{"error":{"message":"upstream read failed"}}`, http.StatusBadGateway)
+				}
+				return
 			}
+			s.hlth.MarkSuccess(step.Provider, step.Model)
+			s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
 			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			resp.Body.Close()
+			w.Write(embedBody)
 			return
 		}
 		lastStatus = resp.StatusCode
@@ -518,6 +530,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
 		}
 		log.Printf("embed: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
+		s.record(step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
 	}
 	log.Printf("embed: all steps failed for model %q: %v", req.Model, lastErr)
 	if lastStatus == 0 {
@@ -748,11 +761,12 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 				// Client disconnected — not an upstream failure.
 				return
 			}
-			s.poolRecord(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient)
-			s.record(step, chain, req, 502, err, keyEnv)
+			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
 			http.Error(w, `{"error":{"message":"upstream read failed"}}`, http.StatusBadGateway)
 			return
 		}
+		s.hlth.MarkSuccess(step.Provider, step.Model)
 		in, out := telemetry.ParseUsage(body)
 		s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
@@ -777,58 +791,57 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
 
-	br := bufio.NewReader(resp.Body)
-	lastWrite := time.Now()
+	lines, stop := readStreamLines(r.Context(), resp.Body)
+	defer stop()
+	timer := time.NewTimer(KeepAliveInterval)
+	defer timer.Stop()
 	var in, out int64
+	var data sseData
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		default:
-		}
-		if time.Since(lastWrite) > KeepAliveInterval {
+		case <-timer.C:
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
 				return
 			}
 			flusher.Flush()
-			lastWrite = time.Now()
-			continue
-		}
-		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			if _, werr := w.Write(line); werr != nil {
-				return
-			}
-			flusher.Flush()
-			lastWrite = time.Now()
-			// Streaming usage arrives in the final data: chunk; capture it
-			// best-effort for telemetry.
-			if payload := dataPayload(line); payload != nil {
-				if i, o := telemetry.ParseUsage(payload); i != 0 || o != 0 {
-					in, out = i, o
-				}
-			}
-		}
-		if err != nil {
+			timer.Reset(KeepAliveInterval)
+		case next := <-lines:
+			line, err := next.line, next.err
 			if r.Context().Err() != nil {
-				return // client disconnected mid-stream
-			}
-			if errors.Is(err, io.EOF) {
-				s.hlth.MarkSuccess(step.Provider, step.Model)
-				if p := s.pools[step.Provider]; p != nil {
-					p.MarkSuccess(keyEnv)
-				}
-				s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 				return
 			}
-			// Mid-stream failure: propagate as an error chunk, then close.
-			// Mark the provider so later requests skip it during cool-off.
-			log.Printf("chat: stream error from %q: %v", step.Provider, err)
-			io.WriteString(w, `data: {"error":{"message":"upstream stream error"}}`+"\n\n")
-			flusher.Flush()
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
-			s.poolRecord(keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient)
-			return
+			if len(line) > 0 {
+				if _, werr := w.Write(line); werr != nil {
+					return
+				}
+				flusher.Flush()
+				resetKeepAlive(timer)
+				if payload, ok := data.line(line); ok {
+					if i, o := telemetry.ParseUsage([]byte(payload)); i != 0 || o != 0 {
+						in, out = i, o
+					}
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					if payload, ok := data.flush(); ok {
+						if i, o := telemetry.ParseUsage([]byte(payload)); i != 0 || o != 0 {
+							in, out = i, o
+						}
+					}
+					s.hlth.MarkSuccess(step.Provider, step.Model)
+					s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+					return
+				}
+				log.Printf("chat: stream error from %q: %v", step.Provider, err)
+				io.WriteString(w, `data: {"error":{"message":"upstream stream error"}}`+"\n\n")
+				flusher.Flush()
+				s.hlth.Mark(step.Provider, step.Model, 0, err)
+				s.poolRecordResult(keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
+				return
+			}
 		}
 	}
 }
@@ -836,17 +849,26 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 // poolRecord records usage against the serving key and marks its pool state:
 // failures for class != "", success otherwise.
 func (s *Server) poolRecord(keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class) {
+	s.poolRecordResult(keyEnv, step, chain, req, status, in, out, class, nil)
+}
+
+// poolRecordResult commits one terminal request event, including an error and
+// any partial usage, rather than recording separate token and error rows.
+func (s *Server) poolRecordResult(keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class, err error) {
 	p := s.pools[step.Provider]
-	if p == nil || keyEnv == "" {
-		return
+	if p != nil && keyEnv != "" {
+		if class != "" {
+			p.Mark(keyEnv, class)
+		} else {
+			p.MarkSuccess(keyEnv)
+		}
+		p.Record(keyEnv, in, out)
 	}
-	if class != "" {
-		p.Mark(keyEnv, class)
-	} else {
-		p.MarkSuccess(keyEnv)
+	e := telemetry.Event{Provider: step.Provider, Chain: chain, Model: step.Model, Stream: req.Stream, Status: status, TokensIn: in, TokensOut: out, Key: keyEnv, Ts: time.Now()}
+	if err != nil {
+		e.Err = err.Error()
 	}
-	p.Record(keyEnv, in, out)
-	s.recordTokens(step, chain, req, status, in, out, keyEnv)
+	s.tm.Record(e)
 }
 
 // dataPayload returns the JSON payload of an SSE data: line, or nil.

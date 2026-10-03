@@ -237,10 +237,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			s.hlth.MarkSuccess(step.Provider, step.Model)
-			if p := s.pools[step.Provider]; p != nil {
-				p.MarkSuccess(keyEnv)
-			}
+			// Health moves inside relaySuccess — see the comment in handleChat.
 			s.relaySuccess(w, r, step, c.Chain, chat, resp, keyEnv)
 			return
 		}

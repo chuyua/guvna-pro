@@ -19,8 +19,12 @@ import (
 	"github.com/creamy-ghost/guvna/internal/config"
 )
 
-const chatPath = "/v1/chat/completions"
-const embedPath = "/v1/embeddings"
+const (
+	openAIPath = "/v1"
+	geminiPath = "/v1beta/openai"
+	chatPath   = "/chat/completions"
+	embedPath  = "/embeddings"
+)
 
 // Adaptor forwards a raw chat completion request to one provider.
 type Adaptor interface {
@@ -158,15 +162,20 @@ type openAICompat struct {
 
 // NewOpenAICompat builds an OpenAI-protocol adaptor (type "openai").
 func NewOpenAICompat(p config.Provider, key string) Adaptor {
-	base := strings.TrimRight(p.BaseURL, "/")
-	return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key}
+	return newCompat(p, key, openAIPath, nil)
 }
 
 // NewGemini builds the Gemini adaptor. Uses Gemini's official OpenAI-compatible
 // endpoint so the body passes through unchanged.
 func NewGemini(p config.Provider, key string) Adaptor {
-	base := strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai"
-	return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key}
+	return newCompat(p, key, geminiPath, nil)
+}
+
+// newCompat keeps endpoint construction identical across the normal, decider,
+// and auto clients. Gemini's compatibility API has no extra /v1 segment.
+func newCompat(p config.Provider, key, apiPath string, c *http.Client) Adaptor {
+	base := strings.TrimRight(p.BaseURL, "/") + apiPath
+	return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key, client: c}
 }
 
 // New returns the adaptor matching the provider's type.
@@ -202,11 +211,9 @@ func NewAuto(p config.Provider, key string, stream bool) (Adaptor, error) {
 func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) {
 	switch p.Type {
 	case "openai":
-		base := strings.TrimRight(p.BaseURL, "/")
-		return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key, client: c}, nil
+		return newCompat(p, key, openAIPath, c), nil
 	case "gemini":
-		base := strings.TrimRight(p.BaseURL, "/") + "/v1beta/openai"
-		return &openAICompat{name: p.Name, url: base + chatPath, embedURL: base + embedPath, key: key, client: c}, nil
+		return newCompat(p, key, geminiPath, c), nil
 	default:
 		return nil, fmt.Errorf("provider %q: unknown type %q", p.Name, p.Type)
 	}
