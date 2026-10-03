@@ -213,6 +213,14 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	// wedged pool degrades to a 503 in bounded time instead of chaining a
 	// timeout per candidate.
 	deadline := time.Now().Add(envDuration("GUVNA_AUTO_TOTAL_BUDGET", 45*time.Second))
+	// A slow non-streaming step can hold the walk hostage far past the total
+	// budget: the budget is checked between candidates, and AutoClientNonStream
+	// waits a whole generation for headers (~60s for a thinking model) — one
+	// such step at the front of the fallback order starved every later
+	// candidate. Non-streaming relays finish synchronously, so a step-scoped
+	// deadline is safe there (the body is fully read before the walk returns).
+	// Streaming relays outlive the handler loop and keep the request context.
+	stepBudget := envDuration("GUVNA_AUTO_STEP_BUDGET", 20*time.Second)
 
 	var lastErr error
 	var lastStatus int
@@ -228,7 +236,19 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			log.Printf("auto: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
-		resp, keyEnv, err := s.tryStepAuto(r, step, body, chat.Stream)
+		stepCtx := r.Context()
+		if !chat.Stream {
+			wait := stepBudget
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
+			}
+			if wait > 0 {
+				var cancel context.CancelFunc
+				stepCtx, cancel = context.WithTimeout(r.Context(), wait)
+				defer cancel()
+			}
+		}
+		resp, keyEnv, err := s.tryStepAuto(stepCtx, r, step, body, chat.Stream)
 		if err != nil {
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err

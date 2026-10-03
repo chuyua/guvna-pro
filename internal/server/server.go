@@ -7,6 +7,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -607,21 +608,21 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 // not — body left open for the caller to relay), or (nil, "", err) when every
 // attempt failed at the network level.
 func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
-	return s.tryStepAdaptor(r, step, body, adaptors.New)
+	return s.tryStepAdaptor(r.Context(), r, step, body, adaptors.New)
 }
 
 // tryStepAuto serves one /v1/auto step through the auto clients: streams get
 // a short first-token budget, non-stream completions a longer whole-generation
 // budget (the upstream sends headers only after generating the whole body), so
 // a slow upstream costs seconds instead of the chain-sized wait.
-func (s *Server) tryStepAuto(r *http.Request, step router.Step, body []byte, stream bool) (*http.Response, string, error) {
+func (s *Server) tryStepAuto(ctx context.Context, r *http.Request, step router.Step, body []byte, stream bool) (*http.Response, string, error) {
 	mk := func(p config.Provider, key string) (adaptors.Adaptor, error) {
 		return adaptors.NewAuto(p, key, stream)
 	}
-	return s.tryStepAdaptor(r, step, body, mk)
+	return s.tryStepAdaptor(ctx, r, step, body, mk)
 }
 
-func (s *Server) tryStepAdaptor(r *http.Request, step router.Step, body []byte, mkAdaptor func(config.Provider, string) (adaptors.Adaptor, error)) (*http.Response, string, error) {
+func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step router.Step, body []byte, mkAdaptor func(config.Provider, string) (adaptors.Adaptor, error)) (*http.Response, string, error) {
 	p, ok := s.provider(step.Provider)
 	if !ok {
 		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
@@ -650,7 +651,7 @@ func (s *Server) tryStepAdaptor(r *http.Request, step router.Step, body []byte, 
 			lastErr = err
 			continue
 		}
-		resp, err := a.Chat(r.Context(), payload)
+		resp, err := a.Chat(ctx, payload)
 		if err != nil {
 			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			pool.Mark(keyEnv, keypool.ClassFor(0, err))
