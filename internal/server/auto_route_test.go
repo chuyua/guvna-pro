@@ -344,3 +344,46 @@ func TestAuto404DoesNotMarkDown(t *testing.T) {
 		t.Fatal("404 put the model into cool-off; a scheduling residue must not be judged down")
 	}
 }
+
+// GUVNA_AUTO_MIN_CONTEXT is an operator preference: when it filters the whole
+// pool out, /v1/auto must degrade to the unfiltered pool rather than 404 —
+// otherwise a blip on the big-window models becomes a gateway outage. A
+// caller-supplied min_context is different: TestAutoRejectsInfeasibleFilter
+// pins that to a 404.
+func TestAutoDegradesServiceMinContext(t *testing.T) {
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	s, ts := autoServer(t, providers, chains, map[string]string{
+		"KEY_A":                  "k",
+		"GUVNA_AUTO_MIN_CONTEXT": "262144",
+	})
+	s.ctxLen = func(string) int { return 8192 }
+
+	resp := doAuto(t, ts, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (degraded)", resp.StatusCode)
+	}
+}
+
+// The same filter passed explicitly by the caller is a hard requirement and
+// must still 404, even with the env default in play.
+func TestAutoCallerMinContextStillHard(t *testing.T) {
+	good := okUpstream(t, `{"choices":[{}]}`)
+
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
+	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
+	s, ts := autoServer(t, providers, chains, map[string]string{
+		"KEY_A":                  "k",
+		"GUVNA_AUTO_MIN_CONTEXT": "262144",
+	})
+	s.ctxLen = func(string) int { return 8192 }
+
+	resp := doAuto(t, ts, map[string]any{"min_context": 20000})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}

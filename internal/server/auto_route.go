@@ -43,6 +43,16 @@ import (
 // DefaultMinContext applies when a caller does not send min_context.
 const DefaultMinContext = 512
 
+// minContextDefault is the service-level default for min_context. Operators
+// raise it via GUVNA_AUTO_MIN_CONTEXT (e.g. 262144 for a 256K floor) without a
+// rebuild; a request-level min_context still wins over both.
+func minContextDefault() int {
+	if v := envInt("GUVNA_AUTO_MIN_CONTEXT", 0); v > 0 {
+		return v
+	}
+	return DefaultMinContext
+}
+
 // DefaultDecideInterval is how long a decider answer is reused.
 const DefaultDecideInterval = 30 * time.Second
 
@@ -102,7 +112,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 
 	minCtx := req.MinContext
 	if minCtx <= 0 {
-		minCtx = DefaultMinContext
+		minCtx = minContextDefault()
 	}
 	if req.MaxContext > 0 && req.MaxContext < minCtx {
 		http.Error(w, `{"error":{"message":"max_context must be >= min_context"}}`, http.StatusBadRequest)
@@ -126,6 +136,30 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cands, excluded := selector.Eligible(pool, minCtx, req.MaxContext, s.ctxLen, s.hlth)
+	degraded := false
+	// Degradation only applies to the service-level default (minContextDefault,
+	// e.g. a 256K floor set via GUVNA_AUTO_MIN_CONTEXT): that is an operator
+	// preference, and a hard 404 turns it into an outage when the big-window
+	// models blip. A caller-supplied min_context is a correctness requirement —
+	// the caller asked for a window on purpose, so it still gets the 404 with
+	// per-candidate reasons below. max_context requests are likewise left
+	// alone: an explicit upper bound is a correctness requirement, not a
+	// preference.
+	if len(cands) == 0 && req.MinContext <= 0 && req.MaxContext == 0 {
+		ctxDropped := 0
+		for _, e := range excluded {
+			if e.Reason == "context_below_min" {
+				ctxDropped++
+			}
+		}
+		if ctxDropped == len(excluded) && ctxDropped > 0 {
+			cands, _ = selector.Eligible(pool, 0, 0, s.ctxLen, s.hlth)
+			degraded = len(cands) > 0
+			if degraded {
+				log.Printf("auto: min=%d left no candidates, degrading to unfiltered pool (%d)", minCtx, len(cands))
+			}
+		}
+	}
 	if len(cands) == 0 {
 		// "no providers available" would be misleading: a provider is available,
 		// it just does not meet the requested window. Say which candidates were
@@ -170,8 +204,8 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	log.Printf("auto: min=%d max=%d eligible=%d images=%v source=%s order=%s",
-		minCtx, req.MaxContext, len(cands), hasImages, source, joinSteps(ordered))
+	log.Printf("auto: min=%d max=%d eligible=%d images=%v degraded=%v source=%s order=%s",
+		minCtx, req.MaxContext, len(cands), hasImages, degraded, source, joinSteps(ordered))
 
 	// Total wall-clock budget for the whole candidate walk. Decider miss
 	// (≤GUVNA_DECIDER_REQUEST_WAIT) plus a few slow non-stream steps (30s each
@@ -269,7 +303,7 @@ func (s *Server) refreshDecide() {
 	if len(pool) == 0 {
 		return
 	}
-	cands, _ := selector.Eligible(pool, DefaultMinContext, 0, s.ctxLen, s.hlth)
+	cands, _ := selector.Eligible(pool, minContextDefault(), 0, s.ctxLen, s.hlth)
 	if len(cands) <= 1 {
 		return
 	}
