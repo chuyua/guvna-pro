@@ -209,10 +209,22 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 			return nil, "", fmt.Errorf("decider cached failure")
 		}
 		// A live call for the same candidate set is already in flight: wait
-		// for it instead of issuing a duplicate decider request.
+		// for it instead of issuing a duplicate decider request — but only
+		// briefly. The leader may be a background refresh whose decider call
+		// runs to the client's full 90s header timeout; a request that waits
+		// unconditionally then blows past its own patience (observed: 60s
+		// client disconnects while every candidate was still queued). After
+		// the wait budget the caller takes the static fallback order; when
+		// the leader lands it writes the cache and later requests share it.
 		if call, ok := cache.inflight[key]; ok {
 			mu.Unlock()
-			<-call.done
+			timer := time.NewTimer(DefaultShareWait)
+			select {
+			case <-call.done:
+				timer.Stop()
+			case <-timer.C:
+				return nil, "", fmt.Errorf("decider call in flight, share wait expired")
+			}
 			if call.err != nil {
 				return nil, "decider_shared", call.err
 			}
@@ -278,6 +290,12 @@ type decideCall struct {
 	order map[string]int
 	err   error
 }
+
+// DefaultShareWait bounds how long a request may block on another caller's
+// in-flight decider call. It mirrors DefaultDeciderRequestWait: a wait that
+// exceeds the client's patience is worse than the static fallback order the
+// caller gets instead.
+const DefaultShareWait = 10 * time.Second
 
 // ParseRanking reads a decider answer of the form {"order":["amd/X","nvidia/Y"]}.
 // Anything unparsable yields an error; the caller then falls back. Positions are
