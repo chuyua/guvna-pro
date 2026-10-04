@@ -248,7 +248,15 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 				defer cancel()
 			}
 		}
-		resp, keyEnv, err := s.tryStepAuto(stepCtx, r, step, body, chat.Stream)
+		// A stream_only provider's non-streaming endpoint is broken: the body
+		// rides an upstream stream, but the client still waits for one complete
+		// JSON body, so the per-step budget applies as for non-streaming.
+		stepBody := body
+		agg := !chat.Stream && s.streamOnly(step.Provider)
+		if agg {
+			stepBody = forceStreamBody(body)
+		}
+		resp, keyEnv, err := s.tryStepAuto(stepCtx, r, step, stepBody, chat.Stream)
 		if err != nil {
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
@@ -257,6 +265,17 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if agg {
+				aggResp, aerr := s.aggregateStreamed(resp)
+				if aerr != nil {
+					log.Printf("auto: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
+					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
+					s.record(step, c.Chain, chat, 0, aerr, keyEnv)
+					continue
+				}
+				s.relaySuccess(w, r, step, c.Chain, chat, aggResp, keyEnv)
+				return
+			}
 			// Health moves inside relaySuccess — see the comment in handleChat.
 			s.relaySuccess(w, r, step, c.Chain, chat, resp, keyEnv)
 			return

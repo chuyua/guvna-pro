@@ -86,6 +86,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			responsesErr(w, http.StatusInternalServerError, "api_error", "marshal_failed", err.Error())
 			return
 		}
+		// A stream_only provider's non-streaming endpoint is broken: rewrite
+		// the body to upstream streaming and aggregate below.
+		agg := !req.Stream && s.streamOnly(step.Provider)
+		if agg {
+			payload = forceStreamBody(payload)
+		}
 		resp, keyEnv, err := s.tryStep(r, step, payload)
 		if err != nil {
 			log.Printf("responses: step %s/%s failed: %v", step.Provider, step.Model, err)
@@ -95,6 +101,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if agg {
+				aggResp, aerr := s.aggregateStreamed(resp)
+				if aerr != nil {
+					log.Printf("responses: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
+					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
+					s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 0, aerr, keyEnv)
+					continue
+				}
+				// relayResponsesBody translates the chat.completion into a
+				// Responses object and marks health after the body lands.
+				s.relayResponsesBody(w, r, step, chain, req, aggResp, keyEnv)
+				return
+			}
 			// Health is marked after the body lands — same rule as handleChat.
 			if req.Stream {
 				s.relayResponsesStream(w, r, step, chain, req, resp, keyEnv)

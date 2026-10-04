@@ -28,6 +28,11 @@ type Provider struct {
 	Quarantine QuarantineCfg `yaml:"quarantine"`
 	Models     []string      `yaml:"models"`
 	Prefixes   []string      `yaml:"prefixes"`
+	// StreamOnly marks upstreams whose non-streaming endpoint is broken
+	// (e.g. a billing layer that rejects every non-stream POST). For these,
+	// non-streaming client requests are rewritten to upstream stream=true and
+	// the SSE chunks are aggregated back into a standard chat.completion.
+	StreamOnly bool `yaml:"stream_only"`
 }
 
 // AllKeyEnvs returns the provider's key env vars as a list: KeyEnvs if set,

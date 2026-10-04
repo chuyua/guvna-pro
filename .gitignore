@@ -14,3 +14,4 @@ docs/runbook-*.md
 # scp (docs/DASHBOARD.md), never committed (140MB+, mostly modernc sqlite)
 vendor/guvna-linux-amd64
 guvna-linux-amd64
+guvna-linux-amd64-new

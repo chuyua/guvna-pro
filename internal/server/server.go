@@ -414,7 +414,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("chat: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
-		resp, keyEnv, err := s.tryStep(r, step, body)
+		// A stream_only provider's non-streaming endpoint is broken: rewrite
+		// the body to upstream streaming and aggregate below.
+		stepBody := body
+		agg := !req.Stream && s.streamOnly(step.Provider)
+		if agg {
+			stepBody = forceStreamBody(body)
+		}
+		resp, keyEnv, err := s.tryStep(r, step, stepBody)
 		if err != nil {
 			log.Printf("chat: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
@@ -423,6 +430,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if agg {
+				aggResp, aerr := s.aggregateStreamed(resp)
+				if aerr != nil {
+					log.Printf("chat: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
+					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
+					s.record(step, chain, req, 0, aerr, keyEnv)
+					continue
+				}
+				// Health is marked inside relaySuccess, after the aggregated
+				// body is fully written to the client.
+				s.relaySuccess(w, r, step, chain, req, aggResp, keyEnv)
+				return
+			}
 			// Health is marked inside relaySuccess/relayStream, after the body
 			// actually lands: a 2xx header followed by a broken body must not
 			// reset the step's failure count (the pre-body MarkSuccess here
@@ -609,6 +629,13 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 // attempt failed at the network level.
 func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
 	return s.tryStepAdaptor(r.Context(), r, step, body, adaptors.New)
+}
+
+// streamOnly reports whether the provider's non-streaming endpoint is broken
+// and non-stream requests must ride an aggregated upstream stream instead.
+func (s *Server) streamOnly(name string) bool {
+	p, ok := s.provider(name)
+	return ok && p.StreamOnly
 }
 
 // tryStepAuto serves one /v1/auto step through the auto clients: streams get
