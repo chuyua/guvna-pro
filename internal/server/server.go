@@ -410,6 +410,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var lastBody []byte
 	var lastCT string
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		if s.hlth.IsDown(step.Provider, step.Model) {
 			log.Printf("chat: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
@@ -423,6 +426,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, keyEnv, err := s.tryStep(r, step, stepBody)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			log.Printf("chat: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.hlth.Mark(step.Provider, step.Model, 0, err)
@@ -433,6 +439,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if agg {
 				aggResp, aerr := s.aggregateStreamed(resp)
 				if aerr != nil {
+					if r.Context().Err() != nil {
+						return
+					}
 					log.Printf("chat: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
 					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
 					s.record(step, chain, req, 0, aerr, keyEnv)
@@ -509,12 +518,18 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	var lastBody []byte
 	var lastCT string
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		if s.hlth.IsDown(step.Provider, step.Model) {
 			log.Printf("embed: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
 		resp, keyEnv, err := s.tryEmbed(r, step, body)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			log.Printf("embed: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.hlth.Mark(step.Provider, step.Model, 0, err)
@@ -577,8 +592,8 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
 	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 && s.retryWait != nil {
-			time.Sleep(s.retryWait(attempt))
+		if err := s.waitRetry(r.Context(), attempt); err != nil {
+			return nil, "", err
 		}
 		keyEnv := pool.Pick()
 		key := s.env(keyEnv)
@@ -596,6 +611,9 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 		}
 		resp, err := a.Embed(r.Context(), payload)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return nil, "", r.Context().Err()
+			}
 			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			pool.Mark(keyEnv, keypool.ClassFor(0, err))
 			lastErr = err
@@ -661,8 +679,8 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
 	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 && s.retryWait != nil {
-			time.Sleep(s.retryWait(attempt))
+		if err := s.waitRetry(ctx, attempt); err != nil {
+			return nil, "", err
 		}
 		keyEnv := pool.Pick()
 		key := s.env(keyEnv)
@@ -680,6 +698,9 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 		}
 		resp, err := a.Chat(ctx, payload)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, "", ctx.Err()
+			}
 			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			pool.Mark(keyEnv, keypool.ClassFor(0, err))
 			lastErr = err
@@ -699,6 +720,25 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 		resp.Body.Close()
 	}
 	return nil, "", lastErr
+}
+
+// A disconnected caller has no next retry. Cancellation must also interrupt
+// backoff rather than briefly quarantining each otherwise healthy key.
+func (s *Server) waitRetry(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if attempt == 0 || s.retryWait == nil {
+		return nil
+	}
+	t := time.NewTimer(s.retryWait(attempt))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return ctx.Err()
+	}
 }
 
 // retryable reports whether a failure is transient: network errors, rate
