@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -98,11 +97,17 @@ func stripAutoFields(body []byte) []byte {
 // visible to POST /v1/chains, where a client could overwrite the pool order.
 func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBody(w, r)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
+		writeRequestBodyError(w, r, err)
 		return
 	}
+	s.handleAutoBody(w, r, body, started)
+}
+
+// handleAutoBody also serves model:auto through the Chat endpoint. Reuse the
+// already bounded input and its start time instead of reading it a second time.
+func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []byte, started time.Time) {
 	var req autoRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
@@ -288,6 +293,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		// A stream_only provider's non-streaming endpoint is broken: the body
 		// rides an upstream stream, but the client still waits for one complete
 		// JSON body, so the per-step budget applies as for non-streaming.
+		stepChat := withChoiceDefault(chat, body, step.Params)
 		stepBody := body
 		agg := !chat.Stream && s.streamOnly(step.Provider)
 		if agg {
@@ -318,7 +324,7 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 			stopSetupBudget()
 			var res relayResult
 			if agg {
-				aggResp, aerr := s.aggregateStreamed(resp, chat.N)
+				aggResp, aerr := s.aggregateStreamed(resp, stepChat.N)
 				if aerr != nil {
 					cancelStep()
 					if r.Context().Err() != nil {
@@ -331,10 +337,10 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
 				}
-				res = s.relaySuccess(w, r, step, c.Chain, chat, aggResp, keyEnv)
+				res = s.relaySuccess(w, r, step, c.Chain, stepChat, aggResp, keyEnv)
 			} else {
 				// Health moves inside relaySuccess — see the comment in handleChat.
-				res = s.relaySuccess(w, r, step, c.Chain, chat, resp, keyEnv)
+				res = s.relaySuccess(w, r, step, c.Chain, stepChat, resp, keyEnv)
 			}
 			cancelStep()
 			if res.clientGone {

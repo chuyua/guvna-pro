@@ -380,9 +380,10 @@ type chatRequest struct {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	started := time.Now()
+	body, err := readRequestBody(w, r)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	var req chatRequest
@@ -391,8 +392,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.EqualFold(req.Model, "auto") {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		s.handleAuto(w, r)
+		s.handleAutoBody(w, r, body, started)
 		return
 	}
 	chain, steps, err := s.rtr.Resolve(req.Model)
@@ -428,6 +428,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		// A stream_only provider's non-streaming endpoint is broken: rewrite
 		// the body to upstream streaming and aggregate below.
+		stepReq := withChoiceDefault(req, body, step.Params)
 		stepBody := body
 		agg := !req.Stream && s.streamOnly(step.Provider)
 		if agg {
@@ -457,7 +458,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			var res relayResult
 			if agg {
-				aggResp, aerr := s.aggregateStreamed(resp, req.N)
+				aggResp, aerr := s.aggregateStreamed(resp, stepReq.N)
 				if aerr != nil {
 					cancel()
 					if r.Context().Err() != nil {
@@ -472,14 +473,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				}
 				// Health is marked inside relaySuccess, after the aggregated
 				// body is fully written to the client.
-				res = s.relaySuccess(w, r, step, chain, req, aggResp, keyEnv)
+				res = s.relaySuccess(w, r, step, chain, stepReq, aggResp, keyEnv)
 			} else {
 				// Health is marked inside relaySuccess/relayStream, after the body
 				// actually lands: a 2xx header followed by a broken body must not
 				// reset the step's failure count (the pre-body MarkSuccess here
 				// used to do exactly that, so a truncating upstream never reached
 				// cool-off).
-				res = s.relaySuccess(w, r, step, chain, req, resp, keyEnv)
+				res = s.relaySuccess(w, r, step, chain, stepReq, resp, keyEnv)
 			}
 			cancel()
 			if res.clientGone {
@@ -526,9 +527,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 // nvidia/nemotron-3-embed-1b), resolved through the router's passthrough path
 // when the model is not a named chain.
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBody(w, r)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	var req chatRequest
@@ -984,7 +985,7 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 			log.Printf("chat: %s/%s body read failed: %v", step.Provider, step.Model, err)
 			return unusableBody(err)
 		}
-		if verr := validateChatCompletion(body); verr != nil {
+		if verr := validateChatCompletion(body, req.N); verr != nil {
 			s.mark(r, step.Provider, step.Model, 0, verr)
 			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
 			log.Printf("chat: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)

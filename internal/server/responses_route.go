@@ -38,9 +38,9 @@ func responsesErr(w http.ResponseWriter, status int, typ, code, msg string) {
 // protocol once, then walked through the identical chain / health / key-pool
 // loop that serves /v1/chat/completions. Only the final response shape differs.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBody(w, r)
 	if err != nil {
-		responsesErr(w, http.StatusBadRequest, "invalid_request_error", "read_body_failed", "read body")
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	req, err := responses.ParseRequest(body)

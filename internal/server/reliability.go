@@ -256,7 +256,11 @@ func isJSONNull(raw json.RawMessage) bool {
 // empty, non-JSON, an array, an {"error":...} object sent with status 200, or
 // no choices at all. A body that fails this check is a failed attempt, so the
 // walk can use the next step instead of handing the caller a broken success.
-func validateChatCompletion(body []byte) error {
+func validateChatCompletion(body []byte, expectedChoices ...int) error {
+	expected := 0
+	if len(expectedChoices) > 0 {
+		expected = expectedChoices[0]
+	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
 		return fmt.Errorf("upstream 2xx body is not a JSON object: %w", err)
@@ -275,12 +279,24 @@ func validateChatCompletion(body []byte) error {
 	if len(arr) == 0 {
 		return errors.New("upstream 2xx body has an empty choices array")
 	}
+	if expected > 1 && len(arr) != expected {
+		return errors.New("upstream completion has an unexpected choice count")
+	}
+	seen := make(map[int]bool)
 	for _, raw := range arr {
 		var choice struct {
+			Index   json.RawMessage            `json:"index"`
 			Message map[string]json.RawMessage `json:"message"`
 		}
 		if err := json.Unmarshal(raw, &choice); err != nil || len(choice.Message) == 0 {
 			return errors.New("upstream choice has no message")
+		}
+		if expected > 1 {
+			var index int
+			if isJSONNull(choice.Index) || json.Unmarshal(choice.Index, &index) != nil || index < 0 || index >= expected || seen[index] {
+				return errors.New("upstream completion has invalid or duplicate choice index")
+			}
+			seen[index] = true
 		}
 		usable := false
 		for _, field := range []string{"content", "reasoning_content", "reasoning", "refusal"} {
