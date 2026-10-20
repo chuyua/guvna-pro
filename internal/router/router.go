@@ -53,7 +53,7 @@ func stepsFromConfig(steps []config.Step) []Step {
 }
 
 func (r *Router) addLocked(name string, steps []Step, source string) {
-	r.chains[name] = steps
+	r.chains[name] = cloneSteps(steps)
 	r.sources[name] = source
 	seen := make(map[string]bool, len(steps))
 	for _, s := range steps {
@@ -61,6 +61,61 @@ func (r *Router) addLocked(name string, steps []Step, source string) {
 			r.modelIndex[s.Model] = append(r.modelIndex[s.Model], name)
 			seen[s.Model] = true
 		}
+	}
+}
+
+// cloneSteps isolates the JSON/YAML parameter containers at router boundaries.
+// Otherwise a caller can mutate params after the router lock is released,
+// including while the runtime store is marshaling a snapshot.
+func cloneSteps(steps []Step) []Step {
+	out := make([]Step, len(steps))
+	for i, step := range steps {
+		out[i] = step
+		if step.Params != nil {
+			out[i].Params = cloneParam(step.Params).(map[string]any)
+		}
+	}
+	return out
+}
+
+func cloneParam(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		if v == nil {
+			return v
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = cloneParam(item)
+		}
+		return out
+	case map[any]any:
+		if v == nil {
+			return v
+		}
+		out := make(map[any]any, len(v))
+		for key, item := range v {
+			out[key] = cloneParam(item)
+		}
+		return out
+	case []any:
+		if v == nil {
+			return v
+		}
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = cloneParam(item)
+		}
+		return out
+	case []string:
+		if v == nil {
+			return v
+		}
+		out := make([]string, len(v))
+		copy(out, v)
+		return out
+	default:
+		return value
 	}
 }
 
@@ -131,13 +186,13 @@ func (r *Router) RemoveChain(name string) error {
 func (r *Router) Resolve(model string) (name string, steps []Step, err error) {
 	r.mu.RLock()
 	if _, found := r.chains[model]; found {
-		name, steps, err = model, r.chains[model], nil
+		name, steps, err = model, cloneSteps(r.chains[model]), nil
 		r.mu.RUnlock()
 		return
 	}
 	if owners, found := r.modelIndex[model]; found {
 		chain := owners[len(owners)-1]
-		name, steps, err = chain, r.chains[chain], nil
+		name, steps, err = chain, cloneSteps(r.chains[chain]), nil
 		r.mu.RUnlock()
 		return
 	}
@@ -207,9 +262,7 @@ func (r *Router) ListChains() []ChainInfo {
 	defer r.mu.RUnlock()
 	out := make([]ChainInfo, 0, len(r.chains))
 	for name, steps := range r.chains {
-		cp := make([]Step, len(steps))
-		copy(cp, steps)
-		out = append(out, ChainInfo{Name: name, Source: r.sources[name], Steps: cp})
+		out = append(out, ChainInfo{Name: name, Source: r.sources[name], Steps: cloneSteps(steps)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -224,9 +277,7 @@ func (r *Router) RuntimeChains() map[string][]Step {
 		if r.sources[name] != "runtime" {
 			continue
 		}
-		cp := make([]Step, len(steps))
-		copy(cp, steps)
-		out[name] = cp
+		out[name] = cloneSteps(steps)
 	}
 	return out
 }

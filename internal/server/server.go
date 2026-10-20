@@ -376,6 +376,7 @@ func (s *Server) handleChainDelete(w http.ResponseWriter, r *http.Request) {
 type chatRequest struct {
 	Model  string `json:"model"`
 	Stream bool   `json:"stream"`
+	N      int    `json:"n"`
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -409,10 +410,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var lastStatus int
 	var lastBody []byte
 	var lastCT string
+	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
-		if s.hlth.IsDown(step.Provider, step.Model) {
+		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
+		if !admitted {
 			log.Printf("chat: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
+		}
+		defer permit.Release()
+		r = withPermit(r, permit)
+		if walkExpired(deadline) {
+			log.Printf("chat: request budget exhausted, stopping the walk")
+			break
 		}
 		// A stream_only provider's non-streaming endpoint is broken: rewrite
 		// the body to upstream streaming and aggregate below.
@@ -421,45 +430,77 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if agg {
 			stepBody = forceStreamBody(body)
 		}
-		resp, keyEnv, err := s.tryStep(r, step, stepBody)
+		stepCtx, cancel := stepContext(r, deadline, req.Stream, chatStepBudget)
+		resp, keyEnv, err := s.tryStepCtx(stepCtx, r, step, stepBody)
 		if err != nil {
+			cancel()
+			if errors.Is(err, errNoAvailableKeys) {
+				permit.Release()
+				continue
+			}
+			if isClientGone(err) {
+				log.Printf("chat: client gone, stopping the walk at %s/%s: %v", step.Provider, step.Model, err)
+				return
+			}
 			log.Printf("chat: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.mark(r, step.Provider, step.Model, 0, err)
 			s.record(step, chain, req, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var res relayResult
 			if agg {
-				aggResp, aerr := s.aggregateStreamed(resp)
+				aggResp, aerr := s.aggregateStreamed(resp, req.N)
 				if aerr != nil {
+					cancel()
+					if r.Context().Err() != nil {
+						return
+					}
 					log.Printf("chat: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
-					s.record(step, chain, req, 0, aerr, keyEnv)
+					s.mark(r, step.Provider, step.Model, 0, aerr)
+					s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, aerr)
+					failure := unusableBody(aerr)
+					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
 				}
 				// Health is marked inside relaySuccess, after the aggregated
 				// body is fully written to the client.
-				s.relaySuccess(w, r, step, chain, req, aggResp, keyEnv)
+				res = s.relaySuccess(w, r, step, chain, req, aggResp, keyEnv)
+			} else {
+				// Health is marked inside relaySuccess/relayStream, after the body
+				// actually lands: a 2xx header followed by a broken body must not
+				// reset the step's failure count (the pre-body MarkSuccess here
+				// used to do exactly that, so a truncating upstream never reached
+				// cool-off).
+				res = s.relaySuccess(w, r, step, chain, req, resp, keyEnv)
+			}
+			cancel()
+			if res.clientGone {
 				return
 			}
-			// Health is marked inside relaySuccess/relayStream, after the body
-			// actually lands: a 2xx header followed by a broken body must not
-			// reset the step's failure count (the pre-body MarkSuccess here
-			// used to do exactly that, so a truncating upstream never reached
-			// cool-off).
-			s.relaySuccess(w, r, step, chain, req, resp, keyEnv)
-			return
+			if res.outcome == relayCommitted {
+				return
+			}
+			// Nothing was written downstream: the body was unusable or the read
+			// failed, so the walk may still try the next step.
+			lastStatus, lastBody, lastCT, lastErr = res.status, res.body, res.ct, res.err
+			continue
 		}
 		lastStatus = resp.StatusCode
-		lastBody, _ = io.ReadAll(resp.Body)
+		lastBody, _ = readErrorBody(resp, req.Stream)
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
+		cancel()
+		if r.Context().Err() != nil {
+			return
+		}
 		if retryable(resp.StatusCode, nil) {
-			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		}
 		log.Printf("chat: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
+		permit.Release()
 	}
 	// All steps failed: propagate the last upstream response as-is.
 	log.Printf("chat: all steps failed for chain %q: %v", chain, lastErr)
@@ -508,16 +549,34 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	var lastStatus int
 	var lastBody []byte
 	var lastCT string
+	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
-		if s.hlth.IsDown(step.Provider, step.Model) {
+		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
+		if !admitted {
 			log.Printf("embed: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
-		resp, keyEnv, err := s.tryEmbed(r, step, body)
+		defer permit.Release()
+		r = withPermit(r, permit)
+		if walkExpired(deadline) {
+			log.Printf("embed: request budget exhausted, stopping the walk")
+			break
+		}
+		stepCtx, cancel := stepContext(r, deadline, false, chatStepBudget)
+		resp, keyEnv, err := s.tryEmbed(stepCtx, r, step, body)
 		if err != nil {
+			cancel()
+			if errors.Is(err, errNoAvailableKeys) {
+				permit.Release()
+				continue
+			}
+			if isClientGone(err) {
+				log.Printf("embed: client gone, stopping the walk at %s/%s: %v", step.Provider, step.Model, err)
+				return
+			}
 			log.Printf("embed: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.mark(r, step.Provider, step.Model, 0, err)
 			s.record(step, chain, req, 0, err, keyEnv)
 			continue
 		}
@@ -525,33 +584,52 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			// Read the body before committing a status: a silently truncated
 			// 200 with a partial embedding would be worse than a 502 — the
 			// caller cannot tell an incomplete vector from a complete one.
-			embedBody, readErr := io.ReadAll(resp.Body)
+			embedBody, readErr := readLimited(resp.Body, maxResponseBytes)
+			embedCT := resp.Header.Get("Content-Type")
 			resp.Body.Close()
-			if readErr != nil {
-				log.Printf("embed: body read failed from %s/%s: %v", step.Provider, step.Model, readErr)
-				if r.Context().Err() == nil {
-					s.hlth.Mark(step.Provider, step.Model, 0, readErr)
-					s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
-					http.Error(w, `{"error":{"message":"upstream read failed"}}`, http.StatusBadGateway)
-				}
+			cancel()
+			if r.Context().Err() != nil {
 				return
 			}
-			s.hlth.MarkSuccess(step.Provider, step.Model)
-			s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
-			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			if readErr != nil {
+				log.Printf("embed: body read failed from %s/%s: %v", step.Provider, step.Model, readErr)
+				s.mark(r, step.Provider, step.Model, 0, readErr)
+				s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
+				failure := unusableBody(readErr)
+				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
+				continue
+			}
+			if verr := validateEmbeddings(embedBody); verr != nil {
+				log.Printf("embed: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
+				s.mark(r, step.Provider, step.Model, 0, verr)
+				s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+				failure := unusableBody(verr)
+				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
+				continue
+			}
+			w.Header().Set("Content-Type", embedCT)
 			w.WriteHeader(resp.StatusCode)
-			w.Write(embedBody)
+			if _, err := w.Write(embedBody); err != nil || r.Context().Err() != nil {
+				return
+			}
+			s.markSuccess(r, step.Provider, step.Model)
+			s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
 			return
 		}
 		lastStatus = resp.StatusCode
-		lastBody, _ = io.ReadAll(resp.Body)
+		lastBody, _ = readErrorBody(resp, false)
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
+		cancel()
+		if r.Context().Err() != nil {
+			return
+		}
 		if retryable(resp.StatusCode, nil) {
-			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		}
 		log.Printf("embed: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
+		permit.Release()
 	}
 	log.Printf("embed: all steps failed for model %q: %v", req.Model, lastErr)
 	if lastStatus == 0 {
@@ -565,7 +643,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 
 // tryEmbed is the embeddings sibling of tryStepAdaptor: same key-pool rotation
 // and retry, but the payload goes to the upstream's /v1/embeddings endpoint.
-func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
+func (s *Server) tryEmbed(ctx context.Context, r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
 	p, ok := s.provider(step.Provider)
 	if !ok {
 		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
@@ -576,11 +654,40 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 	}
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
+	var lastResp *http.Response
+	var lastKey string
 	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 && s.retryWait != nil {
-			time.Sleep(s.retryWait(attempt))
+		if err := abortCause(ctx, r); err != nil {
+			if lastResp != nil {
+				lastResp.Body.Close()
+			}
+			return nil, "", err
 		}
 		keyEnv := pool.Pick()
+		if keyEnv != "" && attempt > 0 && s.retryWait != nil {
+			if werr := sleepCtx(ctx, s.retryWait(attempt)); werr != nil {
+				if lastResp != nil {
+					lastResp.Body.Close()
+				}
+				return nil, "", abortCause(ctx, r)
+			}
+			if !pool.Available(keyEnv) {
+				keyEnv = pool.Pick()
+			}
+		}
+		if keyEnv == "" {
+			if lastResp != nil {
+				return lastResp, lastKey, nil
+			}
+			if lastErr != nil {
+				return nil, "", lastErr
+			}
+			return nil, "", errNoAvailableKeys
+		}
+		if lastResp != nil {
+			lastResp.Body.Close()
+			lastResp = nil
+		}
 		key := s.env(keyEnv)
 		if key == "" {
 			err := fmt.Errorf("provider %q: key env %q not set", p.Name, keyEnv)
@@ -594,8 +701,12 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 			lastErr = err
 			continue
 		}
-		resp, err := a.Embed(r.Context(), payload)
+		resp, err := a.Embed(ctx, payload)
 		if err != nil {
+			if aerr := abortCause(ctx, r); aerr != nil {
+				log.Printf("embed: %s/%s attempt %d aborted: %v", step.Provider, step.Model, attempt+1, aerr)
+				return nil, "", aerr
+			}
 			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			pool.Mark(keyEnv, keypool.ClassFor(0, err))
 			lastErr = err
@@ -612,7 +723,7 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 		if attempt == retries {
 			return resp, keyEnv, nil // transient failures exhausted: last response
 		}
-		resp.Body.Close()
+		lastResp, lastKey = resp, keyEnv
 	}
 	return nil, "", lastErr
 }
@@ -628,7 +739,14 @@ func (s *Server) tryEmbed(r *http.Request, step router.Step, body []byte) (*http
 // not — body left open for the caller to relay), or (nil, "", err) when every
 // attempt failed at the network level.
 func (s *Server) tryStep(r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
-	return s.tryStepAdaptor(r.Context(), r, step, body, adaptors.New)
+	return s.tryStepCtx(r.Context(), r, step, body)
+}
+
+// tryStepCtx is tryStep with a caller-supplied context, so the walk can bound
+// one attempt (per-step budget and remaining whole-request budget) without
+// touching the client's own request context.
+func (s *Server) tryStepCtx(ctx context.Context, r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
+	return s.tryStepAdaptor(ctx, r, step, body, adaptors.New)
 }
 
 // streamOnly reports whether the provider's non-streaming endpoint is broken
@@ -660,11 +778,40 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 	}
 	payload := mergeParams(withModel(body, step.Model), step.Params)
 	var lastErr error
+	var lastResp *http.Response
+	var lastKey string
 	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 && s.retryWait != nil {
-			time.Sleep(s.retryWait(attempt))
+		if err := abortCause(ctx, r); err != nil {
+			if lastResp != nil {
+				lastResp.Body.Close()
+			}
+			return nil, "", err
 		}
 		keyEnv := pool.Pick()
+		if keyEnv != "" && attempt > 0 && s.retryWait != nil {
+			if werr := sleepCtx(ctx, s.retryWait(attempt)); werr != nil {
+				if lastResp != nil {
+					lastResp.Body.Close()
+				}
+				return nil, "", abortCause(ctx, r)
+			}
+			if !pool.Available(keyEnv) {
+				keyEnv = pool.Pick()
+			}
+		}
+		if keyEnv == "" {
+			if lastResp != nil {
+				return lastResp, lastKey, nil
+			}
+			if lastErr != nil {
+				return nil, "", lastErr
+			}
+			return nil, "", errNoAvailableKeys
+		}
+		if lastResp != nil {
+			lastResp.Body.Close()
+			lastResp = nil
+		}
 		key := s.env(keyEnv)
 		if key == "" {
 			err := fmt.Errorf("provider %q: key env %q not set", p.Name, keyEnv)
@@ -680,6 +827,10 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 		}
 		resp, err := a.Chat(ctx, payload)
 		if err != nil {
+			if aerr := abortCause(ctx, r); aerr != nil {
+				log.Printf("chat: %s/%s attempt %d aborted: %v", step.Provider, step.Model, attempt+1, aerr)
+				return nil, "", aerr
+			}
 			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
 			pool.Mark(keyEnv, keypool.ClassFor(0, err))
 			lastErr = err
@@ -696,7 +847,7 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 		if attempt == retries {
 			return resp, keyEnv, nil // transient failures exhausted: last response
 		}
-		resp.Body.Close()
+		lastResp, lastKey = resp, keyEnv
 	}
 	return nil, "", lastErr
 }
@@ -779,34 +930,53 @@ func (s *Server) poolNames() []string {
 	return names
 }
 
-func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req chatRequest, resp *http.Response, keyEnv string) {
+// relaySuccess delivers one successful upstream response to the client and
+// reports how far it got. A non-streaming body is read in full and validated
+// before anything is written, so an unusable 2xx leaves the walk free to try
+// the next step. A streaming response is committed as soon as its status line
+// and headers are sent and never fails over afterwards.
+func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req chatRequest, resp *http.Response, keyEnv string) relayResult {
 	defer resp.Body.Close()
 	if !req.Stream {
-		// Non-streaming: relay body, best-effort token count.
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			if r.Context().Err() != nil {
-				// Client disconnected — not an upstream failure.
-				return
-			}
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
-			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
-			http.Error(w, `{"error":{"message":"upstream read failed"}}`, http.StatusBadGateway)
-			return
+		// Non-streaming: read the whole body and validate it before anything is
+		// written. A 2xx that cannot be a chat completion is a failed attempt,
+		// so the walk can still use the next step instead of handing the caller
+		// a broken success.
+		body, err := readLimited(resp.Body, maxResponseBytes)
+		ct := resp.Header.Get("Content-Type")
+		if r.Context().Err() != nil {
+			return relayResult{outcome: relayUncommitted, clientGone: true, err: r.Context().Err()}
 		}
-		s.hlth.MarkSuccess(step.Provider, step.Model)
-		in, out := telemetry.ParseUsage(body)
-		s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		if err != nil {
+			s.mark(r, step.Provider, step.Model, 0, err)
+			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
+			log.Printf("chat: %s/%s body read failed: %v", step.Provider, step.Model, err)
+			return unusableBody(err)
+		}
+		if verr := validateChatCompletion(body); verr != nil {
+			s.mark(r, step.Provider, step.Model, 0, verr)
+			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+			log.Printf("chat: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
+			return unusableBody(verr)
+		}
+		w.Header().Set("Content-Type", ct)
 		w.Header().Set("X-Guvna-Step", step.Provider+"/"+step.Model)
 		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
-		return
+		if _, err := w.Write(body); err != nil || r.Context().Err() != nil {
+			return relayResult{outcome: relayCommitted, clientGone: true}
+		}
+		s.markSuccess(r, step.Provider, step.Model)
+		in, out := telemetry.ParseUsage(body)
+		s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+		return relayResult{outcome: relayCommitted}
 	}
 	s.relayStream(w, r, step, chain, req, resp, keyEnv)
+	return relayResult{outcome: relayCommitted}
 }
 
 func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req chatRequest, resp *http.Response, keyEnv string) {
+	streamDeadline, durationC, stopDuration := streamDurationTimer()
+	defer stopDuration()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, `{"error":{"message":"streaming unsupported"}}`, http.StatusInternalServerError)
@@ -825,9 +995,49 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 	defer timer.Stop()
 	var in, out int64
 	var data sseData
+	var pending bytes.Buffer
+	progress := chatSSEProgress{expected: req.N}
+	var idleC <-chan time.Time
+	idleTimer := time.NewTimer(time.Hour)
+	defer idleTimer.Stop()
+	if streamIdle > 0 {
+		idleTimer.Reset(streamIdle)
+		idleC = idleTimer.C
+	}
+
+	// fail reports an upstream stream that did not end with a valid terminator.
+	// The stream is already committed to the client, so this never fails over;
+	// the point is that the step is charged with a failure instead of being
+	// reset to healthy by an EOF that only means the socket closed.
+	fail := func(err error) {
+		if r.Context().Err() != nil {
+			return // client went away: not an upstream failure
+		}
+		log.Printf("chat: stream from %q did not complete: %v", step.Provider, err)
+		payload := `data: {"error":{"message":"upstream stream did not complete"}}`
+		var budgetErr *stepTimeoutError
+		if errors.As(err, &budgetErr) {
+			payload = `data: {"error":{"message":"upstream stream exceeded maximum duration","code":"upstream_stream_timeout"}}`
+		}
+		io.WriteString(w, payload+"\n\n")
+		flusher.Flush()
+		s.mark(r, step.Provider, step.Model, 0, err)
+		s.poolRecordResult(keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
+	}
+
 	for {
+		if walkExpired(streamDeadline) {
+			fail(streamDurationError())
+			return
+		}
 		select {
 		case <-r.Context().Done():
+			return
+		case <-durationC:
+			fail(streamDurationError())
+			return
+		case <-idleC:
+			fail(fmt.Errorf("no upstream data for %s", streamIdle))
 			return
 		case <-timer.C:
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
@@ -841,33 +1051,91 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 				return
 			}
 			if len(line) > 0 {
-				if _, werr := w.Write(line); werr != nil {
+				if maxResponseBytes > 0 && int64(pending.Len()+len(line)) > maxResponseBytes {
+					fail(errors.New("upstream SSE frame exceeds body limit"))
 					return
 				}
-				flusher.Flush()
-				resetKeepAlive(timer)
-				if payload, ok := data.line(line); ok {
+				pending.Write(line)
+				payload, complete, frameErr := data.line(line)
+				if frameErr != nil {
+					fail(frameErr)
+					return
+				}
+				if complete {
+					kind, verr := progress.observe(payload)
+					if verr != nil {
+						// Never relay a frame the gateway could not parse.
+						fail(verr)
+						return
+					}
 					if i, o := telemetry.ParseUsage([]byte(payload)); i != 0 || o != 0 {
 						in, out = i, o
 					}
+					if kind == chatSSEDone {
+						if verr := progress.complete(requireStreamTerminator); verr != nil {
+							fail(verr)
+							return
+						}
+						if _, werr := w.Write(pending.Bytes()); werr != nil {
+							return
+						}
+						flusher.Flush()
+						s.markSuccess(r, step.Provider, step.Model)
+						s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+						return
+					}
+					if _, werr := w.Write(pending.Bytes()); werr != nil {
+						return
+					}
+					pending.Reset()
+					flusher.Flush()
+				}
+				if len(bytes.TrimSpace(line)) == 0 && pending.Len() > 0 {
+					if _, werr := w.Write(pending.Bytes()); werr != nil {
+						return
+					}
+					pending.Reset()
+					flusher.Flush()
+				}
+				resetKeepAlive(timer)
+				if streamIdle > 0 {
+					if !idleTimer.Stop() {
+						select {
+						case <-idleTimer.C:
+						default:
+						}
+					}
+					idleTimer.Reset(streamIdle)
 				}
 			}
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					if payload, ok := data.flush(); ok {
+						_, verr := progress.observe(payload)
+						if verr != nil {
+							fail(verr)
+							return
+						}
 						if i, o := telemetry.ParseUsage([]byte(payload)); i != 0 || o != 0 {
 							in, out = i, o
 						}
 					}
-					s.hlth.MarkSuccess(step.Provider, step.Model)
+					if verr := progress.complete(requireStreamTerminator); verr != nil {
+						fail(verr)
+						return
+					}
+					if pending.Len() > 0 {
+						if _, werr := w.Write(pending.Bytes()); werr != nil {
+							return
+						}
+						flusher.Flush()
+					}
+					s.markSuccess(r, step.Provider, step.Model)
 					s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 					return
 				}
 				log.Printf("chat: stream error from %q: %v", step.Provider, err)
-				io.WriteString(w, `data: {"error":{"message":"upstream stream error"}}`+"\n\n")
-				flusher.Flush()
-				s.hlth.Mark(step.Provider, step.Model, 0, err)
-				s.poolRecordResult(keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
+				fail(err)
 				return
 			}
 		}

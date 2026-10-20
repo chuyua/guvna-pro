@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 
 	"github.com/creamy-ghost/guvna/internal/router"
 	"gopkg.in/yaml.v3"
@@ -27,6 +29,7 @@ type fileChain struct {
 
 // Store persists runtime chains to <data-dir>/chains.yaml with atomic rewrites.
 type Store struct {
+	mu   sync.Mutex // serializes snapshots and writes for this Store instance
 	path string
 }
 
@@ -62,9 +65,19 @@ func (s *Store) Load(r *router.Router) error {
 
 // Save writes the current runtime chains atomically (tmp file + rename).
 func (s *Store) Save(r *router.Router) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Take the snapshot inside the write lock so an older queued save cannot
+	// overwrite a newer snapshot after it has already reached disk.
 	runtime := r.RuntimeChains()
 	f := fileFormat{Version: 2, Chains: make([]fileChain, 0, len(runtime))}
-	for name, steps := range runtime {
+	names := make([]string, 0, len(runtime))
+	for name := range runtime {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		steps := runtime[name]
 		ch := fileChain{Name: name, Steps: make([]fileStep, 0, len(steps))}
 		for _, st := range steps {
 			ch.Steps = append(ch.Steps, fileStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
@@ -78,11 +91,23 @@ func (s *Store) Save(r *router.Router) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("chains dir: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create chains temp file: %w", err)
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+	if _, err := tmp.Write(data); err != nil {
 		return fmt.Errorf("write chains: %w", err)
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close chains: %w", err)
+	}
+	// Rename replaces the existing file without deleting it first, including
+	// on Windows. If replacement fails, the original remains in place.
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
 		return fmt.Errorf("rename chains: %w", err)
 	}
 	return nil

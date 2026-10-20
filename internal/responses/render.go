@@ -510,22 +510,20 @@ func (s *Stream) toolCallDeltas(raws []json.RawMessage) error {
 				return err
 			}
 		}
-		if tc.callID == "" {
-			tc.callID = d.ID
-		}
-		if tc.name == "" {
-			tc.name = d.Function.Name
-		}
+		tc.callID += d.ID
+		tc.name += d.Function.Name
 		if d.Function.Arguments == "" {
 			continue
 		}
 		tc.arguments += d.Function.Arguments
-		return s.event("response.function_call_arguments.delta", map[string]any{
+		if err := s.event("response.function_call_arguments.delta", map[string]any{
 			"response_id":  s.id,
 			"item_id":      tc.itemID,
 			"output_index": tc.index,
 			"delta":        d.Function.Arguments,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

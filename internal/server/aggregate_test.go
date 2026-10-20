@@ -124,6 +124,84 @@ func TestAggregateStreamedRejectsTruncatedStream(t *testing.T) {
 	}
 }
 
+func TestAggregateStreamedRejectsInvalidPayloads(t *testing.T) {
+	for name, chunks := range map[string][]string{
+		"bad JSON before finish": {`{"choices":`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+		"error before finish":    {`{"error":{"message":"broken"}}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+		"null":                   {`null`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+		"unknown finish":         {`{"choices":[{"delta":{},"finish_reason":"surprise"}]}`},
+		"empty tools":            {`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`},
+		"missing tool identity":  {`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`},
+		"missing tool index":     {`{"choices":[{"delta":{"tool_calls":[{"id":"call","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`},
+		"invalid tool arguments": {`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":"tool_calls"}]}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := &http.Response{Body: io.NopCloser(strings.NewReader(sseBody(chunks...)))}
+			if _, err := (&Server{}).aggregateStreamed(resp); err == nil {
+				t.Fatal("invalid stream reported success")
+			}
+		})
+	}
+}
+
+func TestAggregateStreamedDispatchesPendingEOF(t *testing.T) {
+	for _, reason := range []string{"stop", "length"} {
+		t.Run(reason, func(t *testing.T) {
+			wire := "data: " + `{"choices":[{"delta":{"content":"answer"},"finish_reason":"` + reason + `"}]}`
+			resp := &http.Response{Body: io.NopCloser(strings.NewReader(wire))}
+			agg, err := (&Server{}).aggregateStreamed(resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer agg.Body.Close()
+			body, _ := io.ReadAll(agg.Body)
+			if !strings.Contains(string(body), `"content":"answer"`) || !strings.Contains(string(body), `"finish_reason":"`+reason+`"`) {
+				t.Fatalf("pending event lost: %s", body)
+			}
+		})
+	}
+}
+
+func TestAggregateStreamedCollectsInterleavedToolCalls(t *testing.T) {
+	chunks := []string{
+		`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_","type":"fun","function":{"name":"get_","arguments":"{\"b\":"}},{"index":0,"id":"first","type":"function","function":{"name":"a","arguments":"{\"a\":"}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}},{"index":1,"id":"second","type":"ction","function":{"name":"b","arguments":"2}"}}]},"finish_reason":"tool_calls"}]}`,
+	}
+	// Deliberately omit the blank line and DONE after the final event.
+	wire := "data: " + chunks[0] + "\n\ndata: " + chunks[1]
+	agg, err := (&Server{}).aggregateStreamed(&http.Response{Body: io.NopCloser(strings.NewReader(wire))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agg.Body.Close()
+	body, _ := io.ReadAll(agg.Body)
+	var got struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Choices) != 1 || len(got.Choices[0].Message.ToolCalls) != 2 || got.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("tool calls missing: %s", body)
+	}
+	calls := got.Choices[0].Message.ToolCalls
+	if calls[0].ID != "first" || calls[0].Function.Arguments != `{"a":1}` || calls[1].ID != "call_second" || calls[1].Type != "function" || calls[1].Function.Name != "get_b" || calls[1].Function.Arguments != `{"b":2}` {
+		t.Fatalf("tool fragments or index order lost: %s", body)
+	}
+}
+
 func TestForceStreamBodyAddsStreamAndUsage(t *testing.T) {
 	out := forceStreamBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	var m map[string]any

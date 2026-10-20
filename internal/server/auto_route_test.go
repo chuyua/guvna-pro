@@ -88,7 +88,7 @@ func TestAutoServesEligibleModel(t *testing.T) {
 // order and still serve. /v1/auto must never fail just because the decider is
 // absent.
 func TestAutoWorksWithoutDecider(t *testing.T) {
-	good := okUpstream(t, `{"choices":[{}]}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
 
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
@@ -105,7 +105,7 @@ func TestAutoWorksWithoutDecider(t *testing.T) {
 // would tell the caller the gateway is down when the real problem is the
 // requested window.
 func TestAutoRejectsInfeasibleFilter(t *testing.T) {
-	good := okUpstream(t, `{"choices":[{}]}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
 
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
@@ -125,7 +125,7 @@ func TestAutoRejectsInfeasibleFilter(t *testing.T) {
 }
 
 func TestAutoRejectsBadContextBounds(t *testing.T) {
-	good := okUpstream(t, `{"choices":[{}]}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
 	_, ts := autoServer(t, providers, chains, map[string]string{"KEY_A": "k"})
@@ -371,7 +371,7 @@ func TestAutoDegradesServiceMinContext(t *testing.T) {
 // The same filter passed explicitly by the caller is a hard requirement and
 // must still 404, even with the env default in play.
 func TestAutoCallerMinContextStillHard(t *testing.T) {
-	good := okUpstream(t, `{"choices":[{}]}`)
+	good := okUpstream(t, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
 
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: good.URL, KeyEnv: "KEY_A"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}

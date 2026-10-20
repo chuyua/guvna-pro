@@ -27,6 +27,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -36,7 +37,9 @@ import (
 
 	"github.com/creamy-ghost/guvna/internal/adaptors"
 	"github.com/creamy-ghost/guvna/internal/health"
+	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/selector"
+	"github.com/creamy-ghost/guvna/internal/telemetry"
 	"github.com/creamy-ghost/guvna/internal/vision"
 )
 
@@ -94,6 +97,7 @@ func stripAutoFields(body []byte) []byte {
 // handleChat. It does not build a chain: a chain would make the decision
 // visible to POST /v1/chains, where a client could overwrite the pool order.
 func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
@@ -177,8 +181,37 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, msg), http.StatusNotFound)
 		return
 	}
+	if !hasImages {
+		required := estimateAutoContext(body)
+		var oversized []selector.Decided
+		cands, oversized = fitAutoContext(cands, required)
+		for _, dropped := range oversized {
+			log.Printf("auto: skipping %s ctx=%d required_estimate=%d (%s)", dropped.Step, dropped.Context, required, dropped.Reason)
+		}
+		if len(cands) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+				"type": "invalid_request_error", "code": "context_length_exceeded",
+				"message": "estimated request and output tokens exceed every eligible model context", "estimated_tokens": required,
+			}})
+			return
+		}
+	}
 
-	ordered, _, source := selector.Decide(
+	// Charge cold-cache decisions and waits on another decision to this same
+	// budget. Keep the original caller context for failure attribution and for a
+	// selected active stream; its generation limit is configured separately.
+	var deadline time.Time
+	decisionCtx := r.Context()
+	cancelDecision := func() {}
+	if budget := autoTotalBudget(); budget > 0 {
+		deadline = started.Add(budget)
+		decisionCtx, cancelDecision = context.WithDeadline(r.Context(), deadline)
+	}
+	defer cancelDecision()
+	ordered, _, source := selector.DecideContext(
+		decisionCtx,
 		cands,
 		s.deciderFor(cands, r.Context(), s.decideReqWait),
 		s.providerOrder(),
@@ -186,6 +219,9 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		&s.decideMu,
 		&s.decideCache,
 	)
+	if r.Context().Err() != nil {
+		return
+	}
 	// Vision filtering happens after ordering, not in Eligible: the decider's
 	// cached ranking is keyed on the full pool, so filtering first would force
 	// every image request onto a cold cache. Skipping non-vision models in rank
@@ -207,12 +243,6 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	log.Printf("auto: min=%d max=%d eligible=%d images=%v degraded=%v source=%s order=%s",
 		minCtx, req.MaxContext, len(cands), hasImages, degraded, source, joinSteps(ordered))
 
-	// Total wall-clock budget for the whole candidate walk. Decider miss
-	// (≤GUVNA_DECIDER_REQUEST_WAIT) plus a few slow non-stream steps (30s each
-	// without this) could exceed any client's patience; cap the walk so a
-	// wedged pool degrades to a 503 in bounded time instead of chaining a
-	// timeout per candidate.
-	deadline := time.Now().Add(envDuration("GUVNA_AUTO_TOTAL_BUDGET", 45*time.Second))
 	// A slow non-streaming step can hold the walk hostage far past the total
 	// budget: the budget is checked between candidates, and AutoClientNonStream
 	// waits a whole generation for headers (~60s for a thinking model) — one
@@ -227,26 +257,30 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	var lastBody []byte
 	var lastCT string
 	for _, c := range ordered {
-		if time.Now().After(deadline) {
+		if walkExpired(deadline) {
 			log.Printf("auto: total budget exceeded, stopping walk")
 			break
 		}
 		step := c.Step
-		if s.hlth.IsDown(step.Provider, step.Model) {
+		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
+		if !admitted {
 			log.Printf("auto: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
 		}
+		defer permit.Release()
+		r = withPermit(r, permit)
 		stepCtx := r.Context()
+		cancelStep := func() {}
+		stopSetupBudget := func() {}
 		if !chat.Stream {
-			wait := stepBudget
-			if remaining := time.Until(deadline); remaining < wait {
-				wait = remaining
-			}
-			if wait > 0 {
-				var cancel context.CancelFunc
-				stepCtx, cancel = context.WithTimeout(r.Context(), wait)
-				defer cancel()
-			}
+			stepCtx, cancelStep = stepContext(r, deadline, false, stepBudget)
+		} else if !deadline.IsZero() {
+			// Bound setup and failed bodies, then remove this setup timer once
+			// successful headers select a stream. Cancel remains tied to caller.
+			stepCtx, cancelStep = context.WithCancel(r.Context())
+			timer := time.AfterFunc(time.Until(deadline), cancelStep)
+			stopSetupBudget = func() { timer.Stop() }
+			defer stopSetupBudget()
 		}
 		// A stream_only provider's non-streaming endpoint is broken: the body
 		// rides an upstream stream, but the client still waits for one complete
@@ -258,48 +292,76 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, keyEnv, err := s.tryStepAuto(stepCtx, r, step, stepBody, chat.Stream)
 		if err != nil {
+			stopSetupBudget()
+			cancelStep()
+			if errors.Is(err, errNoAvailableKeys) {
+				permit.Release()
+				continue
+			}
+			if isClientGone(err) {
+				log.Printf("auto: client gone, stopping the walk at %s/%s: %v", step.Provider, step.Model, err)
+				return
+			}
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.mark(r, step.Provider, step.Model, 0, err)
 			s.record(step, c.Chain, chat, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			stopSetupBudget()
+			var res relayResult
 			if agg {
-				aggResp, aerr := s.aggregateStreamed(resp)
+				aggResp, aerr := s.aggregateStreamed(resp, chat.N)
 				if aerr != nil {
+					cancelStep()
+					if r.Context().Err() != nil {
+						return
+					}
 					log.Printf("auto: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
-					s.record(step, c.Chain, chat, 0, aerr, keyEnv)
+					s.mark(r, step.Provider, step.Model, 0, aerr)
+					s.poolRecordResult(keyEnv, step, c.Chain, chat, 502, 0, 0, keypool.ClassTransient, aerr)
+					failure := unusableBody(aerr)
+					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
 				}
-				s.relaySuccess(w, r, step, c.Chain, chat, aggResp, keyEnv)
+				res = s.relaySuccess(w, r, step, c.Chain, chat, aggResp, keyEnv)
+			} else {
+				// Health moves inside relaySuccess — see the comment in handleChat.
+				res = s.relaySuccess(w, r, step, c.Chain, chat, resp, keyEnv)
+			}
+			cancelStep()
+			if res.clientGone {
 				return
 			}
-			// Health moves inside relaySuccess — see the comment in handleChat.
-			s.relaySuccess(w, r, step, c.Chain, chat, resp, keyEnv)
-			return
+			if res.outcome == relayCommitted {
+				return
+			}
+			// Unusable 2xx body: nothing was written, so keep walking.
+			lastStatus, lastBody, lastCT, lastErr = res.status, res.body, res.ct, res.err
+			continue
 		}
 		lastStatus = resp.StatusCode
-		lastBody, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		lastBody, _ = readErrorBody(resp, chat.Stream)
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
-		// Mark unconditionally for transient and for 400: Mark itself decides
-		// severity — 400 is the vision self-healing signal (a text-only model
-		// eating an image request enters single-strike cool-off) and we cannot
-		// gate on retryable() or that signal never fires. 404 is different: it
-		// means the model is configured on the chain but absent upstream — a
-		// scheduling residue, not a model-health signal. Judging it down would
-		// spread a config error into /v1/chat's shared health for 5 minutes
-		// (and it never heals, so re-probing is wasted). Skip it every request
-		// (fast) and leave its state untouched.
+		stopSetupBudget()
+		cancelStep()
+		if r.Context().Err() != nil {
+			return
+		}
+		// Preserve 400 as the vision self-healing signal: a text-only model
+		// receiving an image request enters single-strike cool-off. Other request
+		// and config errors are neutral for model health; 401/403 have already
+		// been attributed to the key in tryStepAdaptor.
 		if resp.StatusCode == http.StatusNotFound {
 			log.Printf("auto: step %s/%s not found upstream (config residue), skipping", step.Provider, step.Model)
-		} else {
-			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+		} else if resp.StatusCode == http.StatusBadRequest || retryable(resp.StatusCode, nil) {
+			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		}
 		log.Printf("auto: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, c.Chain, chat, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode), keyEnv)
+		permit.Release()
 	}
 	log.Printf("auto: all candidates failed: %v", lastErr)
 	if lastStatus == 0 {
@@ -370,12 +432,17 @@ func (s *Server) deciderFor(cands []selector.Candidate, parent context.Context, 
 	if s.decideProvider == "" || s.decideModel == "" {
 		return nil
 	}
-	return func(context.Context) (map[string]int, error) {
-		// The ctx argument from Decide is context.Background; deriving from it
-		// would sever the tie to the caller. Derive from parent instead.
+	return func(decisionCtx context.Context) (map[string]int, error) {
+		// Keep parent distinct for cancellation attribution. The selector's
+		// deadline can be shorter than the advisory call's own wait budget.
 		ctx := context.Background()
 		if parent != nil {
 			ctx = parent
+		}
+		if deadline, ok := decisionCtx.Deadline(); ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
 		}
 		if wait > 0 {
 			var cancel context.CancelFunc
@@ -383,7 +450,7 @@ func (s *Server) deciderFor(cands []selector.Candidate, parent context.Context, 
 			defer cancel()
 			return s.callDecider(parent, ctx, cands)
 		}
-		bgCtx, cancel := context.WithTimeout(context.Background(), DefaultBackgroundDecideDeadline)
+		bgCtx, cancel := context.WithTimeout(ctx, DefaultBackgroundDecideDeadline)
 		defer cancel()
 		return s.callDecider(parent, bgCtx, cands)
 	}
@@ -407,6 +474,9 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 		return nil, fmt.Errorf("decider provider %q has no key pool", s.decideProvider)
 	}
 	keyEnv := pool.Pick()
+	if keyEnv == "" {
+		return nil, errNoAvailableKeys
+	}
 	key := s.env(keyEnv)
 	if key == "" {
 		log.Printf("auto: decider key env %q not set", keyEnv)
@@ -427,26 +497,56 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 		log.Printf("auto: decider payload: %v", err)
 		return nil, err
 	}
+	callerGone := func() bool {
+		return parent != nil && parent.Err() != nil || errors.Is(ctx.Err(), context.Canceled)
+	}
+	// The advisory decider shares provider credentials, but does not change
+	// model health. Record exactly one key result for a real upstream attempt.
+	finishKey := func(class keypool.Class, success bool, raw []byte) {
+		if callerGone() {
+			return
+		}
+		if class != "" {
+			pool.Mark(keyEnv, class)
+		} else if success {
+			pool.MarkSuccess(keyEnv)
+		}
+		in, out := telemetry.ParseUsage(raw)
+		pool.Record(keyEnv, in, out)
+	}
 	resp, err := a.Chat(ctx, payload)
 	if err != nil {
 		log.Printf("auto: decider call: %v", err)
+		finishKey(keypool.ClassTransient, false, nil)
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readLimited(resp.Body, maxResponseBytes)
 	if err != nil {
 		log.Printf("auto: decider read: %v", err)
+		class := keypool.ClassFor(resp.StatusCode, nil)
+		if class == "" {
+			class = keypool.ClassTransient
+		}
+		finishKey(class, false, raw)
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("auto: decider status %d: %s", resp.StatusCode, truncate(raw, 200))
+		finishKey(keypool.ClassFor(resp.StatusCode, nil), false, raw)
 		return nil, fmt.Errorf("decider status %d: %s", resp.StatusCode, truncate(raw, 200))
+	}
+	if err := validateChatCompletion(raw); err != nil {
+		finishKey(keypool.ClassTransient, false, raw)
+		return nil, err
 	}
 	ranked, err := selector.ParseRanking(raw)
 	if err != nil {
 		log.Printf("auto: decider parse: %v (body: %s)", err, truncate(raw, 300))
+		finishKey(keypool.ClassTransient, false, raw)
 		return nil, err
 	}
+	finishKey("", true, raw)
 	return ranked, nil
 }
 

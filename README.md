@@ -68,6 +68,8 @@ guvna-cli status
 
 Everything is YAML in git (`config.yaml`): providers, models, rotation strategy, chains. Keys live only in env (`.env`, gitignored — see `.env.example`). Per-step request params can be set inside chain steps (`params`, client values always win). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full data model and [docs/FREE_MODELS.md](docs/FREE_MODELS.md) for per-provider free-tier limits.
 
+Upstream response validation, body limits, cancellation and timeout settings are documented in [docs/RELIABILITY.md](docs/RELIABILITY.md).
+
 ## Status
 
 Use-ready and running in production (single user) since 2026-08-16. Compression engines and further phases are tracked in [docs/ROADMAP.md](docs/ROADMAP.md).

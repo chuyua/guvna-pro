@@ -1,0 +1,87 @@
+# Upstream reliability
+
+Non-streaming Chat, Responses, Auto and Embeddings buffer and validate each successful upstream body before committing a client response. Invalid or truncated 2xx bodies can use the next configured step. If no step serves a valid result, the gateway returns a 502 instead of forwarding a broken success. This validation checks protocol structure; it cannot judge the usefulness of an answer.
+
+An upstream may already have generated or billed a request before a body fails. Retrying another step before client output can therefore duplicate generation or billing. Once streaming headers or events have been sent, the gateway never switches providers or combines their answers. A later failure leaves HTTP status 200 in place and emits a Chat error event or a Responses `response.failed` event.
+
+## Endings and tool calls
+
+By default, Chat and Responses streams require a recognized `finish_reason`. `[DONE]` alone is insufficient; a recognized finish followed by EOF is accepted. Responses maps `length` and `content_filter` to `response.incomplete`, preserving the distinction between transport success and completed generation.
+
+Chat relays track endings separately for every observed choice. For a request with `n > 1`, each requested choice index must be present and finish; one finished choice cannot hide an unfinished or omitted choice. Invalid or duplicate indices, conflicting endings and payloads appended after a choice has ended are rejected. Usage-only frames remain supported. The nonstandard-ending opt-out applies only to a single-choice stream, not to missing or unfinished choices in a multiple-choice result.
+
+Stream-only aggregation preserves all observed choices, ordered by choice index. Each choice keeps its own content, reasoning, finish reason and tool calls; tool calls are ordered by their index within that choice. Every observed choice must finish, and a request with `n > 1` also requires the requested choices to be present. With an omitted `n` or `n = 1`, providers returning extra choices remain compatible, but every returned choice must be complete. Malformed/error payloads or incomplete choices fail before client output and can use the next configured step.
+
+Tool calls must have an ID, a function name, type `function`, and valid JSON arguments when a complete call is reported. Responses streams ending with `length` or `content_filter` can retain partial calls as incomplete output. Stream-only aggregation rejects incomplete calls before committing output. The Responses translation path still maps only the first Chat choice; it does not expose multiple Chat choices as multiple Responses outputs.
+
+Embeddings must contain nonempty numeric vectors or valid base64 float32 bytes in every data entry; non-finite values are rejected. Validation does not compare vector count with the request's input count or verify model-specific dimensions.
+
+## Limits
+
+| Environment variable | Default | Scope |
+|---|---|---|
+| `GUVNA_STEP_BUDGET` | `180s` | One ordinary non-streaming step, including retries, headers and body |
+| `GUVNA_REQUEST_BUDGET` | `300s` | Ordinary non-streaming candidate walk |
+| `GUVNA_STREAM_IDLE_TIMEOUT` | `120s` | No complete upstream line during a streaming relay; also caps a streaming error-body read |
+| `GUVNA_STREAM_MAX_DURATION` | `10m` | Active Chat, Responses or Auto relay, measured from successful upstream headers regardless of progress |
+| `GUVNA_MAX_BODY_BYTES` | `33554432` (32 MiB) | Buffered success/error bodies, including the decider response |
+| `GUVNA_REQUIRE_STREAM_TERMINATOR` | `true` | Ordinary single-choice Chat relay finish check; `false` permits nonstandard endings, including incomplete results |
+
+The duration settings in the table accept Go durations; `0` disables that duration limit. The byte setting must be a positive integer. These limits are loaded when the server starts. SSE lines and joined event data have a fixed 8 MiB cap; the aggregation reader additionally caps total input at 256 MiB. Aggregated output must also pass the buffered-body limit.
+
+Auto retains `GUVNA_AUTO_STEP_BUDGET=20s` and `GUVNA_AUTO_TOTAL_BUDGET=45s`. Its total budget is measured from handler entry and covers the decider call, shared decision waits and the candidate walk. The step budget applies to non-streaming candidates, including stream-only aggregation. Streaming setup and failed responses share the remaining total budget; successful upstream headers stop that setup timer, and the active relay then uses the independent idle and maximum-duration limits. A non-positive Auto total budget disables it; the Auto step budget requires a positive duration and otherwise retains its default.
+
+The idle limit measures upstream line activity: upstream comment lines count, while downstream keep-alives do not. The maximum duration is a wall-clock deadline that upstream activity cannot extend. Expiry emits a Chat `upstream_stream_timeout` error or a Responses `response.failed` event, records one transient step failure and closes the upstream body; it never switches providers after committing a stream. Setting `GUVNA_STREAM_MAX_DURATION=0` disables only this hard deadline, leaving the idle limit in effect.
+
+Caller cancellation stops backoff and further candidates without adding a health/key failure or recording success. An earlier upstream failure remains recorded. Gateway budgets count as transient step failures. The Auto total budget deducts time spent reading and parsing the incoming request, but it does not itself interrupt that incoming body read or impose an incoming request-body size cap.
+
+## Auto context selection
+
+For requests without images, Auto first applies the configured model-context filters, then checks each eligible candidate against a local estimate of the current request plus explicitly requested output. The estimate includes the serialized request's message/tool structure: roughly three ASCII bytes per token and one token per non-ASCII UTF-8 byte. It reserves the larger positive value of `max_tokens` and `max_completion_tokens`, with overflow protection. If every eligible candidate is too small, Auto returns `400 context_length_exceeded` before calling a candidate.
+
+This is a heuristic, not a model tokenizer: it can overestimate or underestimate usage. It does not predict an unspecified output allowance or model-specific image token costs, and image requests skip this estimate. Unknown models keep the existing 8192-token registry default. The service's default minimum-context preference can still degrade to a smaller pool when no registered model meets it, but those text-only candidates must also pass the current request estimate. Explicit client context bounds remain hard filters. Upstream context validation remains authoritative.
+
+## HTTP failure attribution
+
+| Upstream status | Chat / Responses / Embeddings model health | Auto model health | Key state |
+|---|---|---|---|
+| `400` | Neutral | Preserve the existing single-strike self-healing cool-off | Neutral |
+| `401`, `403` | Neutral | Neutral | Quarantine the attempted key as an auth failure |
+| `404`, `408`, `422` | Neutral | Neutral | Neutral |
+| `429` | Count one failed step | Count one failed step | Rate-limit quarantine |
+| `5xx` | Count one failed step | Count one failed step | Transient quarantine |
+
+Auth, rate-limit and transient failures can try another available key within the existing retry count. Key retries do not multiply the model-health failure count. Ordinary request/configuration errors do not renew model cool-off, and their recovery permits are released. Auto's `400` exception retains its existing vision self-healing behavior; it is not a provider-wide circuit-breaker policy. Error responses continue through the configured fallback path and preserve the upstream status/body when no candidate succeeds.
+
+## Recovery admission and key exhaustion
+
+`IsDown` is a read-only health query. The Chat, Responses, Auto and Embeddings execution walks use `TryAcquire` instead: after a provider/model cool-off expires, only one request owns its recovery probe. Other requests skip to the next candidate immediately. A successful probe resets model health; a failed probe restarts cool-off. Cancellation, unavailable keys, non-health HTTP outcomes and downstream disconnects release the permit without manufacturing a health failure. A generation token prevents older results from clearing a newer probe or its cool-off.
+
+The key pool returns no key while all credentials remain quarantined. That step makes no upstream call, does not retry an empty credential and does not count another model/key failure. If every candidate is unavailable, the walk returns 503; if a real upstream response was already obtained, it preserves that result. Keys become selectable at the exact expiry boundary. A delayed success cannot clear a key that is still quarantined by another request. Retries recheck the selected key after backoff and can select another available key if it was quarantined during the wait.
+
+The advisory Auto decider follows the same key availability and quarantine rules. Auth, rate-limit, network, server and invalid-success failures update its key state; caller cancellation is neutral. Valid rankings record successful key usage. The decider still does not change candidate model health and falls back to the existing static ordering when unavailable. Canceled decisions do not populate the ranking failure cache, and a canceled shared waiter does not cancel another request's leader decision.
+
+Half-open admission is per provider/model, not a provider-wide circuit breaker or a per-key single-flight limit. Healthy traffic remains concurrent.
+
+## Runtime chain persistence
+
+Each `Store` serializes the complete snapshot-to-replacement operation. Saves use unique temporary files in the target directory and stable chain ordering; failed replacements clean up the temporary file and leave the original target intact. Router input and returned snapshots copy JSON/YAML parameter containers so external mutation does not race with persistence.
+
+These guarantees apply to one shared `Store` instance. Multiple processes or independently constructed stores writing the same path are not coordinated. No delete-before-rename workaround is used. This is not an fsync-based crash or power-loss durability guarantee; on Windows a target held without delete sharing can still reject replacement, in which case the API reports failure and preserves the original file.
+
+## Verification
+
+```sh
+go test ./... -count=1
+go vet ./...
+go build ./...
+go test -race ./internal/chains ./internal/router ./internal/health ./internal/keypool ./internal/server ./internal/responses -count=1
+```
+
+PowerShell users can run `./Validate.ps1 -Race`. If a Windows MinGW installation under a non-ASCII path fails to locate `crt2.o` or `crtbegin.o`, `./Validate.ps1 -Race -ShortToolchainPaths` temporarily sets the GCC search paths using the installed directory's short path. It restores the process environment on exit and does not change system settings. This workaround requires Windows short-path support and an installed GCC toolchain.
+
+The regression tests use local simulated upstreams and dummy keys. They cover malformed/empty 2xx, truncated and stalled bodies, body limits, fallback, cancellation during body/backoff, downstream write failure, invalid SSE endings, idle and hard stream deadlines, oversized SSE lines/events, and multiple fragmented tool calls. Multiple-choice tests check interleaved choices, isolated tool indices, missing/unfinished choices, invalid indices and fallback before output. Auto tests check request-context fit, explicit output reservation, image-estimate bypass, decider/shared-wait deadlines and cancellation-cache attribution. HTTP status tests cover ten route forms, key retries and neutral half-open release.
+
+Recovery tests cover 64 concurrent admissions across ten route forms, probe release and old results, all-key quarantine, decider key results, key quarantine during backoff, 64 concurrent saves, snapshot isolation, and failed replacement cleanup. A Windows-only test verifies preservation of a locked target file.
+
+Provider-wide isolation, exact model tokenization, incoming request-body limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and deployment architecture are retained.
