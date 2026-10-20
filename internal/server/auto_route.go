@@ -257,6 +257,9 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	var lastBody []byte
 	var lastCT string
 	for _, c := range ordered {
+		if r.Context().Err() != nil {
+			return
+		}
 		if walkExpired(deadline) {
 			log.Printf("auto: total budget exceeded, stopping walk")
 			break
@@ -294,6 +297,9 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			stopSetupBudget()
 			cancelStep()
+			if r.Context().Err() != nil {
+				return
+			}
 			if errors.Is(err, errNoAvailableKeys) {
 				permit.Release()
 				continue
@@ -487,12 +493,20 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 		log.Printf("auto: decider adaptor: %v", err)
 		return nil, err
 	}
-	payload, err := json.Marshal(map[string]any{
+	request := map[string]any{
 		"model":       s.decideModel,
 		"messages":    deciderMessages(s.decidePrompt(cands)),
-		"max_tokens":  2000,
+		"max_tokens":  max(4096, min(32768, envInt("GUVNA_DECIDER_MAX_TOKENS", 8192))),
 		"temperature": 0,
-	})
+	}
+	// NVIDIA NIM's Nemotron reasoning mode can spend the entire output budget
+	// thinking. Disable it for this small structured advisory task. Keep other
+	// providers' payloads portable instead of assuming they accept vendor knobs.
+	if s.decideProvider == "nvidia" && strings.Contains(strings.ToLower(s.decideModel), "nemotron") {
+		request["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+		request["response_format"] = map[string]string{"type": "json_object"}
+	}
+	payload, err := json.Marshal(request)
 	if err != nil {
 		log.Printf("auto: decider payload: %v", err)
 		return nil, err
@@ -546,8 +560,20 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 		finishKey(keypool.ClassTransient, false, raw)
 		return nil, err
 	}
+	valid := make(map[string]int)
+	for _, c := range cands {
+		name := c.Step.Provider + "/" + c.Step.Model
+		if n, ok := ranked[name]; ok {
+			valid[name] = n
+		}
+	}
+	if len(valid) == 0 {
+		err := fmt.Errorf("decider ranked no eligible models")
+		finishKey(keypool.ClassTransient, false, raw)
+		return nil, err
+	}
 	finishKey("", true, raw)
-	return ranked, nil
+	return valid, nil
 }
 
 // decidePrompt renders the pool the decider is ordering, with each candidate's

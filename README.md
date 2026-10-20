@@ -70,6 +70,10 @@ Everything is YAML in git (`config.yaml`): providers, models, rotation strategy,
 
 Upstream response validation, body limits, cancellation and timeout settings are documented in [docs/RELIABILITY.md](docs/RELIABILITY.md).
 
+For automatic routing, `GUVNA_DECIDER_MAX_TOKENS` controls the ranking model's output budget (default `8192`, clamped to `4096`–`32768`). NVIDIA Nemotron deciders use JSON output with thinking disabled so the budget is available for the ranking.
+
+If a ranking refresh fails, automatic routing can reuse the last successful ranking for up to one hour, filtered to the currently eligible candidates. Logs report `source=decider_stale` while using that advice; without usable advice, routing uses the existing fallback order. Client cancellation stops retries and provider fallback without counting as a provider or key failure.
+
 ## Status
 
 Use-ready and running in production (single user) since 2026-08-16. Compression engines and further phases are tracked in [docs/ROADMAP.md](docs/ROADMAP.md).

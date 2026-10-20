@@ -50,3 +50,30 @@ func TestDecideContextLeaderDeadlineDoesNotPoisonCache(t *testing.T) {
 		t.Fatalf("caller deadline poisoned ranking cache: source=%s calls=%d", source, calls)
 	}
 }
+
+func TestCanceledRefreshPreservesLastGoodAdviceWithoutRefreshingCache(t *testing.T) {
+	cands := cacheCandidates("x")
+	at := time.Now().Add(-2 * time.Minute)
+	goodAt := time.Now()
+	good := map[string]int{"b/y": 0}
+	mu := &sync.Mutex{}
+	cache := &Cache{key: candidatesKey(cands), order: good, at: at, goodOrder: good, goodAt: goodAt}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got, _, source := DecideContext(ctx, cands, func(ctx context.Context) (map[string]int, error) {
+		cancel()
+		return nil, ctx.Err()
+	}, []string{"a", "b"}, time.Minute, mu, cache)
+	if source != "decider_unavailable" || got[0].Step.Provider != "a" {
+		t.Fatalf("canceled refresh used stale advice: source=%s order=%v", source, got)
+	}
+	if !cache.at.Equal(at) || !cache.goodAt.Equal(goodAt) || cache.stale || len(cache.inflight) != 0 {
+		t.Fatalf("canceled refresh changed cache: %+v", cache)
+	}
+	got, _, source = DecideContext(context.Background(), cands, func(context.Context) (map[string]int, error) {
+		return nil, context.DeadlineExceeded
+	}, []string{"a", "b"}, time.Minute, mu, cache)
+	if source != "decider_stale" || got[0].Step.Provider != "b" {
+		t.Fatalf("canceled refresh discarded good advice: source=%s order=%v", source, got)
+	}
+}

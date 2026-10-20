@@ -214,8 +214,12 @@ func decideOrderContext(ctx context.Context, cands []Candidate, decider func(ctx
 		hit := cache.key == key && time.Since(cache.at) < interval
 		if hit && cache.order != nil {
 			order := cache.order
+			source := "decider_cached"
+			if cache.stale {
+				source = "decider_stale"
+			}
 			mu.Unlock()
-			return order, "decider_cached", nil
+			return order, source, nil
 		}
 		if hit && cache.order == nil {
 			mu.Unlock()
@@ -244,7 +248,7 @@ func decideOrderContext(ctx context.Context, cands []Candidate, decider func(ctx
 			if call.err != nil {
 				return nil, "decider_shared", call.err
 			}
-			return call.order, "decider_shared", nil
+			return call.order, call.source, nil
 		}
 		if cache.inflight == nil {
 			cache.inflight = make(map[string]*decideCall)
@@ -264,18 +268,30 @@ func decideOrderContext(ctx context.Context, cands []Candidate, decider func(ctx
 			ranked = nil
 		}
 		mu.Lock()
-		// err is nil iff ranked is non-nil, so one store covers both states.
+		source := "decider"
+		// Keep usable upstream advice on a failed refresh, but a canceled
+		// caller must not refresh either the success or failure cache.
 		if ctx.Err() == nil {
+			if err != nil && time.Since(cache.goodAt) < time.Hour {
+				ranked = currentRanking(cands, cache.goodOrder)
+				if len(ranked) > 0 {
+					source, err = "decider_stale", nil
+				}
+			} else if err == nil {
+				cache.goodOrder, cache.goodAt = ranked, time.Now()
+			}
+			cache.stale = source == "decider_stale"
 			cache.key, cache.order, cache.at = key, ranked, time.Now()
 		}
 		delete(cache.inflight, key)
 		mu.Unlock()
 		call.order, call.err = ranked, err
+		call.source = source
 		close(call.done)
 		if err != nil {
 			return nil, "", err
 		}
-		return ranked, "decider", nil
+		return ranked, source, nil
 	}
 	ranked, err := decider(ctx)
 	if ctx.Err() != nil {
@@ -299,9 +315,12 @@ func candidatesKey(cands []Candidate) string {
 }
 
 type Cache struct {
-	key   string
-	order map[string]int
-	at    time.Time
+	key       string
+	order     map[string]int
+	at        time.Time
+	goodOrder map[string]int
+	goodAt    time.Time
+	stale     bool
 	// inflights merges concurrent cold-cache misses on the same candidate
 	// set into one decider call. Without it, N simultaneous /v1/auto
 	// requests on a cold or expired cache fire N decider calls — paid
@@ -310,9 +329,23 @@ type Cache struct {
 }
 
 type decideCall struct {
-	done  chan struct{}
-	order map[string]int
-	err   error
+	done   chan struct{}
+	order  map[string]int
+	err    error
+	source string
+}
+
+// Restrict stale advice to the current eligible set. Removed or unhealthy
+// models can never be revived by a cached ranking; new models use fallback order.
+func currentRanking(cands []Candidate, ranked map[string]int) map[string]int {
+	out := make(map[string]int)
+	for _, c := range cands {
+		k := c.Step.Provider + "/" + c.Step.Model
+		if n, ok := scoreOf(k, ranked); ok {
+			out[k] = n
+		}
+	}
+	return out
 }
 
 // DefaultShareWait bounds how long a request may block on another caller's
@@ -331,7 +364,8 @@ const DefaultShareWait = 10 * time.Second
 func ParseRanking(body []byte) (map[string]int, error) {
 	var resp struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
@@ -343,22 +377,43 @@ func ParseRanking(body []byte) (map[string]int, error) {
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("no choices")
 	}
+	if resp.Choices[0].FinishReason == "length" {
+		return nil, fmt.Errorf("ranking output truncated")
+	}
 	content := strings.TrimSpace(resp.Choices[0].Message.Content)
 	if content == "" || content == "null" {
 		content = strings.TrimSpace(resp.Choices[0].Message.ReasoningContent)
 	}
-	var want struct {
-		Order []string `json:"order"`
+	// Accept a complete JSON object inside a markdown fence or reasoning wrapper,
+	// but never guess an order from prose or salvage a truncated JSON array.
+	for i := 0; i < len(content); i++ {
+		if content[i] != '{' {
+			continue
+		}
+		var want struct {
+			Order []string `json:"order"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(content[i:]))
+		if err := decoder.Decode(&want); err != nil || len(want.Order) == 0 {
+			continue
+		}
+		// A complete final JSON block may be fenced, but trailing prose,
+		// another object, or an enclosing broken JSON document is not a reply.
+		suffix := strings.TrimSpace(content[i+int(decoder.InputOffset()):])
+		if suffix != "" && suffix != "```" {
+			continue
+		}
+		out := make(map[string]int, len(want.Order))
+		for _, name := range want.Order {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return nil, fmt.Errorf("empty model in ranking")
+			}
+			if _, exists := out[name]; !exists {
+				out[name] = len(out)
+			}
+		}
+		return out, nil
 	}
-	if err := json.Unmarshal([]byte(content), &want); err != nil {
-		return nil, err
-	}
-	out := make(map[string]int, len(want.Order))
-	for i, s := range want.Order {
-		out[strings.TrimSpace(s)] = i
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("empty order")
-	}
-	return out, nil
+	return nil, fmt.Errorf("no complete ranking JSON object")
 }

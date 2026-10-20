@@ -76,6 +76,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var lastCT string
 	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
 		if !admitted {
 			log.Printf("responses: skipping %s/%s (cool-off)", step.Provider, step.Model)
@@ -104,6 +107,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		resp, keyEnv, err := s.tryStepCtx(stepCtx, r, step, payload)
 		if err != nil {
 			cancel()
+			if r.Context().Err() != nil {
+				return
+			}
 			if errors.Is(err, errNoAvailableKeys) {
 				permit.Release()
 				continue

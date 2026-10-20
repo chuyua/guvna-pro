@@ -412,6 +412,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var lastCT string
 	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
 		if !admitted {
 			log.Printf("chat: skipping %s/%s (cool-off)", step.Provider, step.Model)
@@ -434,6 +437,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		resp, keyEnv, err := s.tryStepCtx(stepCtx, r, step, stepBody)
 		if err != nil {
 			cancel()
+			if r.Context().Err() != nil {
+				return
+			}
 			if errors.Is(err, errNoAvailableKeys) {
 				permit.Release()
 				continue
@@ -551,6 +557,9 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	var lastCT string
 	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
 		if !admitted {
 			log.Printf("embed: skipping %s/%s (cool-off)", step.Provider, step.Model)
@@ -566,6 +575,9 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		resp, keyEnv, err := s.tryEmbed(stepCtx, r, step, body)
 		if err != nil {
 			cancel()
+			if r.Context().Err() != nil {
+				return
+			}
 			if errors.Is(err, errNoAvailableKeys) {
 				permit.Release()
 				continue
@@ -850,6 +862,25 @@ func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step route
 		lastResp, lastKey = resp, keyEnv
 	}
 	return nil, "", lastErr
+}
+
+// A disconnected caller has no next retry. Cancellation must also interrupt
+// backoff rather than briefly quarantining each otherwise healthy key.
+func (s *Server) waitRetry(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if attempt == 0 || s.retryWait == nil {
+		return nil
+	}
+	t := time.NewTimer(s.retryWait(attempt))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return ctx.Err()
+	}
 }
 
 // retryable reports whether a failure is transient: network errors, rate

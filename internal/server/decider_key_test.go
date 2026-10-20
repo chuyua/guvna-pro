@@ -11,6 +11,8 @@ import (
 
 	"github.com/creamy-ghost/guvna/internal/config"
 	"github.com/creamy-ghost/guvna/internal/keypool"
+	"github.com/creamy-ghost/guvna/internal/router"
+	"github.com/creamy-ghost/guvna/internal/selector"
 )
 
 const validDeciderBody = `{"choices":[{"message":{"content":"{\"order\":[\"a/m\"]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`
@@ -29,6 +31,7 @@ func TestDeciderUpstreamFailuresQuarantineAndRecordKey(t *testing.T) {
 		{"server_error", 503, `{"error":"unavailable"}`, false, keypool.ClassTransient},
 		{"invalid_json", 200, `{broken`, false, keypool.ClassTransient},
 		{"invalid_ranking", 200, `{"choices":[{"message":{"content":"not a ranking"}}]}`, false, keypool.ClassTransient},
+		{"unrelated_ranking", 200, validDeciderBody, false, keypool.ClassTransient},
 		{"error_in_2xx", 200, `{"error":"broken","choices":[{"message":{"content":"{\"order\":[\"a/m\"]}"}}]}`, false, keypool.ClassTransient},
 		{"truncated", 200, `{"choices":`, true, keypool.ClassTransient},
 		{"bad_request", 400, `{"error":"bad request"}`, false, ""},
@@ -148,7 +151,8 @@ func TestDeciderValidRankingRecoversKeyAndRecordsUsage(t *testing.T) {
 	s := runtimeServer(t, up.URL)
 	s.decideProvider, s.decideModel = "a", "m"
 	seedRecoveredKey(t, s)
-	ranked, err := s.callDecider(nil, context.Background(), nil)
+	cands := []selector.Candidate{{Step: router.Step{Provider: "a", Model: "m"}}}
+	ranked, err := s.callDecider(nil, context.Background(), cands)
 	if err != nil || len(ranked) != 1 {
 		t.Fatalf("ranking=%v err=%v", ranked, err)
 	}
@@ -176,10 +180,11 @@ func TestDeciderRotatesAfterQuarantine(t *testing.T) {
 	}
 	s.pools["a"] = p
 	s.env = func(string) string { return "dummy" }
-	if _, err := s.callDecider(nil, context.Background(), nil); err == nil {
+	cands := []selector.Candidate{{Step: router.Step{Provider: "a", Model: "m"}}}
+	if _, err := s.callDecider(nil, context.Background(), cands); err == nil {
 		t.Fatal("401 accepted")
 	}
-	if _, err := s.callDecider(nil, context.Background(), nil); err != nil {
+	if _, err := s.callDecider(nil, context.Background(), cands); err != nil {
 		t.Fatal(err)
 	}
 	ks := p.Keys()
