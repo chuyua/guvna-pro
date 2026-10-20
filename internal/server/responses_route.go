@@ -75,6 +75,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var lastBody []byte
 	var lastCT string
 	for _, step := range steps {
+		if r.Context().Err() != nil {
+			return
+		}
 		if s.hlth.IsDown(step.Provider, step.Model) {
 			log.Printf("responses: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
@@ -94,6 +97,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, keyEnv, err := s.tryStep(r, step, payload)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			log.Printf("responses: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.hlth.Mark(step.Provider, step.Model, 0, err)
@@ -104,6 +110,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			if agg {
 				aggResp, aerr := s.aggregateStreamed(resp)
 				if aerr != nil {
+					if r.Context().Err() != nil {
+						return
+					}
 					log.Printf("responses: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
 					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
 					s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 0, aerr, keyEnv)

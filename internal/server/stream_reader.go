@@ -125,9 +125,9 @@ type streamChunk struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Delta struct {
-			Content         *string `json:"content"`
-			ReasoningText   *string `json:"reasoning_content"`
-			Reasoning       *string `json:"reasoning"`
+			Content       *string `json:"content"`
+			ReasoningText *string `json:"reasoning_content"`
+			Reasoning     *string `json:"reasoning"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
