@@ -612,7 +612,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 				continue
 			}
-			if verr := validateEmbeddings(embedBody); verr != nil {
+			if verr := validateEmbeddings(embedBody, embeddingRequestContract(body, step.Params)); verr != nil {
 				log.Printf("embed: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
 				s.mark(r, step.Provider, step.Model, 0, verr)
 				s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
