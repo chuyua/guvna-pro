@@ -2,6 +2,8 @@
 
 Guvna is a single static binary with config-as-code. Two supported ways to run it.
 
+Administration uses `guvna-cli` over the same API as clients. No browser login or separate UI service is required or provided. See [CLI.md](CLI.md) to build and use the CLI from the current checkout.
+
 ## Option A — Docker Compose
 
 ```sh
@@ -16,7 +18,7 @@ Or use the published multi-arch image (amd64/arm64):
 
 ```sh
 docker run -d --name guvna \
-  -p 20128:20128 \
+  -p 127.0.0.1:20128:20128 \
   --env-file .env \
   -e GOMEMLIMIT=256MiB \
   -v guvna-data:/data \
@@ -34,9 +36,11 @@ guvna -config config.yaml                             # data dir defaults to ~/.
 
 A minimal unit runs it as your user on port 20128, keys via env, never in git.
 
+The gateway currently binds `:20128` (all interfaces), or the port configured in YAML. This differs from the CLI's default destination of `127.0.0.1:20128`: pointing the CLI at loopback does not restrict the server listener. The bridge-mode `docker run` example above publishes only on host loopback; the supplied Compose file uses host networking and needs host network access controls for equivalent isolation.
+
 ## TLS exposure
 
-Keep the gateway localhost-only unless you need remote clients. When exposing:
+Restrict access to local clients through container port publishing or host network controls unless remote clients are needed. When exposing:
 
 - Terminate TLS in front (caddy example below). Auth is always on (admin key + client API keys), but keys should still travel over TLS.
 
@@ -100,4 +104,4 @@ Admin endpoints (`/admin/status`, `/admin/logs`) are admin-key-only.
 
 - Auth always on (admin key + API keys) — never exposed without it
 - Remote CLI authenticates against the same gateway HTTPS endpoint
-- TLS via your reverse proxy when exposed; localhost-only otherwise
+- TLS via your reverse proxy when exposed; restrict the gateway port through container publishing or host network controls for local-only use

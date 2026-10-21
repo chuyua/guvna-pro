@@ -77,11 +77,9 @@ Build order with definition of done per phase. No time estimates — this is a p
 - Cache-aware: never touch cached prefixes
 - **Done when:** token savings measurable per engine (before/after counts in telemetry)
 
-## Phase 7 — Web UI (separate binary)
+## Phase 7 — Web UI (cancelled 2026-10-21)
 
-- Read-only: provider health, usage, token savings
-- Separate binary, never embedded in core
-- **Done when:** runs standalone against a live gateway, read-only enforced
+The former optional UI direction is superseded by CLI-only management. Its binary, browser login, web assets and deployment service have been removed. Status, logs and chain management remain available through `guvna-cli` over the existing gateway API. See [CLI.md](CLI.md) and the 2026-10-21 entry in [DECISIONS.md](DECISIONS.md).
 
 ## Phase 8 — Arch local install
 

@@ -2,6 +2,8 @@
 
 Everything below was verified against primary sources in Aug 2026. Confidence is stated per claim.
 
+The product comparisons below describe those reference projects, not additional Guvna services. Guvna's current operator interface is CLI-only; the former optional web UI direction was cancelled on 2026-10-21 (see [DECISIONS.md](DECISIONS.md)).
+
 ## Why scratch, not port or fork
 
 ### Full port of OmniRoute: impossible

@@ -10,6 +10,8 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 
 **Decision:** v1 is single-user: one admin key, API keys for clients, global usage stats, minimal read-only web UI.
 
+**Superseded in part (2026-10-21):** The UI scope was later removed in favor of CLI-only management. The single-user and API-key decisions remain in force; see the current decision at the end of this log.
+
 **Context:** User asked "is omnirouter single user?" — verified: OmniRoute is single-admin (INITIAL_PASSWORD + JWT_SECRET + API keys + scoped CLI tokens), NOT multi-tenant (0 "multi-user" results in docs).
 
 **Rationale:** Free quotas (Kiro ~50 credits/mo, Cerebras 1M/day) are per-upstream-account — multiple users sharing one account just drain one quota. The only honest multi-user free model is bring-your-own-keys, which is new-api's model. Multi-user ~2-3x scope. Auth can be bolted on later without touching router core.
@@ -122,6 +124,8 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 
 **Rationale:** The host's docker cannot create bridge networks (iptables setup fails — no iptables/legacy tooling present). Existing containers (caddy et al.) already run host-network. App binds 127.0.0.1:20128 directly; caddy reaches it the same way.
 
+**Current implementation note (2026-10-21):** The gateway listener is `:port` (all interfaces), not a forced loopback bind. Local-only access therefore requires host network controls with this host-network deployment; see DEPLOYMENT.md.
+
 ## 2026-08-16 — No catalogs, no strict model checks (upstream is the source of truth)
 
 **Decision:** No local model catalog; chain/model validation is loose (provider must exist in config, model non-empty). `POST /v1/chains` accepts any model string. Cancelled the Phase 5 subscribe-sync as the enforcement mechanism.
@@ -151,6 +155,8 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 **Context:** Requested: multiple rotation strategies so usage doesn't burn one key out, plus set-aside of seemingly-dead keys backed by health checking and observability.
 
 **Rationale:** Free-tier keys die (quota exhaustion, revocations — all 3 staged groq keys returned 403). A dead key must cost one attempt, not a burned request: quarantine it class-appropriately (auth death = long; rate limit = short, recoverable) and let the pool forget it until it heals. Per-key observability (`/admin/status` keys section + `key` column in telemetry rows) makes the mechanism auditable; deliberately out of scope: quarantine persistence across restarts (in-memory like step health), CLI key commands (a UI comes later).
+
+**Superseded in part (2026-10-21):** The expectation of a later UI was cancelled. Key status remains available through the authenticated API; future management work should extend the CLI.
 
 ## 2026-08-17 — Verified: key failover + quarantine live
 
@@ -183,3 +189,11 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 **Context:** Proposed during downstream-app integration work: per-step request params on chains with step-wins semantics. Rejected step-wins: the chain author IS the requester in this gateway (any valid key self-provisions chains), so step-wins means the client silently overrides its own explicit values (`max_tokens: 2048` → 8192 with no signal) and widens the chain-poisoning blast radius on shared chain names. Fill-missing solves the motivating case identically (client sends plain body, step fills `reasoning_effort: high` + `max_tokens`) while keeping per-request tuning intact.
 
 **Also:** responses now carry `x-guvna-step: <provider>/<model>` so clients can see which step served and whether params applied (works for SSE — header precedes the stream). chains.yaml gains a `version` field; no backward-compat constraint — nothing is migrated yet, chains are regenerable runtime state. Config-defined chains get params too (config.yaml parity). CLI stays JSON-only for params chains (repeatable `--param` flags can't express arrays/objects or bind unambiguously to a step).
+
+## 2026-10-21 — CLI-only management
+
+**Decision:** Remove the optional Dashboard binary, browser login and sessions, web assets and separate deployment service. Manage status, logs and runtime chains with `guvna-cli` over the existing gateway API. This supersedes the earlier optional-UI scope and ROADMAP Phase 7.
+
+**Context:** The project owner wants command-line operation without a browser login or an additional web-management entry point.
+
+**Rationale:** The CLI already covers the required management operations and authenticates directly with the configured gateway admin key. Keeping one authenticated API avoids maintaining a second listener and web-session scheme. `ADMIN_KEY`, `API_KEYS` and provider keys remain user-configured credentials; no browser OAuth or external login account is required. This scope decision does not replace a security audit or remove the gateway's HTTP API.

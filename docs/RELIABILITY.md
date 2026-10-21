@@ -47,7 +47,7 @@ Chat, Responses, Auto, Embeddings and `POST /v1/chains` share one bounded body r
 
 The read timeout covers only incoming body consumption. A successful read stops and joins its cancellation callback, then clears the native read deadline before generation begins. It does not cap upstream generation or an active response stream. Chat requests using `model:auto` pass the already-read body to Auto instead of reading it again. Failed HTTP/1 reads close the connection and keep an expired read deadline so the server cannot block while draining the unread body; HTTP/2 read deadlines apply to that request's stream.
 
-Standard HTTP/1 and HTTP/2 writers use `http.ResponseController.SetReadDeadline`. A wrapping writer should expose `Unwrap` so the controller can reach its transport. For custom writers without read-deadline support, cancellation closes the body and relies on the `http.Request.Body` contract that `Close` unblocks `Read`. These limits do not cover request headers or Dashboard form payloads.
+Standard HTTP/1 and HTTP/2 writers use `http.ResponseController.SetReadDeadline`. A wrapping writer should expose `Unwrap` so the controller can reach its transport. For custom writers without read-deadline support, cancellation closes the body and relies on the `http.Request.Body` contract that `Close` unblocks `Read`. These limits do not cover request headers. Management is CLI-only; there are no browser form routes.
 
 ## Auto context selection
 
@@ -104,4 +104,4 @@ Incoming-reader tests cover declared and actual size limits, exact-limit bodies,
 
 Recovery tests cover 64 concurrent admissions across ten route forms, probe release and old results, all-key quarantine, decider key results, key quarantine during backoff, 64 concurrent saves, snapshot isolation, and failed replacement cleanup. A Windows-only test verifies preservation of a locked target file.
 
-Provider-wide isolation, exact model tokenization, request-header limits, Dashboard form payload limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and deployment architecture are retained.
+Provider-wide isolation, exact model tokenization, request-header limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and gateway deployment architecture are retained.
