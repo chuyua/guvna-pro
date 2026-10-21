@@ -1,6 +1,7 @@
 package chains
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 	"github.com/creamy-ghost/guvna/internal/router"
 	"gopkg.in/yaml.v3"
 )
+
+// ErrPersistence distinguishes storage failures from chain validation errors.
+var ErrPersistence = errors.New("persist runtime chains")
 
 type fileFormat struct {
 	Version int         `yaml:"version,omitempty"`
@@ -69,7 +73,35 @@ func (s *Store) Save(r *router.Router) error {
 	defer s.mu.Unlock()
 	// Take the snapshot inside the write lock so an older queued save cannot
 	// overwrite a newer snapshot after it has already reached disk.
-	runtime := r.RuntimeChains()
+	return s.persist(r.RuntimeChains())
+}
+
+// AddChain saves a candidate snapshot before the router publishes the chain.
+// All Store operations acquire Store.mu before Router.mu; persistence callbacks
+// never reenter the router, avoiding the inverse lock order.
+func (s *Store) AddChain(r *router.Router, name string, steps []router.Step) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return r.AddChainPersisted(name, steps, s.persist)
+}
+
+// RemoveChain saves a candidate snapshot before the router removes the chain.
+func (s *Store) RemoveChain(r *router.Router, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return r.RemoveChainPersisted(name, s.persist)
+}
+
+func (s *Store) persist(runtime map[string][]router.Step) error {
+	if err := s.writeSnapshot(runtime); err != nil {
+		return fmt.Errorf("%w: %w", ErrPersistence, err)
+	}
+	return nil
+}
+
+// writeSnapshot requires Store.mu. Its input is an isolated candidate or a
+// committed router snapshot; it must not acquire any router lock.
+func (s *Store) writeSnapshot(runtime map[string][]router.Step) error {
 	f := fileFormat{Version: 2, Chains: make([]fileChain, 0, len(runtime))}
 	names := make([]string, 0, len(runtime))
 	for name := range runtime {

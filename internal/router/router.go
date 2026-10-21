@@ -124,6 +124,14 @@ func cloneParam(value any) any {
 // NOT checked — the upstream provider is the source of truth; a bad model
 // fails at request time and the chain falls through to the next step.
 func (r *Router) AddChain(name string, steps []Step) error {
+	return r.AddChainPersisted(name, steps, nil)
+}
+
+// AddChainPersisted validates a runtime chain and persists its candidate runtime
+// snapshot before publishing the chain. persist runs under the router write lock
+// and must not call back into this router. A failed persistence leaves all router
+// state, including model ownership order, untouched. A nil callback skips saving.
+func (r *Router) AddChainPersisted(name string, steps []Step, persist func(map[string][]Step) error) error {
 	if err := ValidateChainName(name); err != nil {
 		return err
 	}
@@ -146,11 +154,24 @@ func (r *Router) AddChain(name string, steps []Step) error {
 	if _, exists := r.chains[name]; exists {
 		return fmt.Errorf("chain %q already exists (source: %s)", name, r.sources[name])
 	}
+	if persist != nil {
+		candidate := r.runtimeChainsLocked()
+		candidate[name] = cloneSteps(steps)
+		if err := persist(candidate); err != nil {
+			return err
+		}
+	}
 	r.addLocked(name, steps, "runtime")
 	return nil
 }
 
 func (r *Router) RemoveChain(name string) error {
+	return r.RemoveChainPersisted(name, nil)
+}
+
+// RemoveChainPersisted persists a candidate without name before publishing its
+// removal. Its callback has the same locking contract as AddChainPersisted.
+func (r *Router) RemoveChainPersisted(name string, persist func(map[string][]Step) error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	src, exists := r.sources[name]
@@ -159,6 +180,13 @@ func (r *Router) RemoveChain(name string) error {
 	}
 	if src == "config" {
 		return fmt.Errorf("chain %q is defined in config.yaml — edit the config, not the runtime store", name)
+	}
+	if persist != nil {
+		candidate := r.runtimeChainsLocked()
+		delete(candidate, name)
+		if err := persist(candidate); err != nil {
+			return err
+		}
 	}
 	steps := r.chains[name]
 	for _, s := range steps {
@@ -272,6 +300,10 @@ func (r *Router) ListChains() []ChainInfo {
 func (r *Router) RuntimeChains() map[string][]Step {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.runtimeChainsLocked()
+}
+
+func (r *Router) runtimeChainsLocked() map[string][]Step {
 	out := make(map[string][]Step)
 	for name, steps := range r.chains {
 		if r.sources[name] != "runtime" {
