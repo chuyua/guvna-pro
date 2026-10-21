@@ -335,8 +335,9 @@ func validateChatCompletion(body []byte, expectedChoices ...int) error {
 }
 
 // validateEmbeddings rejects a 2xx body with no usable embedding data.
-// Every entry must contain a nonempty numeric vector or base64 float32 bytes.
-func validateEmbeddings(body []byte) error {
+// Every entry must contain a nonempty finite vector with a consistent encoding
+// and dimension. A request contract additionally constrains count and shape.
+func validateEmbeddings(body []byte, contracts ...embeddingContract) error {
 	var m struct {
 		Data  []json.RawMessage `json:"data"`
 		Error json.RawMessage   `json:"error"`
@@ -350,15 +351,39 @@ func validateEmbeddings(body []byte) error {
 	if len(m.Data) == 0 {
 		return errors.New("upstream 2xx body has no embedding data")
 	}
+	var contract embeddingContract
+	if len(contracts) > 0 {
+		contract = contracts[0]
+	}
+	if contract.count > 0 && len(m.Data) != contract.count {
+		return errors.New("upstream embedding count does not match the request")
+	}
+	seen := make(map[int]bool, len(m.Data))
+	var dimensions int
+	var format string
 	for _, raw := range m.Data {
 		var entry struct {
 			Embedding json.RawMessage `json:"embedding"`
+			Index     json.RawMessage `json:"index"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil || isJSONNull(entry.Embedding) {
 			return errors.New("upstream embedding entry has no vector")
 		}
-		var vector []float64
+		if len(entry.Index) == 0 {
+			if len(m.Data) > 1 {
+				return errors.New("upstream embedding batch entry has no index")
+			}
+		} else {
+			var index int
+			if isJSONNull(entry.Index) || json.Unmarshal(entry.Index, &index) != nil || index < 0 || index >= len(m.Data) || seen[index] {
+				return errors.New("upstream embedding index is invalid or duplicated")
+			}
+			seen[index] = true
+		}
+		var vectorDimensions int
+		var vectorFormat string
 		if strings.HasPrefix(strings.TrimSpace(string(entry.Embedding)), "[") {
+			vectorFormat = "float"
 			var numbers []json.RawMessage
 			if err := json.Unmarshal(entry.Embedding, &numbers); err != nil || len(numbers) == 0 {
 				return errors.New("upstream embedding vector is empty or malformed")
@@ -368,9 +393,13 @@ func validateEmbeddings(body []byte) error {
 				if isJSONNull(number) || json.Unmarshal(number, &value) != nil {
 					return errors.New("upstream embedding vector contains a non-number")
 				}
-				vector = append(vector, value)
+				if math.IsInf(value, 0) || math.IsNaN(value) {
+					return errors.New("upstream embedding vector contains a non-finite number")
+				}
 			}
+			vectorDimensions = len(numbers)
 		} else {
+			vectorFormat = "base64"
 			var encoded string
 			if json.Unmarshal(entry.Embedding, &encoded) != nil {
 				return errors.New("upstream embedding vector is neither numeric array nor base64")
@@ -380,14 +409,20 @@ func validateEmbeddings(body []byte) error {
 				return errors.New("upstream embedding vector is not base64 float32")
 			}
 			for i := 0; i < len(decoded); i += 4 {
-				vector = append(vector, float64(math.Float32frombits(binary.LittleEndian.Uint32(decoded[i:i+4]))))
+				value := float64(math.Float32frombits(binary.LittleEndian.Uint32(decoded[i : i+4])))
+				if math.IsInf(value, 0) || math.IsNaN(value) {
+					return errors.New("upstream embedding vector contains a non-finite number")
+				}
 			}
+			vectorDimensions = len(decoded) / 4
 		}
-		for _, value := range vector {
-			if math.IsInf(value, 0) || math.IsNaN(value) {
-				return errors.New("upstream embedding vector contains a non-finite number")
-			}
+		if (dimensions > 0 && vectorDimensions != dimensions) || (contract.dimensions > 0 && vectorDimensions != contract.dimensions) {
+			return errors.New("upstream embedding dimensions do not match")
 		}
+		if (format != "" && vectorFormat != format) || (contract.format != "" && vectorFormat != contract.format) {
+			return errors.New("upstream embedding encoding does not match")
+		}
+		dimensions, format = vectorDimensions, vectorFormat
 	}
 	return nil
 }
