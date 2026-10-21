@@ -16,6 +16,7 @@ Guvna takes neither horn: **config-as-code, no database, one static binary** (~1
 - **Provider-prefixed passthrough** — call any catalog model directly as `<provider>/<model>` when you don't need a chain.
 - **Self-healing** — unhealthy providers cool off (60s → 10min, auto-recovery); chains fail over across steps; no silent mid-stream restarts.
 - **Remote CLI** — `guvna-cli status|logs|chains` against the gateway's HTTPS endpoint, from anywhere.
+- **CLI-only management** — no browser login, OAuth flow, web sessions or separate UI service. The CLI uses your configured gateway admin key.
 - **Observability** — async SQLite telemetry (requests, tokens, serving key), `/admin/status` + `/admin/logs`.
 - **Free-tier native** — ships with configs for Bazaarlink, Groq, Mistral, Gemini, OrcaRouter free tiers.
 
@@ -30,9 +31,10 @@ docker compose -f deploy/docker-compose.yml up -d
 Or without Docker:
 
 ```sh
-go install github.com/creamy-ghost/guvna/cmd/guvna@latest
+go build -o guvna ./cmd/guvna
+go build -o guvna-cli ./cmd/guvna-cli
 set -a; source .env; set +a
-guvna -config config.yaml          # listens on :20128
+./guvna -config config.yaml        # listens on :20128 (all interfaces)
 ```
 
 Tagged releases also publish an image to `ghcr.io/creamy-ghost/guvna`.
@@ -56,13 +58,16 @@ curl http://127.0.0.1:20128/v1/chat/completions \
 
 If `bazaarlink` is down or rate-limited, the same request transparently falls through to `groq`. Or skip chains entirely: `"model": "groq/llama-3.3-70b-versatile"`.
 
-Manage chains remotely:
+Manage the gateway from another terminal, locally or remotely:
 
 ```sh
-export GUVNA_URL=https://your-gateway.example.com GUVNA_ADMIN_KEY=...
-guvna-cli chains list
-guvna-cli status
+export GUVNA_URL=http://127.0.0.1:20128 GUVNA_ADMIN_KEY="$ADMIN_KEY"
+./guvna-cli chains list
+./guvna-cli status
+./guvna-cli logs -n 100
 ```
+
+The API gateway must keep running; CLI-only management does not remove its HTTP API. For remote use, set `GUVNA_URL` to your gateway's HTTPS endpoint. See [docs/CLI.md](docs/CLI.md) for source builds, Windows commands, credentials and chain management. No separate port 20129 service is provided.
 
 ## Configuration
 
@@ -85,6 +90,7 @@ Use-ready and running in production (single user) since 2026-08-16. Compression 
 | [docs/VISION.md](docs/VISION.md) | Vision, v1 goals, non-goals |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: components, data model, security, chains, key pools |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Deploy anywhere: Compose, binary/systemd, TLS, keys, chains |
+| [docs/CLI.md](docs/CLI.md) | CLI-only management: build, credentials, status, logs and chains |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Why: comparisons (new-api, litellm, OmniRoute), compression reality check |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decision log with dates and rationale |
 | [docs/FREE_MODELS.md](docs/FREE_MODELS.md) | Per-provider free model + rate-limit reference |

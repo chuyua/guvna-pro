@@ -10,7 +10,7 @@ Free-tier providers (Bazaarlink, Groq, Mistral, Gemini, OrcaRouter) bill in toke
 
 1. **Single-user** — one admin key, global usage stats, minimal security surface. Multi-user is out of scope — per-upstream-account quotas make shared use self-defeating.
 2. **Cloud-first** — headless daemon, one static binary, one port, config-as-code YAML in git (never DB-driven config), SQLite only for usage/telemetry, distroless image, one-command deploy.
-3. **Security default-on** — auth always enabled, scoped tokens for remote CLI, no open-by-default dashboard.
+3. **Security default-on** — auth always enabled, CLI management using the configured admin key, no browser login or separate web-management service.
 4. **Upstream is the catalog** — no local model catalogs, no strict model-existence checks: chain creation validates loosely and unknown models fail at request time, where the chain falls over. A stale local catalog would reject valid new models; the provider can't. (Supersedes the original catalog-sync pillar — see DECISIONS.md.)
 
 ## Goals (v1)
@@ -24,14 +24,14 @@ Free-tier providers (Bazaarlink, Groq, Mistral, Gemini, OrcaRouter) bill in toke
   3. Session dedup / repetition pruning (content-addressed)
 - Config-as-code YAML; SQLite for usage/telemetry only
 - Single admin key + API keys (single-user)
-- Minimal read-only web UI — separate optional binary, never in core
-- Local CLI + remote CLI with scoped tokens
+- Local CLI + remote CLI over the gateway's authenticated API; revocable scoped tokens remain future work
 - systemd unit on Arch + container on a VPS
 - Tests + release docs
 
 ## Non-goals (v1)
 
 - Multi-user accounts, per-user quotas, billing
+- Browser dashboard, web login and web-session management
 - MCP / A2A / Electron app
 - LLMLingua-2 (ONNX MobileBERT) and headroom-style cache-aware live-zone compression
 - WebSocket realtime, context relay, combos

@@ -22,10 +22,9 @@ any OpenAI-compatible client
         │ 50+ providers  │
         └────────────────┘
 
-Separate, optional:  read-only web UI binary* (never in core)
-CLI:                guvna-cli status / logs / chains (local + remote over gateway)
+Management:         guvna-cli status / logs / chains (local + remote over gateway)
 
-* planned — see ROADMAP phases 6–7; everything unmarked is shipped.
+* planned — see ROADMAP Phase 6; everything unmarked is shipped.
 ```
 
 ## Components
@@ -41,7 +40,7 @@ CLI:                guvna-cli status / logs / chains (local + remote over gatewa
 - Provider adaptors: small per-provider interface (`Chat(ctx, body) (*http.Response, error)`), pattern from new-api's `relay_adaptor.go`. Two types built: `openai` (base + `/v1/chat/completions`) and `gemini` (base + `/v1beta/openai` + chat path — Gemini's official OpenAI-compat endpoint, passthrough no translation). Outbound requests carry `User-Agent: guvna/0.1` (bazaarlink throttles UA-less requests).
 - Auth: Bearer admin key (`ADMIN_KEY`) or client key (`API_KEYS`), always on; `/healthz` unauthenticated
 - Telemetry: in-memory event buffer, async batch flush to SQLite every 30s (pure-Go driver, no CGO); hot path never touches disk; crash loses <30s
-- Single process, one port. No dashboard in the process.
+- Single gateway process, one API port. Management uses the separate CLI binary against that same API.
 
 ### 2. Compression pipeline (planned — ROADMAP Phase 6, not built)
 Decision precedence when built (adapted from OmniRoute): per-request header (`x-guvna-compression`) → named profile → adaptive → config default → off. Cache-aware compression is always on (never touch already-cached prefixes).
@@ -65,11 +64,13 @@ v2 (not in v1): LLMLingua-2 (ONNX MobileBERT, heavy — separate process or side
 ### 5. Security
 - Auth always on: one admin key (env `ADMIN_KEY`), client keys (env `API_KEYS`); the gateway refuses to start without them
 - Remote CLI authenticates with the admin key over the gateway's HTTPS endpoint — no new port, no separate token scheme (revocable scoped tokens: future work, ROADMAP Phase 4)
-- No multi-user, no registration, no open dashboard
+- No multi-user, registration, browser login or web-session authentication
 
-### 6. Web UI (planned — ROADMAP Phase 7, not built)
-- Read-only status: provider health, usage, token savings
-- Separate binary; can be omitted from deployment entirely
+### 6. Operator interface
+- CLI-only: status, logs and runtime chains use the gateway's existing authenticated HTTP API
+- No UI binary, web assets, login page or additional management listener
+- The CLI defaults to `http://127.0.0.1:20128`; the gateway itself listens on `:20128` (all interfaces), so deployment network access must be configured separately
+- See [CLI.md](CLI.md) for commands and [DEPLOYMENT.md](DEPLOYMENT.md) for exposure
 
 ## Sizing
 
@@ -82,5 +83,5 @@ v2 (not in v1): LLMLingua-2 (ONNX MobileBERT, heavy — separate process or side
 
 - `REQUIRE_API_KEY` equivalent always on when exposed
 - Config in git, not DB
-- UI never in core process
+- Management through CLI and the authenticated API; no browser UI
 - Port 20128

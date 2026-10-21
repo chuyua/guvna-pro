@@ -10,8 +10,7 @@ docs/runbook-*.md
 # J-space working ledger
 .jspace/
 
-# Go vendor tree — regenerated via `go mod vendor`, shipped to the VPS by
-# scp (docs/DASHBOARD.md), never committed (140MB+, mostly modernc sqlite)
+# Go deployment artifacts — generated locally, never committed
 vendor/guvna-linux-amd64
 guvna-linux-amd64
 guvna-linux-amd64-new

@@ -13,6 +13,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -44,6 +45,9 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "guvna-cli: %v\n", err)
 		os.Exit(1)
@@ -56,9 +60,9 @@ func usage() {
 usage:
   guvna-cli status [flags]
   guvna-cli logs [-n lines] [flags]
-  guvna-cli chains [list]
-  guvna-cli chains add NAME --step provider:model [--step ...]
-  guvna-cli chains rm NAME
+  guvna-cli chains [list] [flags]
+  guvna-cli chains add NAME --step provider:model [--step ...] [flags]
+  guvna-cli chains rm NAME [flags]
 
 flags:
   --url    gateway base URL (default: %s or $GUVNA_URL)
@@ -76,6 +80,8 @@ type commonFlags struct {
 func parseCommon(fs *flag.FlagSet, cf *commonFlags) {
 	fs.StringVar(&cf.url, "url", envOr("GUVNA_URL", defaultURL), "gateway base URL")
 	fs.StringVar(&cf.token, "token", os.Getenv("GUVNA_ADMIN_KEY"), "admin key (Bearer token)")
+	// Keep the environment default active without displaying a credential in help.
+	fs.Lookup("token").DefValue = ""
 	fs.BoolVar(&cf.json, "json", false, "raw JSON output")
 }
 
@@ -244,10 +250,12 @@ type chainStep struct {
 }
 
 func chainsCmd(args []string) error {
-	if len(args) == 0 || args[0] == "list" {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		return chainsListCmd(args)
 	}
 	switch args[0] {
+	case "list":
+		return chainsListCmd(args[1:])
 	case "add":
 		return chainsAddCmd(args[1:])
 	case "rm", "remove":
@@ -258,10 +266,19 @@ func chainsCmd(args []string) error {
 }
 
 func chainsListCmd(args []string) error {
-	fs := flag.NewFlagSet("chains", flag.ExitOnError)
+	fs := flag.NewFlagSet("chains", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
-	fs.Parse(args)
+	ordered, err := reorderArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := fs.Parse(ordered); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("chains list accepts no positional arguments")
+	}
 
 	var out chainResp
 	if err := cf.get("/v1/chains", &out); err != nil {
@@ -284,51 +301,71 @@ func chainsListCmd(args []string) error {
 // reorderArgs moves flag tokens (and their values) before positional args so
 // Go's flag package, which stops at the first non-flag argument, still parses
 // commands like "chains add mychain --step a:b".
-func reorderArgs(args []string) []string {
+func reorderArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 	var flags, pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if strings.HasPrefix(a, "-") {
-			flags = append(flags, a)
-			if !strings.Contains(a, "=") && a != "-" && a != "--" {
-				i++
-				flags = append(flags, args[i])
-			}
+		if a == "--" {
+			pos = append(pos, args[i+1:]...)
+			break
+		}
+		if a == "-" || !strings.HasPrefix(a, "-") {
+			pos = append(pos, a)
 			continue
 		}
-		pos = append(pos, a)
+		name, _, hasValue := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		f := fs.Lookup(name)
+		if f == nil {
+			if name == "h" || name == "help" {
+				flags = append(flags, a)
+				continue
+			}
+			return nil, fmt.Errorf("flag provided but not defined: -%s", name)
+		}
+		flags = append(flags, a)
+		if hasValue {
+			continue
+		}
+		if boolean, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && boolean.IsBoolFlag() {
+			continue
+		}
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+			return nil, fmt.Errorf("flag needs an argument: -%s", name)
+		}
+		i++
+		flags = append(flags, args[i])
 	}
-	return append(flags, pos...)
+	// Preserve positional values after an explicit separator, including a leading
+	// dash, instead of allowing flag.Parse to reinterpret them as options.
+	return append(append(flags, "--"), pos...), nil
 }
 
 func chainsAddCmd(args []string) error {
 	var steps []chainStep
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--step" || args[i] == "-step" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("--step needs provider:model")
-			}
-			p, m, found := strings.Cut(args[i+1], ":")
-			if !found || p == "" || m == "" {
-				return fmt.Errorf("bad step %q — want provider:model", args[i+1])
-			}
-			steps = append(steps, chainStep{Provider: p, Model: m})
-			i++
-			continue
+	fs := flag.NewFlagSet("chains add", flag.ContinueOnError)
+	var cf commonFlags
+	parseCommon(fs, &cf)
+	fs.Func("step", "provider:model step (repeat for fallback order)", func(value string) error {
+		p, m, found := strings.Cut(value, ":")
+		if !found || p == "" || m == "" {
+			return fmt.Errorf("want provider:model")
 		}
-		rest = append(rest, args[i])
+		steps = append(steps, chainStep{Provider: p, Model: m})
+		return nil
+	})
+	ordered, err := reorderArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := fs.Parse(ordered); err != nil {
+		return err
 	}
 	if len(steps) == 0 {
 		return fmt.Errorf("chains add needs at least one --step")
 	}
-	fs := flag.NewFlagSet("chains add", flag.ExitOnError)
-	var cf commonFlags
-	parseCommon(fs, &cf)
-	fs.Parse(reorderArgs(rest))
 
 	name := fs.Arg(0)
-	if name == "" {
+	if name == "" || fs.NArg() != 1 {
 		return fmt.Errorf("chains add NAME --step provider:model [--step ...]")
 	}
 	var created chainInfo
@@ -343,13 +380,19 @@ func chainsAddCmd(args []string) error {
 }
 
 func chainsRmCmd(args []string) error {
-	fs := flag.NewFlagSet("chains rm", flag.ExitOnError)
+	fs := flag.NewFlagSet("chains rm", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
-	fs.Parse(reorderArgs(args))
+	ordered, err := reorderArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := fs.Parse(ordered); err != nil {
+		return err
+	}
 
 	name := fs.Arg(0)
-	if name == "" {
+	if name == "" || fs.NArg() != 1 {
 		return fmt.Errorf("chains rm NAME")
 	}
 	if err := cf.do(http.MethodDelete, "/v1/chains/"+name, nil, nil); err != nil {
