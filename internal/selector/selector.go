@@ -97,7 +97,13 @@ type ForContext func(model string) int
 // Candidates the decider did not mention keep a neutral score and sort after
 // the ranked ones, before the unranked tail.
 func Decide(cands []Candidate, decider func(ctx context.Context) (map[string]int, error), order []string, interval time.Duration, mu *sync.Mutex, cache *Cache) ([]Candidate, []Decided, string) {
-	ranked, source, err := decideOrder(cands, decider, interval, mu, cache)
+	return DecideContext(context.Background(), cands, decider, order, interval, mu, cache)
+}
+
+// DecideContext is Decide with a caller budget. A canceled caller stops waiting
+// on a shared call without canceling the leader's work or poisoning its cache.
+func DecideContext(ctx context.Context, cands []Candidate, decider func(ctx context.Context) (map[string]int, error), order []string, interval time.Duration, mu *sync.Mutex, cache *Cache) ([]Candidate, []Decided, string) {
+	ranked, source, err := decideOrderContext(ctx, cands, decider, interval, mu, cache)
 	if err != nil {
 		source = "decider_unavailable"
 		ranked = nil
@@ -184,6 +190,13 @@ func priorityMap(order []string) map[string]int {
 // than one per request. The mutex is only held while reading or writing the
 // cache, never across the decider call itself — that call can take seconds.
 func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[string]int, error), interval time.Duration, mu *sync.Mutex, cache *Cache) (map[string]int, string, error) {
+	return decideOrderContext(context.Background(), cands, decider, interval, mu, cache)
+}
+
+func decideOrderContext(ctx context.Context, cands []Candidate, decider func(ctx context.Context) (map[string]int, error), interval time.Duration, mu *sync.Mutex, cache *Cache) (map[string]int, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if len(cands) <= 1 {
 		return nil, "single_candidate", nil
 	}
@@ -226,6 +239,9 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 			select {
 			case <-call.done:
 				timer.Stop()
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, "", ctx.Err()
 			case <-timer.C:
 				return nil, "", fmt.Errorf("decider call in flight, share wait expired")
 			}
@@ -241,7 +257,10 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 		cache.inflight[key] = call
 		mu.Unlock()
 
-		ranked, err := decider(context.Background())
+		ranked, err := decider(ctx)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		if err == nil && ranked == nil {
 			err = fmt.Errorf("decider returned no ranking")
 		}
@@ -250,16 +269,20 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 		}
 		mu.Lock()
 		source := "decider"
-		if err != nil && time.Since(cache.goodAt) < time.Hour {
-			ranked = currentRanking(cands, cache.goodOrder)
-			if len(ranked) > 0 {
-				source, err = "decider_stale", nil
+		// Keep usable upstream advice on a failed refresh, but a canceled
+		// caller must not refresh either the success or failure cache.
+		if ctx.Err() == nil {
+			if err != nil && time.Since(cache.goodAt) < time.Hour {
+				ranked = currentRanking(cands, cache.goodOrder)
+				if len(ranked) > 0 {
+					source, err = "decider_stale", nil
+				}
+			} else if err == nil {
+				cache.goodOrder, cache.goodAt = ranked, time.Now()
 			}
-		} else if err == nil {
-			cache.goodOrder, cache.goodAt = ranked, time.Now()
+			cache.stale = source == "decider_stale"
+			cache.key, cache.order, cache.at = key, ranked, time.Now()
 		}
-		cache.stale = source == "decider_stale"
-		cache.key, cache.order, cache.at = key, ranked, time.Now()
 		delete(cache.inflight, key)
 		mu.Unlock()
 		call.order, call.err = ranked, err
@@ -270,7 +293,10 @@ func decideOrder(cands []Candidate, decider func(ctx context.Context) (map[strin
 		}
 		return ranked, source, nil
 	}
-	ranked, err := decider(context.Background())
+	ranked, err := decider(ctx)
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err == nil && ranked == nil {
 		err = fmt.Errorf("decider returned no ranking")
 	}

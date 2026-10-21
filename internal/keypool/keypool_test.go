@@ -102,15 +102,19 @@ func TestLeastUsedPicksOldest(t *testing.T) {
 	}
 }
 
-func TestAllQuarantinedFallsBackToMostRecovered(t *testing.T) {
+func TestAllQuarantinedReturnsUnavailable(t *testing.T) {
 	p, _ := New("p", []string{"K1", "K2"}, "round_robin", config.QuarantineCfg{})
 	now := time.Now()
 	p.now = func() time.Time { return now }
 	p.Mark("K1", ClassAuth) // down until now+24h
 	now = now.Add(time.Minute)
 	p.Mark("K2", ClassAuth) // down until now+24h (1 minute later than K1)
+	if got := p.Pick(); got != "" {
+		t.Fatalf("quarantined pick = %s, want unavailable", got)
+	}
+	now = p.keys[0].downUntil
 	if got := p.Pick(); got != "K1" {
-		t.Fatalf("fallback pick = %s, want K1 (earliest expiry)", got)
+		t.Fatalf("pick at exact expiry = %s, want K1", got)
 	}
 }
 
@@ -148,6 +152,14 @@ func TestMarkSuccessResets(t *testing.T) {
 	p.Mark("K", ClassAuth)
 	if p.keys[0].healthy(now) {
 		t.Fatal("key should be quarantined after mark")
+	}
+	p.MarkSuccess("K")
+	if p.keys[0].healthy(now) || p.keys[0].failures != 1 {
+		t.Fatal("late success must preserve a newer quarantine")
+	}
+	now = p.keys[0].downUntil
+	if p.Pick() != "K" {
+		t.Fatal("key must be selectable at expiry")
 	}
 	p.MarkSuccess("K")
 	if !p.keys[0].healthy(now) {

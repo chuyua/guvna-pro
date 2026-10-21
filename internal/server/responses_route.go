@@ -38,9 +38,9 @@ func responsesErr(w http.ResponseWriter, status int, typ, code, msg string) {
 // protocol once, then walked through the identical chain / health / key-pool
 // loop that serves /v1/chat/completions. Only the final response shape differs.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBody(w, r)
 	if err != nil {
-		responsesErr(w, http.StatusBadRequest, "invalid_request_error", "read_body_failed", "read body")
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	req, err := responses.ParseRequest(body)
@@ -74,13 +74,21 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var lastStatus int
 	var lastBody []byte
 	var lastCT string
+	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
 		if r.Context().Err() != nil {
 			return
 		}
-		if s.hlth.IsDown(step.Provider, step.Model) {
+		permit, admitted := s.hlth.TryAcquire(step.Provider, step.Model)
+		if !admitted {
 			log.Printf("responses: skipping %s/%s (cool-off)", step.Provider, step.Model)
 			continue
+		}
+		defer permit.Release()
+		r = withPermit(r, permit)
+		if walkExpired(deadline) {
+			log.Printf("responses: request budget exhausted, stopping the walk")
+			break
 		}
 		// tryStep rewrites "model" to the step's model and applies the step's
 		// params, exactly as it does for chat completions.
@@ -95,51 +103,77 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if agg {
 			payload = forceStreamBody(payload)
 		}
-		resp, keyEnv, err := s.tryStep(r, step, payload)
+		stepCtx, cancel := stepContext(r, deadline, req.Stream, chatStepBudget)
+		resp, keyEnv, err := s.tryStepCtx(stepCtx, r, step, payload)
 		if err != nil {
+			cancel()
 			if r.Context().Err() != nil {
+				return
+			}
+			if errors.Is(err, errNoAvailableKeys) {
+				permit.Release()
+				continue
+			}
+			if isClientGone(err) {
+				log.Printf("responses: client gone, stopping the walk at %s/%s: %v", step.Provider, step.Model, err)
 				return
 			}
 			log.Printf("responses: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
-			s.hlth.Mark(step.Provider, step.Model, 0, err)
+			s.mark(r, step.Provider, step.Model, 0, err)
 			s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var res relayResult
 			if agg {
 				aggResp, aerr := s.aggregateStreamed(resp)
 				if aerr != nil {
+					cancel()
 					if r.Context().Err() != nil {
 						return
 					}
 					log.Printf("responses: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.hlth.Mark(step.Provider, step.Model, 0, aerr)
-					s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 0, aerr, keyEnv)
+					s.mark(r, step.Provider, step.Model, 0, aerr)
+					s.poolRecordResult(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, aerr)
+					failure := invalidResponsesResult(aerr)
+					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
 				}
 				// relayResponsesBody translates the chat.completion into a
 				// Responses object and marks health after the body lands.
-				s.relayResponsesBody(w, r, step, chain, req, aggResp, keyEnv)
+				res = s.relayResponsesBody(w, r, step, chain, req, aggResp, keyEnv)
+			} else if req.Stream {
+				// Health is marked after the body lands — same rule as handleChat.
+				s.relayResponsesStream(w, r, step, chain, req, resp, keyEnv)
+				res = relayResult{outcome: relayCommitted}
+			} else {
+				res = s.relayResponsesBody(w, r, step, chain, req, resp, keyEnv)
+			}
+			cancel()
+			if res.clientGone {
 				return
 			}
-			// Health is marked after the body lands — same rule as handleChat.
-			if req.Stream {
-				s.relayResponsesStream(w, r, step, chain, req, resp, keyEnv)
-			} else {
-				s.relayResponsesBody(w, r, step, chain, req, resp, keyEnv)
+			if res.outcome == relayCommitted {
+				return
 			}
-			return
+			lastStatus, lastBody, lastCT, lastErr = res.status, res.body, res.ct, res.err
+			continue
 		}
 		lastStatus = resp.StatusCode
-		lastBody, _ = io.ReadAll(resp.Body)
+		lastBody, _ = readErrorBody(resp, req.Stream)
 		lastCT = resp.Header.Get("Content-Type")
 		resp.Body.Close()
+		cancel()
+		if r.Context().Err() != nil {
+			return
+		}
 		if retryable(resp.StatusCode, nil) {
-			s.hlth.Mark(step.Provider, step.Model, resp.StatusCode, nil)
+			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		}
 		log.Printf("responses: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
 		s.record(step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
+		permit.Release()
 	}
 
 	log.Printf("responses: all steps failed for chain %q: %v", chain, lastErr)
@@ -156,30 +190,51 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	w.Write(lastBody)
 }
 
+// Invalid 2xx responses are gateway failures when no fallback can serve them.
+func invalidResponsesResult(err error) relayResult {
+	return relayResult{outcome: relayUncommitted, status: http.StatusBadGateway, ct: "application/json",
+		body: []byte(`{"error":{"type":"api_error","code":"upstream_invalid_response","message":"upstream returned an invalid or incomplete response"}}`), err: err}
+}
+
 // relayResponsesBody translates a whole chat completions body back into a
 // Responses response object.
-func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req *responses.Request, resp *http.Response, keyEnv string) {
+func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req *responses.Request, resp *http.Response, keyEnv string) relayResult {
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimited(resp.Body, maxResponseBytes)
+	ct := resp.Header.Get("Content-Type")
+	if r.Context().Err() != nil {
+		return relayResult{outcome: relayUncommitted, clientGone: true, err: r.Context().Err()}
+	}
 	if err != nil {
 		if r.Context().Err() != nil {
-			return
+			return relayResult{outcome: relayUncommitted, clientGone: true, status: resp.StatusCode, ct: ct, err: err}
 		}
-		s.hlth.Mark(step.Provider, step.Model, 0, err)
+		s.mark(r, step.Provider, step.Model, 0, err)
 		s.poolRecordResult(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, err)
-		responsesErr(w, http.StatusBadGateway, "api_error", "upstream_read_failed", "upstream read failed")
-		return
+		log.Printf("responses: %s/%s body read failed: %v", step.Provider, step.Model, err)
+		return invalidResponsesResult(err)
 	}
-	s.hlth.MarkSuccess(step.Provider, step.Model)
 	var cc responses.ChatCompletion
-	if err := json.Unmarshal(body, &cc); err != nil {
-		// Not a chat completion object — pass the body straight through so the
-		// client still sees the upstream's own error.
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
-		s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, 0, 0, "")
-		return
+	verr := validateChatCompletion(body)
+	if verr == nil {
+		verr = json.Unmarshal(body, &cc)
+	}
+	if verr != nil {
+		// A 2xx that is not a chat completion cannot be translated into a
+		// Responses object, so this attempt failed: report it and let the walk
+		// try the next step instead of handing the caller an unusable success.
+		verr = fmt.Errorf("upstream 2xx body is not a chat completion: %w", verr)
+		log.Printf("responses: %s/%s unusable 2xx body: %v", step.Provider, step.Model, verr)
+		s.mark(r, step.Provider, step.Model, 0, verr)
+		s.poolRecordResult(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, verr)
+		return invalidResponsesResult(verr)
+	}
+	if len(cc.Choices) == 0 {
+		verr := errors.New("upstream 2xx body has no choices")
+		log.Printf("responses: %s/%s %v", step.Provider, step.Model, verr)
+		s.mark(r, step.Provider, step.Model, 0, verr)
+		s.poolRecordResult(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, verr)
+		return invalidResponsesResult(verr)
 	}
 	// The upstream echoes the model that actually served the request, e.g.
 	// "self-dploy/GLM-5.3-Flash" for a step that asked for "GLM-5.3-Flash".
@@ -189,17 +244,23 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		in, out = cc.Usage.PromptTokens, cc.Usage.CompletionTokens
 	}
 	outResp := responses.FromChat(&cc, req, served)
-	s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, in, out, "")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Guvna-Step", step.Provider+"/"+step.Model)
 	w.WriteHeader(resp.StatusCode)
-	json.NewEncoder(w).Encode(outResp)
+	if err := json.NewEncoder(w).Encode(outResp); err != nil || r.Context().Err() != nil {
+		return relayResult{outcome: relayCommitted, clientGone: true}
+	}
+	s.markSuccess(r, step.Provider, step.Model)
+	s.poolRecord(keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, in, out, "")
+	return relayResult{outcome: relayCommitted}
 }
 
 // relayResponsesStream translates complete SSE events. Blocking reads run in a
 // separate goroutine so keep-alive and cancellation remain responsive; only this
 // goroutine writes the client response. Once opened, this stream never fails over.
 func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, step router.Step, chain string, req *responses.Request, resp *http.Response, keyEnv string) {
+	streamDeadline, durationC, stopDuration := streamDurationTimer()
+	defer stopDuration()
 	defer resp.Body.Close()
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -223,7 +284,15 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 	var data sseData
 	var usage *responses.ChatUsage
 	var finish string
+	streamCalls := make(map[int]*toolCallAgg)
 	chatReq := chatRequest{Model: req.Model, Stream: req.Stream}
+	var idleC <-chan time.Time
+	idleTimer := time.NewTimer(time.Hour)
+	defer idleTimer.Stop()
+	if streamIdle > 0 {
+		idleTimer.Reset(streamIdle)
+		idleC = idleTimer.C
+	}
 	tokens := func() (int64, int64) {
 		if usage == nil {
 			return 0, 0
@@ -235,18 +304,41 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 			return
 		}
 		in, out := tokens()
-		s.hlth.Mark(step.Provider, step.Model, 0, err)
+		s.mark(r, step.Provider, step.Model, 0, err)
 		s.poolRecordResult(keyEnv, step, chain, chatReq, 502, in, out, keypool.ClassTransient, err)
-		_ = st.Fail("upstream stream invalid or interrupted")
+		message := "upstream stream invalid or interrupted"
+		var budgetErr *stepTimeoutError
+		if errors.As(err, &budgetErr) {
+			message = "upstream stream exceeded maximum duration"
+		}
+		_ = st.Fail(message)
 	}
 	complete := func() {
 		if r.Context().Err() != nil {
 			return
 		}
+		if finish == "" {
+			fail(errors.New("upstream SSE ended without finish_reason"))
+			return
+		}
+		if finish == "tool_calls" || finish == "function_call" {
+			if len(streamCalls) == 0 {
+				fail(errors.New("upstream stream reported tool_calls without any call"))
+				return
+			}
+		}
+		if finish != "length" && finish != "content_filter" {
+			for _, call := range streamCalls {
+				if !call.valid() {
+					fail(errors.New("upstream stream carried an incomplete tool call"))
+					return
+				}
+			}
+		}
 		if err := st.Finish(finish, usage); err != nil {
 			return
 		}
-		s.hlth.MarkSuccess(step.Provider, step.Model)
+		s.markSuccess(r, step.Provider, step.Model)
 		in, out := tokens()
 		s.poolRecord(keyEnv, step, chain, chatReq, resp.StatusCode, in, out, "")
 	}
@@ -273,6 +365,20 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 		if cc.Usage != nil {
 			usage = cc.Usage
 		}
+		if len(cc.Choices) > 0 {
+			for _, raw := range cc.Choices[0].Delta.ToolCalls {
+				var tc streamToolCall
+				if err := json.Unmarshal(raw, &tc); err != nil || tc.Index == nil || *tc.Index < 0 {
+					return false, errors.New("invalid upstream tool-call delta"), nil
+				}
+				call := streamCalls[*tc.Index]
+				if call == nil {
+					call = &toolCallAgg{}
+					streamCalls[*tc.Index] = call
+				}
+				call.append(tc)
+			}
+		}
 		if len(cc.Choices) > 0 && cc.Choices[0].FinishReason != nil {
 			reason := *cc.Choices[0].FinishReason
 			switch reason {
@@ -287,8 +393,18 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 		return false, nil, st.Chunk(&cc)
 	}
 	for {
+		if walkExpired(streamDeadline) {
+			fail(streamDurationError())
+			return
+		}
 		select {
 		case <-r.Context().Done():
+			return
+		case <-durationC:
+			fail(streamDurationError())
+			return
+		case <-idleC:
+			fail(fmt.Errorf("no upstream data for %s", streamIdle))
 			return
 		case <-timer.C:
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
@@ -301,7 +417,15 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 				return
 			}
 			if len(next.line) > 0 {
-				if payload, ok := data.line(next.line); ok {
+				if streamIdle > 0 {
+					idleTimer.Reset(streamIdle)
+				}
+				payload, ok, err := data.line(next.line)
+				if err != nil {
+					fail(err)
+					return
+				}
+				if ok {
 					done, upstreamErr, writeErr := consume(payload)
 					if upstreamErr != nil {
 						fail(upstreamErr)
@@ -325,7 +449,7 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 					return
 				}
 				// EOF dispatches a pending event too, but it is not itself a
-				// successful terminator. A valid finish_reason or DONE is required.
+				// successful terminator. A valid finish_reason is required.
 				if payload, ok := data.flush(); ok {
 					done, upstreamErr, writeErr := consume(payload)
 					if upstreamErr != nil {

@@ -69,7 +69,7 @@ func completionUpstream(t *testing.T, status int, body string, stream bool) *htt
 		if stream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(status)
-			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
 			w.Write([]byte("data: [DONE]\n\n"))
 			return
 		}
@@ -94,7 +94,7 @@ func doChat(t *testing.T, ts *httptest.Server, model string, stream bool) *http.
 func TestChatFallsBackToSecondStep(t *testing.T) {
 	bad := completionUpstream(t, http.StatusTooManyRequests, `{"error":"rate limited"}`, false)
 	defer bad.Close()
-	good := completionUpstream(t, http.StatusOK, `{"choices":[{}],"usage":{"prompt_tokens":5,"completion_tokens":9}}`, false)
+	good := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9}}`, false)
 	defer good.Close()
 
 	providers := []config.Provider{
@@ -157,7 +157,7 @@ func TestChatRewritesModelToStepModel(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[{}]}`))
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
 	}))
 	defer up.Close()
 
@@ -174,7 +174,7 @@ func TestChatRewritesModelToStepModel(t *testing.T) {
 }
 
 func TestChatSkipsProviderWithoutKey(t *testing.T) {
-	good := completionUpstream(t, http.StatusOK, `{"choices":[{}]}`, false)
+	good := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`, false)
 	defer good.Close()
 
 	providers := []config.Provider{
@@ -293,7 +293,7 @@ func doChatNoAuth(t *testing.T, ts *httptest.Server) *http.Response {
 func TestTelemetryRecordsAttempts(t *testing.T) {
 	bad := completionUpstream(t, http.StatusTooManyRequests, `{"error":"429"}`, false)
 	defer bad.Close()
-	good := completionUpstream(t, http.StatusOK, `{"choices":[{}],"usage":{"prompt_tokens":5,"completion_tokens":9}}`, false)
+	good := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9}}`, false)
 	defer good.Close()
 
 	providers := []config.Provider{
@@ -334,7 +334,7 @@ func TestChatSkipsDownStep(t *testing.T) {
 		http.Error(w, `{"error":"should not reach"`, http.StatusInternalServerError)
 	}))
 	defer down.Close()
-	good := completionUpstream(t, http.StatusOK, `{"choices":[{}]}`, false)
+	good := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`, false)
 	defer good.Close()
 
 	providers := []config.Provider{
@@ -370,13 +370,14 @@ func TestChatRetriesTransientFailure(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[{}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
 	}))
 	defer up.Close()
 
-	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "KEY_A"}}
+	// Each rate-limited key is quarantined; retries need another usable key.
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnvs: []string{"KEY_A", "KEY_A2", "KEY_A3"}}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
-	_, ts := testServer(t, providers, chains, map[string]string{"KEY_A": "k"})
+	_, ts := testServer(t, providers, chains, map[string]string{"KEY_A": "k", "KEY_A2": "k2", "KEY_A3": "k3"})
 
 	resp := doChat(t, ts, "main", false)
 	defer resp.Body.Close()
@@ -391,7 +392,7 @@ func TestChatRetriesTransientFailure(t *testing.T) {
 func TestChatClientErrorDoesNotMarkDown(t *testing.T) {
 	bad := completionUpstream(t, http.StatusBadRequest, `{"error":"bad model"}`, false)
 	defer bad.Close()
-	good := completionUpstream(t, http.StatusOK, `{"choices":[{}]}`, false)
+	good := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`, false)
 	defer good.Close()
 
 	providers := []config.Provider{
@@ -536,7 +537,7 @@ func postChain(t *testing.T, ts *httptest.Server, token string, name string, ste
 }
 
 func TestChainsCreateWithClientKey(t *testing.T) {
-	up := completionUpstream(t, http.StatusOK, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`, false)
+	up := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`, false)
 	defer up.Close()
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
 	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
@@ -644,7 +645,7 @@ func TestChatFailsOverAcrossKeys(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[{}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`))
 	}))
 	defer up.Close()
 
@@ -726,7 +727,7 @@ func captureUpstream(t *testing.T, bodies chan []byte) *httptest.Server {
 		bodies <- raw
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"choices":[{}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	}))
 }
 
@@ -795,7 +796,7 @@ func TestStepParamsClientWins(t *testing.T) {
 }
 
 func TestStepParamsStreamAndModelNeverMerged(t *testing.T) {
-	up := completionUpstream(t, http.StatusOK, `{"choices":[{}]}`, false)
+	up := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`, false)
 	defer up.Close()
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
 	// Reserved keys are rejected at chain creation, so a config chain with
@@ -926,7 +927,7 @@ func TestEnvIntParses(t *testing.T) {
 }
 
 // TestTryStepBudgetIsDefaultRetries locks the retry budget with an upstream
-// that always fails. With GUVNA_RETRIES unset the upstream must receive exactly
+// that always fails and has enough usable keys. With GUVNA_RETRIES unset it receives exactly
 // defaultRetries+1 attempts — one too many and the chain latency budget breaks.
 func TestTryStepBudgetIsDefaultRetries(t *testing.T) {
 	if defaultRetries != 2 {
@@ -948,9 +949,9 @@ func TestTryStepBudgetIsDefaultRetries(t *testing.T) {
 	}))
 	defer up.Close()
 
-	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
+	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnvs: []string{"K", "K2", "K3"}}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m-a"}}}}
-	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+	_, ts := testServer(t, providers, chains, map[string]string{"K": "k", "K2": "k2", "K3": "k3"})
 
 	resp := doChat(t, ts, "main", false)
 	defer resp.Body.Close()

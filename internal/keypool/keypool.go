@@ -3,9 +3,7 @@
 // their env var name; values are resolved lazily by the caller so env changes
 // take effect without a restart.
 //
-// Selection never hard-blocks: if every key is quarantined, Pick falls back to
-// the key whose cool-off expires first (most recovered). Persistent failure
-// still surfaces via the step health tracker, which fails the chain over.
+// Selection skips quarantined keys; an exhausted pool lets the caller fail over.
 package keypool
 
 import (
@@ -60,7 +58,7 @@ type keyState struct {
 }
 
 func (k *keyState) healthy(now time.Time) bool {
-	return k.failures == 0 || now.After(k.downUntil)
+	return k.failures == 0 || !now.Before(k.downUntil)
 }
 
 // Pool is safe for concurrent use.
@@ -77,6 +75,12 @@ type Pool struct {
 // New builds a pool for the provider. Strategy "" and zero quarantine fields
 // fall back to round_robin and config.DefaultQuarantine.
 func New(provider string, envs []string, strategy string, qc config.QuarantineCfg) (*Pool, error) {
+	return NewWithClock(provider, envs, strategy, qc, time.Now)
+}
+
+// NewWithClock allows deterministic evaluation of quarantine expiry. The clock
+// must be safe for concurrent use.
+func NewWithClock(provider string, envs []string, strategy string, qc config.QuarantineCfg, now func() time.Time) (*Pool, error) {
 	if len(envs) == 0 {
 		return nil, fmt.Errorf("provider %q: empty key pool", provider)
 	}
@@ -101,12 +105,11 @@ func New(provider string, envs []string, strategy string, qc config.QuarantineCf
 	for _, e := range envs {
 		keys = append(keys, &keyState{env: e})
 	}
-	return &Pool{name: provider, keys: keys, strat: s, qc: qc, now: time.Now}, nil
+	return &Pool{name: provider, keys: keys, strat: s, qc: qc, now: now}, nil
 }
 
 // Pick returns the env var name of the key to use for the next attempt.
-// Prefers healthy keys per the strategy; if none are healthy, falls back to
-// the key with the oldest cool-off expiry (most recovered). Never returns "".
+// It returns "" if every key is still quarantined.
 func (p *Pool) Pick() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -140,18 +143,22 @@ func (p *Pool) Pick() string {
 		}
 	}
 	if best == -1 {
-		// All quarantined: use the key that recovers soonest.
-		for i, k := range p.keys {
-			if best == -1 || k.downUntil.Before(p.keys[best].downUntil) {
-				best = i
-			}
-		}
+		return ""
 	}
 	p.keys[best].lastAt = now
 	if p.strat == StrategyRoundRobin {
 		p.rrNext = (best + 1) % len(p.keys)
 	}
 	return p.keys[best].env
+}
+
+// Available rechecks a selected key after a cancellable backoff. Another
+// request may have quarantined it while this attempt was waiting.
+func (p *Pool) Available(env string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := p.byEnv(env)
+	return k != nil && k.healthy(p.now())
 }
 
 // ClassFor maps an upstream status to a failure class. Returns "" for
@@ -200,11 +207,13 @@ func (p *Pool) Mark(env string, class Class) Class {
 	return class
 }
 
-// MarkSuccess resets the key's failure state.
+// MarkSuccess resets a recovered key's failure state. A response arriving while
+// the key is quarantined belongs to an older in-flight attempt: selection no
+// longer admits this key, so that old success must not erase the quarantine.
 func (p *Pool) MarkSuccess(env string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if k := p.byEnv(env); k != nil {
+	if k := p.byEnv(env); k != nil && k.healthy(p.now()) {
 		k.failures = 0
 		k.downUntil = time.Time{}
 		k.lastClass = ""

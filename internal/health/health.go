@@ -33,10 +33,12 @@ type StepStatus struct {
 type stepKey struct{ provider, model string }
 
 type state struct {
-	failures  int
-	downUntil time.Time
-	lastAt    time.Time
-	lastErr   string
+	failures   int
+	downUntil  time.Time
+	lastAt     time.Time
+	lastErr    string
+	generation uint64
+	probing    bool
 }
 
 // Tracker is safe for concurrent use.
@@ -47,7 +49,13 @@ type Tracker struct {
 }
 
 func New() *Tracker {
-	return &Tracker{states: make(map[stepKey]*state), now: time.Now}
+	return NewWithClock(time.Now)
+}
+
+// NewWithClock builds a tracker with an injectable clock for deterministic
+// cooldown evaluation. The clock must be safe for concurrent use.
+func NewWithClock(now func() time.Time) *Tracker {
+	return &Tracker{states: make(map[stepKey]*state), now: now}
 }
 
 // Mark records a failure for a step. Cool-off grows exponentially with
@@ -64,6 +72,10 @@ func (t *Tracker) Mark(provider, model string, status int, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st := t.state(provider, model)
+	t.mark(st, status, err)
+}
+
+func (t *Tracker) mark(st *state, status int, err error) {
 	st.failures++
 	st.lastAt = t.now()
 	if err != nil {
@@ -96,6 +108,12 @@ func (t *Tracker) MarkSuccess(provider, model string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st := t.state(provider, model)
+	st.generation++
+	st.probing = false
+	reset(st)
+}
+
+func reset(st *state) {
 	st.failures = 0
 	st.downUntil = time.Time{}
 	st.lastErr = ""
@@ -105,8 +123,75 @@ func (t *Tracker) MarkSuccess(provider, model string) {
 func (t *Tracker) IsDown(provider, model string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	st := t.states[stepKey{provider, model}]
+	return st != nil && st.failures >= FailureThreshold && (st.probing || t.now().Before(st.downUntil))
+}
+
+// Permit owns an execution admission. Release abandons it without recording a
+// failure (for example on cancellation or when no key is available).
+type Permit struct {
+	tracker    *Tracker
+	key        stepKey
+	generation uint64
+	probe      bool
+	done       bool // guarded by tracker.mu
+}
+
+// TryAcquire admits healthy traffic freely, but only one probe after cool-off.
+// Callers must release every permit even if no upstream request is made.
+func (t *Tracker) TryAcquire(provider, model string) (*Permit, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	st := t.state(provider, model)
-	return st.failures >= FailureThreshold && t.now().Before(st.downUntil)
+	probe := st.failures >= FailureThreshold
+	if probe {
+		if st.probing || t.now().Before(st.downUntil) {
+			return nil, false
+		}
+		st.generation++
+		st.probing = true
+	}
+	return &Permit{tracker: t, key: stepKey{provider, model}, generation: st.generation, probe: probe}, true
+}
+
+func (p *Permit) Release()                      { p.finish(false, false, 0, nil) }
+func (p *Permit) Success()                      { p.finish(true, true, 0, nil) }
+func (p *Permit) Failure(status int, err error) { p.finish(true, false, status, err) }
+
+func (p *Permit) finish(record, success bool, status int, err error) {
+	if p == nil {
+		return
+	}
+	t := p.tracker
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p.done {
+		return
+	}
+	p.done = true
+	st := t.states[p.key]
+	if st.generation != p.generation {
+		return
+	}
+	if p.probe {
+		st.probing = false
+	}
+	if !record {
+		return
+	}
+	if success {
+		// An older healthy request cannot erase a cooldown established while
+		// it was in flight. Only its admitted recovery probe can reset it.
+		if !p.probe && st.failures >= FailureThreshold {
+			return
+		}
+		reset(st)
+		if p.probe {
+			st.generation++
+		}
+	} else {
+		t.mark(st, status, err)
+	}
 }
 
 // Snapshot returns the health of every observed step, for the admin surface.
@@ -116,9 +201,11 @@ func (t *Tracker) Snapshot() []StepStatus {
 	out := make([]StepStatus, 0, len(t.states))
 	for k, st := range t.states {
 		ss := StepStatus{Provider: k.provider, Model: k.model, Failures: st.failures}
-		if st.failures >= FailureThreshold && t.now().Before(st.downUntil) {
+		if st.failures >= FailureThreshold && (st.probing || t.now().Before(st.downUntil)) {
 			ss.Down = true
-			ss.DownFor = st.downUntil.Sub(t.now())
+			if t.now().Before(st.downUntil) {
+				ss.DownFor = st.downUntil.Sub(t.now())
+			}
 		}
 		out = append(out, ss)
 	}

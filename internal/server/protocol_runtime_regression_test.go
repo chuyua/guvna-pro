@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/creamy-ghost/guvna/internal/config"
-	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/responses"
 	"github.com/creamy-ghost/guvna/internal/router"
 )
@@ -55,11 +54,11 @@ func TestRuntimeResponsesTermination(t *testing.T) {
 		failed                  bool
 	}{
 		{"stop_eof", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n", "completed", false},
-		{"done_no_finish", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n", "completed", false},
+		{"done_no_finish", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n", "failed", true},
 		{"length", "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\n", "incomplete", false},
 		{"filter", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n", "incomplete", false},
 		{"multiline_usage", ": upstream comment\n\ndata: {\"choices\": [\n" + "data: {\"delta\": {\"content\": \"joined\"}, \"finish_reason\": \"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n", "completed", false},
-		{"tools", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", "completed", false},
+		{"tools", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", "completed", false},
 		{"bad_json", "data: {bad}\n\n", "failed", true},
 		{"error_object", "data: {\"error\":{\"message\":\"denied\"}}\n\n", "failed", true},
 		{"unfinished", "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", "failed", true},
@@ -68,12 +67,12 @@ func TestRuntimeResponsesTermination(t *testing.T) {
 		{"null", "data: null\n\n", "failed", true},
 		{"unknown_finish", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"mystery\"}]}\n\n", "failed", true},
 		{"error_after_finish", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"error\":\"failed\"}\n\n", "failed", true},
-		{"ignore_after_done", "data: [DONE]\n\ndata: {bad}\n\n", "completed", false},
+		{"ignore_after_done", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\ndata: {bad}\n\n", "completed", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := runtimeServer(t, "http://unused")
 			s.hlth.Mark("a", "m", 500, nil)
-			s.pools["a"].Mark("A", keypool.ClassTransient)
+			seedRecoveredKey(t, s)
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest("POST", "/v1/responses", nil)
 			s.relayResponsesStream(w, r, router.Step{Provider: "a", Model: "m"}, "main", &responses.Request{Model: "main", Stream: true}, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.payload))}, "A")
@@ -117,12 +116,16 @@ func TestRuntimeBodiesFailureAndRecovery(t *testing.T) {
 					io.WriteString(w, `{"choices":`)
 					return
 				}
+				if route == "/v1/embeddings" {
+					io.WriteString(w, `{"data":[{"embedding":[0.5,1]}]}`)
+					return
+				}
 				io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`)
 			}))
 			defer up.Close()
 			s := runtimeServer(t, up.URL)
 			s.hlth.Mark("a", "m", 500, nil)
-			s.pools["a"].Mark("A", keypool.ClassTransient)
+			advanceKey := seedRecoveredKey(t, s)
 			call := func() *httptest.ResponseRecorder {
 				r := httptest.NewRequest("POST", route, strings.NewReader(`{"model":"main","input":"hi","messages":[{"role":"user","content":"hi"}],"input_context":1}`))
 				r.Header.Set("Authorization", "Bearer client-1")
@@ -138,6 +141,7 @@ func TestRuntimeBodiesFailureAndRecovery(t *testing.T) {
 			}
 			runtimeTelemetry(t, s, 1, 502, true)
 			broken.Store(false)
+			advanceKey()
 			if w := call(); w.Code != 200 {
 				t.Fatalf("recovery status=%d body=%s", w.Code, w.Body)
 			}
@@ -191,7 +195,7 @@ func TestRuntimeStreamCancellationAndWriteFailure(t *testing.T) {
 			t.Run(surface+"_"+failure, func(t *testing.T) {
 				s := runtimeServer(t, "http://unused")
 				s.hlth.Mark("a", "m", 500, nil)
-				s.pools["a"].Mark("A", keypool.ClassTransient)
+				seedRecoveredKey(t, s)
 				pr, pw := io.Pipe()
 				defer pw.Close()
 				body := &runtimeBody{PipeReader: pr, readStarted: make(chan struct{}), closed: make(chan struct{}), readExited: make(chan struct{})}
