@@ -24,8 +24,8 @@ The effective positive `dimensions` and explicit `encoding_format` (`float` or `
 
 | Environment variable | Default | Scope |
 |---|---|---|
-| `GUVNA_MAX_REQUEST_BYTES` | `33554432` (32 MiB) | Incoming Chat, Responses, Auto and Embeddings request body |
-| `GUVNA_REQUEST_READ_TIMEOUT` | `30s` | Incoming model-request body read only |
+| `GUVNA_MAX_REQUEST_BYTES` | `33554432` (32 MiB) | Incoming Chat, Responses, Auto, Embeddings and `POST /v1/chains` request body |
+| `GUVNA_REQUEST_READ_TIMEOUT` | `30s` | Incoming model and chain-creation request body read only |
 | `GUVNA_STEP_BUDGET` | `180s` | One ordinary non-streaming step, including retries, headers and body |
 | `GUVNA_REQUEST_BUDGET` | `300s` | Ordinary non-streaming candidate walk |
 | `GUVNA_STREAM_IDLE_TIMEOUT` | `120s` | No complete upstream line during a streaming relay; also caps a streaming error-body read |
@@ -43,11 +43,11 @@ Caller cancellation stops backoff and further candidates without adding a health
 
 ## Incoming request bodies
 
-Chat, Responses, Auto and Embeddings share one bounded body reader. A declared `Content-Length` above the limit is rejected before reading; streamed or chunked bodies are checked against the bytes actually read. An exactly-at-limit body is allowed. An oversized body returns `413 request_too_large`; a gateway body-read timeout returns `408 request_timeout`. Both failures occur before upstream selection and do not add model-health or key failures. Caller cancellation remains neutral.
+Chat, Responses, Auto, Embeddings and `POST /v1/chains` share one bounded body reader. A declared `Content-Length` above the limit is rejected before reading; streamed or chunked bodies are checked against the bytes actually read. An exactly-at-limit body is allowed. An oversized body returns `413 request_too_large`; a gateway body-read timeout returns `408 request_timeout`. These failures occur before upstream selection or runtime-chain changes and do not add model-health or key failures. Caller cancellation remains neutral. Chain creation requires one complete JSON value; trailing JSON or garbage is rejected before changing a route.
 
 The read timeout covers only incoming body consumption. A successful read stops and joins its cancellation callback, then clears the native read deadline before generation begins. It does not cap upstream generation or an active response stream. Chat requests using `model:auto` pass the already-read body to Auto instead of reading it again. Failed HTTP/1 reads close the connection and keep an expired read deadline so the server cannot block while draining the unread body; HTTP/2 read deadlines apply to that request's stream.
 
-Standard HTTP/1 and HTTP/2 writers use `http.ResponseController.SetReadDeadline`. A wrapping writer should expose `Unwrap` so the controller can reach its transport. For custom writers without read-deadline support, cancellation closes the body and relies on the `http.Request.Body` contract that `Close` unblocks `Read`. These new limits do not cover request headers or management-route payloads.
+Standard HTTP/1 and HTTP/2 writers use `http.ResponseController.SetReadDeadline`. A wrapping writer should expose `Unwrap` so the controller can reach its transport. For custom writers without read-deadline support, cancellation closes the body and relies on the `http.Request.Body` contract that `Close` unblocks `Read`. These limits do not cover request headers or Dashboard form payloads.
 
 ## Auto context selection
 
@@ -81,6 +81,8 @@ Half-open admission is per provider/model, not a provider-wide circuit breaker o
 
 Each `Store` serializes the complete snapshot-to-replacement operation. Saves use unique temporary files in the target directory and stable chain ordering; failed replacements clean up the temporary file and leave the original target intact. Router input and returned snapshots copy JSON/YAML parameter containers so external mutation does not race with persistence.
 
+HTTP runtime-chain creation and deletion persist the proposed snapshot before publishing the router change. A failed save returns HTTP 500 without changing either the live chain map or model-alias resolution; the previous file remains intact, and the same operation can be retried. Validation, duplicate-name conflicts and config-chain protection retain their existing 400/409/404 responses. Concurrent mutations through the shared `Store` are serialized so successful changes cannot overwrite each other.
+
 These guarantees apply to one shared `Store` instance. Multiple processes or independently constructed stores writing the same path are not coordinated. No delete-before-rename workaround is used. This is not an fsync-based crash or power-loss durability guarantee; on Windows a target held without delete sharing can still reject replacement, in which case the API reports failure and preserves the original file.
 
 ## Verification
@@ -98,8 +100,8 @@ The regression tests use local simulated upstreams and dummy keys. They cover ma
 
 Embedding contract tests cover recognized input forms, missing/extra vectors, batch indices, inconsistent/requested dimensions, numeric/base64 encoding and finite values. Local upstream tests verify fallback before output, exhausted-chain 502 responses, per-step defaults, explicit client precedence, health/key attribution and neutral caller cancellation.
 
-Incoming-reader tests cover declared and actual size limits, exact-limit bodies, disabled read timeouts, caller cancellation/deadlines, wrapped writers, real HTTP/1 and HTTP/2 slow uploads, long responses and connection reuse after successful reads. Route-level fault injection checks zero upstream calls and neutral health/key state across ten route forms, real network 408 responses on all four model endpoints, and single-read Auto alias handling that charges upload time to the total budget.
+Incoming-reader tests cover declared and actual size limits, exact-limit bodies, disabled read timeouts, caller cancellation/deadlines, wrapped writers, real HTTP/1 and HTTP/2 slow uploads, long responses and connection reuse after successful reads. Route-level fault injection checks zero upstream calls and neutral health/key state across ten route forms, real network 408 responses on all four model endpoints and chain creation, and single-read Auto alias handling that charges upload time to the total budget. Chain-route tests cover rejected input without mutations, exact-limit JSON, trailing data, persistence failures and successful retries.
 
 Recovery tests cover 64 concurrent admissions across ten route forms, probe release and old results, all-key quarantine, decider key results, key quarantine during backoff, 64 concurrent saves, snapshot isolation, and failed replacement cleanup. A Windows-only test verifies preservation of a locked target file.
 
-Provider-wide isolation, exact model tokenization, request-header limits, management-route payload limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and deployment architecture are retained.
+Provider-wide isolation, exact model tokenization, request-header limits, Dashboard form payload limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and deployment architecture are retained.

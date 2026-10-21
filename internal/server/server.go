@@ -320,8 +320,13 @@ type chainCreateRequest struct {
 // handleChainCreate adds a runtime chain and persists it. Any valid key
 // (admin or client) may create chains — apps self-provision their routes.
 func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
+	body, err := readRequestBody(w, r)
+	if err != nil {
+		writeRequestBodyError(w, r, err)
+		return
+	}
 	var req chainCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
 	}
@@ -329,20 +334,23 @@ func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 	for _, st := range req.Steps {
 		steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model, Params: st.Params})
 	}
-	if err := s.rtr.AddChain(req.Name, steps); err != nil {
+	if s.store != nil {
+		err = s.store.AddChain(s.rtr, req.Name, steps)
+	} else {
+		err = s.rtr.AddChain(req.Name, steps)
+	}
+	if err != nil {
+		if errors.Is(err, chains.ErrPersistence) {
+			log.Printf("chains: persist failed: %v", err)
+			http.Error(w, `{"error":{"message":"chain could not be persisted"}}`, http.StatusInternalServerError)
+			return
+		}
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already exists") {
 			status = http.StatusConflict
 		}
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), status)
 		return
-	}
-	if s.store != nil {
-		if err := s.store.Save(s.rtr); err != nil {
-			log.Printf("chains: persist failed: %v", err)
-			http.Error(w, `{"error":{"message":"chain added but not persisted"}}`, http.StatusInternalServerError)
-			return
-		}
 	}
 	log.Printf("chains: created %q (%d steps)", req.Name, len(steps))
 	w.Header().Set("Content-Type", "application/json")
@@ -354,20 +362,24 @@ func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 // refused — they live in config.yaml.
 func (s *Server) handleChainDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := s.rtr.RemoveChain(name); err != nil {
+	var err error
+	if s.store != nil {
+		err = s.store.RemoveChain(s.rtr, name)
+	} else {
+		err = s.rtr.RemoveChain(name)
+	}
+	if err != nil {
+		if errors.Is(err, chains.ErrPersistence) {
+			log.Printf("chains: persist failed: %v", err)
+			http.Error(w, `{"error":{"message":"chain could not be persisted"}}`, http.StatusInternalServerError)
+			return
+		}
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
 		}
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), status)
 		return
-	}
-	if s.store != nil {
-		if err := s.store.Save(s.rtr); err != nil {
-			log.Printf("chains: persist failed: %v", err)
-			http.Error(w, `{"error":{"message":"chain removed but not persisted"}}`, http.StatusInternalServerError)
-			return
-		}
 	}
 	log.Printf("chains: deleted %q", name)
 	w.WriteHeader(http.StatusNoContent)

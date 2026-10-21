@@ -75,7 +75,7 @@ func TestRequestBodyFailuresStayNeutralAcrossRoutes(t *testing.T) {
 
 func TestRequestBodyNetworkTimeoutAcrossRoutes(t *testing.T) {
 	requestBodyTestLimits(t, 1024, 30*time.Millisecond)
-	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/auto", "/v1/embeddings"} {
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/auto", "/v1/embeddings", "/v1/chains"} {
 		t.Run(path, func(t *testing.T) {
 			var calls atomic.Int32
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
@@ -101,6 +101,9 @@ func TestRequestBodyNetworkTimeoutAcrossRoutes(t *testing.T) {
 			}
 			if calls.Load() != 0 || len(s.hlth.Snapshot()) != 0 || s.pools["a"].Keys()[0].Failures != 0 {
 				t.Fatalf("network timeout penalized upstream: calls=%d health=%+v", calls.Load(), s.hlth.Snapshot())
+			}
+			if len(s.rtr.RuntimeChains()) != 0 {
+				t.Fatal("network timeout created a runtime chain")
 			}
 		})
 	}
