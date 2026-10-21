@@ -51,6 +51,39 @@ kills the previous poller (the trigger lives inside the loaded partial).
 - Chain deletes are limited to `source: runtime` chains in the UI;
   config-defined chains show as locked (they live in `config.yaml`).
 
+## Form request limits
+
+Login (`POST /login`) and chain creation (`POST /chains`) use the shared
+bounded request-body reader before parsing form fields. Chain creation
+checks the session first: unauthenticated uploads are not consumed and
+retain the normal login redirect or HTMX `401` with `HX-Redirect`.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `GUVNA_DASHBOARD_MAX_FORM_BYTES` | `1048576` (1 MiB) | Maximum incoming form-body bytes |
+| `GUVNA_DASHBOARD_FORM_READ_TIMEOUT` | `30s` | Time allowed to read the incoming form body |
+
+The byte limit must be a positive integer; empty, invalid, zero or negative
+values use the default. The timeout accepts Go durations and `0` disables
+it; invalid or negative values use the default. Each Dashboard captures
+these settings when constructed. They are independent of the gateway's
+`GUVNA_MAX_REQUEST_BYTES` and `GUVNA_REQUEST_READ_TIMEOUT` settings.
+
+Declared and actual body bytes are checked, with exactly-at-limit bodies
+allowed. Oversized input returns HTTP 413, a read timeout returns 408, and
+read or form-parsing failures return 400. Responses contain safe HTML error
+messages without submitted fields or underlying read details, marked with
+`X-Guvna-Form-Error: true`; only marked HTMX chain-form errors are displayed
+as HTML partials. Rejected forms make no gateway request and
+never issue a login cookie. Caller cancellation does not write an error.
+
+The read deadline ends before parsing and gateway processing, so the
+existing gateway-client timeout remains independent. Failed HTTP/1 reads
+and rejected unauthenticated uploads close their connections rather than
+waiting to drain an unfinished body. HTTP/2 read deadlines affect only the
+current stream. Header limits remain the Dashboard server's separate
+`ReadHeaderTimeout` setting.
+
 ## Exposure
 
 Never expose the dashboard without its login page: it binds localhost and

@@ -31,11 +31,13 @@ const maxBody = 1 << 20
 
 // Dashboard proxies a Guvna gateway and renders the UI.
 type Dashboard struct {
-	gateway  string
-	adminKey string
-	client   *http.Client
-	tmpl     *template.Template
-	auth     *sessionAuth
+	gateway         string
+	adminKey        string
+	client          *http.Client
+	tmpl            *template.Template
+	auth            *sessionAuth
+	formMaxBytes    int64
+	formReadTimeout time.Duration
 
 	mu         sync.Mutex
 	statusBody []byte
@@ -58,11 +60,13 @@ func New(gateway, adminKey, dashUser, dashPass string) (*Dashboard, error) {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
 	return &Dashboard{
-		gateway:  strings.TrimRight(gateway, "/"),
-		adminKey: adminKey,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		tmpl:     tmpl,
-		auth:     newSessionAuth(dashUser, dashPass),
+		gateway:         strings.TrimRight(gateway, "/"),
+		adminKey:        adminKey,
+		client:          &http.Client{Timeout: 10 * time.Second},
+		tmpl:            tmpl,
+		auth:            newSessionAuth(dashUser, dashPass),
+		formMaxBytes:    dashboardFormMaxBytes(),
+		formReadTimeout: dashboardFormReadTimeout(),
 	}, nil
 }
 
@@ -112,9 +116,8 @@ func (d *Dashboard) handleLoginView(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		d.tmpl.ExecuteTemplate(w, "login", loginView{Error: "bad form submission"})
+	if err := d.readForm(w, r); err != nil {
+		d.writeFormError(w, r, "login", err)
 		return
 	}
 	user := r.FormValue("user")
@@ -352,8 +355,8 @@ func (d *Dashboard) handleChainsView(w http.ResponseWriter, _ *http.Request) {
 // re-rendered either way: inputs preserved on error, cleared on success.
 func (d *Dashboard) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := r.ParseForm(); err != nil {
-		d.tmpl.ExecuteTemplate(w, "chains", d.chainsPage("bad form submission", "", ""))
+	if err := d.readForm(w, r); err != nil {
+		d.writeFormError(w, r, "chains", err)
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))

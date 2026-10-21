@@ -41,6 +41,15 @@ document.querySelectorAll('.tab').forEach(function (b) {
     b.setAttribute('aria-current', 'page');
   });
 });
+document.body.addEventListener('htmx:beforeSwap', function (event) {
+  var detail = event.detail;
+  if (detail.pathInfo.requestPath === '/chains' &&
+      [400, 408, 413].indexOf(detail.xhr.status) !== -1 &&
+      detail.xhr.getResponseHeader('X-Guvna-Form-Error') === 'true') {
+    detail.shouldSwap = true;
+    detail.isError = false;
+  }
+});
 </script>
 </body>
 </html>{{end}}

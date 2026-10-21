@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/creamy-ghost/guvna/internal/requestbody"
 )
 
 // Session auth for the dashboard: a styled login page issuing a signed
@@ -136,6 +138,14 @@ func (s *sessionAuth) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if s.authed(r) {
 			next(w, r)
 			return
+		}
+		if r.Body != nil && r.Body != http.NoBody {
+			// Do not consume unauthenticated uploads or let HTTP/1's post-handler
+			// drain wait on a client that has not sent the rest of its body.
+			requestbody.Abort(w, r)
+			if r.ProtoMajor < 2 {
+				w.Header().Set("Connection", "close")
+			}
 		}
 		if r.Header.Get("HX-Request") == "true" {
 			w.Header().Set("HX-Redirect", "/login")
