@@ -83,7 +83,7 @@ func TestActiveStreamDurationBoundsProgressAcrossRoutes(t *testing.T) {
 			if route != "/v1/responses" && !strings.Contains(body, `"code":"upstream_stream_timeout"`) {
 				t.Fatalf("missing Chat timeout code: %s", body)
 			}
-			if primaryHits.Load() != 1 || backupHits.Load() != 0 || s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
+			if primaryHits.Load() != 1 || backupHits.Load() != 0 || s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 0 {
 				t.Fatalf("timeout retried or was not charged once: hits=%d/%d health=%v keys=%v", primaryHits.Load(), backupHits.Load(), s.hlth.Snapshot(), s.pools["a"].Keys())
 			}
 			select {
@@ -139,7 +139,7 @@ func TestDisabledStreamDurationStillUsesIdleDeadline(t *testing.T) {
 			w := httptest.NewRecorder()
 			start := time.Now()
 			s.Handler().ServeHTTP(w, durationRequest(route, context.Background()))
-			if time.Since(start) > time.Second || strings.Contains(w.Body.String(), "maximum duration") || s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
+			if time.Since(start) > time.Second || strings.Contains(w.Body.String(), "maximum duration") || s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 0 {
 				t.Fatalf("disabled duration changed idle timeout: %s", w.Body)
 			}
 			runtimeTelemetry(t, s, 1, http.StatusBadGateway, true)

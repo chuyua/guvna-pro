@@ -122,7 +122,7 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 	lease := pool.Acquire(nil)
 	defer func() { lease.Release() }()
 	wait := false
-	// Connection failures leave credentials healthy; retry that credential with
+	// Service/network failures leave credentials healthy; retry that credential with
 	// a fresh epoch-bound lease before considering another unused credential.
 	reacquire := func(key string) *keypool.Lease {
 		excluded := make(map[string]bool)
@@ -219,7 +219,7 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 			lastErr, lastKey = err, key
 			chain, req := traceRequest(r)
 			s.recordAttempt(r, step, chain, req, 0, err, key, 0, 0)
-			lease.Failure(keypool.ClassFor(0, err))
+			completeKeyAttempt(lease, 0, err)
 			if transient >= retries || ctx.Err() != nil {
 				return finish()
 			}
@@ -259,7 +259,7 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 		chain, req := traceRequest(r)
 		s.recordAttempt(r, step, chain, req, resp.StatusCode, statusErr, key, 0, 0)
 		class := outcome.Classify(resp.StatusCode, nil)
-		lease.Failure(keypool.ClassFor(resp.StatusCode, nil))
+		completeKeyAttempt(lease, resp.StatusCode, statusErr)
 		switch class {
 		case outcome.Auth, outcome.RateLimit:
 			lease = pool.Acquire(used) // each credential once, independent of transient budget
@@ -269,7 +269,7 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 				return finish()
 			}
 			transient++
-			lease = pool.Acquire(used) // failed key is quarantined under the retained policy
+			lease = reacquire(key)
 			wait = true
 		default:
 			return finish()

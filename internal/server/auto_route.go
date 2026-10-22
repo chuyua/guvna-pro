@@ -36,7 +36,6 @@ import (
 
 	"github.com/creamy-ghost/guvna/internal/adaptors"
 	"github.com/creamy-ghost/guvna/internal/health"
-	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
 	"github.com/creamy-ghost/guvna/internal/vision"
@@ -343,8 +342,8 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 						return
 					}
 					log.Printf("auto: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.mark(r, step.Provider, step.Model, 0, aerr)
-					s.poolRecordResult(r, keyEnv, step, c.Chain, chat, 502, 0, 0, keypool.ClassTransient, aerr)
+					s.mark(r, step.Provider, step.Model, http.StatusBadGateway, aerr)
+					s.poolRecordResult(r, keyEnv, step, c.Chain, chat, 502, 0, 0, aerr)
 					failure := unusableBody(aerr)
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
@@ -528,18 +527,12 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 	}
 	// The advisory decider shares provider credentials, but does not change
 	// model health. Record exactly one key result for a real upstream attempt.
-	finishKey := func(class keypool.Class, success bool, raw []byte) {
+	finishKey := func(status int, err error, raw []byte) {
 		if callerGone() {
 			lease.Release()
 			return
 		}
-		if class != "" {
-			lease.Failure(class)
-		} else if success {
-			lease.Success()
-		} else {
-			lease.Release()
-		}
+		completeKeyAttempt(lease, status, err)
 		in, out := telemetry.ParseUsage(raw)
 		pool.Record(keyEnv, in, out)
 	}
@@ -549,33 +542,33 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 	resp, err := a.Chat(ctx, payload)
 	if err != nil {
 		log.Printf("auto: decider call: %v", err)
-		finishKey(keypool.ClassFor(0, err), false, nil)
+		finishKey(0, err, nil)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := readLimited(resp.Body, maxResponseBytes)
 	if err != nil {
 		log.Printf("auto: decider read: %v", err)
-		class := keypool.ClassFor(resp.StatusCode, nil)
-		if class == "" {
-			class = keypool.ClassTransient
+		status := resp.StatusCode
+		if status >= 200 && status < 300 {
+			status = http.StatusBadGateway
 		}
-		finishKey(class, false, raw)
+		finishKey(status, err, raw)
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("auto: decider status %d: %s", resp.StatusCode, truncate(raw, 200))
-		finishKey(keypool.ClassFor(resp.StatusCode, nil), false, raw)
+		finishKey(resp.StatusCode, nil, raw)
 		return nil, fmt.Errorf("decider status %d: %s", resp.StatusCode, truncate(raw, 200))
 	}
 	if err := validateChatCompletion(raw); err != nil {
-		finishKey(keypool.ClassTransient, false, raw)
+		finishKey(http.StatusBadGateway, err, raw)
 		return nil, err
 	}
 	ranked, err := selector.ParseRanking(raw)
 	if err != nil {
 		log.Printf("auto: decider parse: %v (body: %s)", err, truncate(raw, 300))
-		finishKey(keypool.ClassTransient, false, raw)
+		finishKey(http.StatusBadGateway, err, raw)
 		return nil, err
 	}
 	valid := make(map[string]int)
@@ -587,10 +580,10 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 	}
 	if len(valid) == 0 {
 		err := fmt.Errorf("decider ranked no eligible models")
-		finishKey(keypool.ClassTransient, false, raw)
+		finishKey(http.StatusBadGateway, err, raw)
 		return nil, err
 	}
-	finishKey("", true, raw)
+	finishKey(resp.StatusCode, nil, raw)
 	return valid, nil
 }
 

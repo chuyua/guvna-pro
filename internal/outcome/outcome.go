@@ -30,8 +30,8 @@ const (
 	// rate-limit quarantine.
 	RateLimit Outcome = "rate_limit"
 	// UpstreamTransient is a 5xx (or an unusable 2xx body / gateway timeout).
-	// The model counts one failure; the key keeps the documented transient
-	// quarantine.
+	// The model counts one failure; the key is neutral because a service
+	// failure is not evidence that the credential is unhealthy.
 	UpstreamTransient Outcome = "upstream_transient"
 	// LocalNetwork is a DNS, dial or connection-level failure before any HTTP
 	// response. The model counts one failure; the key is neutral.
@@ -103,8 +103,6 @@ func KeyClass(o Outcome) string {
 		return "auth"
 	case RateLimit:
 		return "rate_limit"
-	case UpstreamTransient:
-		return "transient"
 	}
 	return ""
 }

@@ -39,12 +39,15 @@ func runtimeTelemetry(t *testing.T, s *Server, wantCount, wantStatus int, wantEr
 		return
 	}
 	var status int
-	var msg string
-	if err := s.tm.DB().QueryRow("SELECT status, err FROM requests ORDER BY id DESC LIMIT 1").Scan(&status, &msg); err != nil {
+	var msg, class string
+	if err := s.tm.DB().QueryRow("SELECT status, err, failure_class FROM requests ORDER BY id DESC LIMIT 1").Scan(&status, &msg, &class); err != nil {
 		t.Fatal(err)
 	}
 	if status != wantStatus || (msg != "") != wantErr {
 		t.Fatalf("telemetry status=%d err=%q", status, msg)
+	}
+	if status >= 500 && class != "upstream_transient" {
+		t.Fatalf("service failure classified as %q", class)
 	}
 }
 
@@ -87,11 +90,11 @@ func TestRuntimeResponsesTermination(t *testing.T) {
 			if tc.terminal != "completed" && strings.Contains(body, "event: response.completed") {
 				t.Fatalf("incorrect completed event: %s", body)
 			}
-			wantFailures, wantStatus := 0, 200
+			wantFailures, wantKeyFailures, wantStatus := 0, 0, 200
 			if tc.failed {
-				wantFailures, wantStatus = 2, 502
+				wantFailures, wantKeyFailures, wantStatus = 2, 1, 502
 			}
-			if s.hlth.Snapshot()[0].Failures != wantFailures || s.pools["a"].Keys()[0].Failures != wantFailures {
+			if s.hlth.Snapshot()[0].Failures != wantFailures || s.pools["a"].Keys()[0].Failures != wantKeyFailures {
 				t.Fatalf("health/key=%v/%v", s.hlth.Snapshot(), s.pools["a"].Keys())
 			}
 			runtimeTelemetry(t, s, 1, wantStatus, tc.failed)
@@ -140,7 +143,7 @@ func TestRuntimeBodiesFailureAndRecovery(t *testing.T) {
 			if w := call(); w.Code != 502 || strings.Contains(w.Body.String(), `{"choices":`) {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body)
 			}
-			if s.hlth.Snapshot()[0].Failures != 2 || s.pools["a"].Keys()[0].Failures != 2 {
+			if s.hlth.Snapshot()[0].Failures != 2 || s.pools["a"].Keys()[0].Failures != 1 {
 				t.Fatalf("failure accounting=%v/%v", s.hlth.Snapshot(), s.pools["a"].Keys())
 			}
 			runtimeTelemetry(t, s, 1, 502, true)

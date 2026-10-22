@@ -158,6 +158,8 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 
 **Superseded in part (2026-10-21):** The expectation of a later UI was cancelled. Key status remains available through the authenticated API; future management work should extend the CLI.
 
+**Superseded in part (2026-10-22):** Service/network failures no longer quarantine keys, and credential failover has a separate bound from transient retries. See the service-failure attribution decision below.
+
 ## 2026-08-17 — Verified: key failover + quarantine live
 
 **Decision:** Live-verified on the VPS: with `BAZAARLINK_2_KEY` deliberately invalid, round-robin picked it second, 403 → quarantined (`auth`, failures=1), same request served by `BAZAARLINK_1`; `/admin/status` showed the quarantined key with reason; telemetry rows carry the serving key env. Local verification additionally covered: dead groq pool (all 3 keys 403 → all quarantined → last upstream 403 propagated), telemetry key attribution, and `/admin/status` per-key counters.
@@ -216,3 +218,22 @@ discovery. Management still runs as a separate process talking to the existing
 authenticated API; no listener, web service or dependency is added. This is a
 distribution decision, not a claim that the gateway will use significantly less
 memory. Standalone Windows/Arch artifacts and benchmark gates are out of scope.
+
+## 2026-10-22 — Service failures leave credentials neutral
+
+**Decision:** Only 401/403 and 429 automatically quarantine API keys. 5xx,
+gateway timeouts, network failures and unusable response bodies still count
+against the serving model's health, but release key leases without penalizing
+or resetting them. The decider follows the same key policy. A validated
+completed success remains the only recovery signal that clears key failures.
+
+**Context:** Issue #19 requires consistent attribution across Chat, Responses,
+Auto and Embeddings. A shared service outage does not establish credential
+failure, and rotating healthy keys cannot resolve that outage.
+
+**Rationale:** Transient setup retries prefer the same healthy credential with
+fresh leases, existing backoff/Retry-After handling, and both per-step and
+request-wide retry limits. If concurrent traffic quarantines that credential,
+another unused healthy key may be selected. Retry defaults are unchanged;
+`GUVNA_RETRIES=0` disables service/network retries. `ClassTransient` and its
+configuration remain available for legacy/manual key isolation.

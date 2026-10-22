@@ -17,14 +17,17 @@ if !lease.Available() { // recheck after a cancellable backoff
 // Complete once after the real attempt, including any successful response body:
 lease.Failure(keypool.ClassRateLimit) // returns the class only when applied
 // OR lease.Success()
-// OR lease.Release() // cancellation, caller error or abandoned selection
+// OR lease.Release() // service/network failure, cancellation, caller error or abandoned selection
 ```
 
 All lease methods accept nil. `Failure("")` also completes the lease neutrally.
 `Failure`, `Success` and `Release` are terminal and idempotent. A second retry
 needs a new lease, even when it reuses the same credential. Request and token
 accounting stays separate in `Pool.Record`; every attempted request can count
-usage even when its late result no longer changes isolation.
+usage even when its late result no longer changes isolation. Automatic outcome
+classification quarantines only auth and rate-limit failures. Service/network
+failures, including gateway timeouts and unusable response bodies, release
+neutrally; they must not use `Success`, which would erase prior key evidence.
 
 ## Failure generations
 
@@ -37,8 +40,10 @@ an earlier failure cannot poison a recovered key.
 
 Consecutive failures from genuine later attempts retain the configured
 exponential durations and existing 24-hour maximum. The defaults remain
-auth 24 hours, rate limit 1 minute and transient 1 minute; this fix adds no
-new timeout policy, limiter or Retry-After parser.
+auth 24 hours and rate limit 1 minute. `ClassTransient` and its 1-minute default
+remain available for legacy/manual isolation, but automatic classification no
+longer maps service/network failures to it. See [retry budgets and backoff](RELIABILITY.md#retry-budgets-and-backoff)
+for the independent serving retry policy.
 
 ## Authentication upgrade
 

@@ -56,11 +56,11 @@ func TestChatStreamChoiceCompleteness(t *testing.T) {
 			if w.Code != http.StatusOK || strings.Contains(body, `"error"`) != tc.failed || tc.failed && strings.Contains(body, "data: [DONE]") {
 				t.Fatalf("incorrect stream terminal: status=%d body=%s", w.Code, body)
 			}
-			wantFailures, wantStatus := 0, http.StatusOK
+			wantFailures, wantKeyFailures, wantStatus := 0, 0, http.StatusOK
 			if tc.failed {
-				wantFailures, wantStatus = 2, http.StatusBadGateway
+				wantFailures, wantKeyFailures, wantStatus = 2, 1, http.StatusBadGateway
 			}
-			if s.hlth.Snapshot()[0].Failures != wantFailures || s.pools["a"].Keys()[0].Failures != wantFailures {
+			if s.hlth.Snapshot()[0].Failures != wantFailures || s.pools["a"].Keys()[0].Failures != wantKeyFailures {
 				t.Fatalf("wrong health/key attribution: health=%v keys=%v", s.hlth.Snapshot(), s.pools["a"].Keys())
 			}
 			runtimeTelemetry(t, s, 1, wantStatus, tc.failed)

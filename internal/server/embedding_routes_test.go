@@ -75,8 +75,8 @@ func TestEmbeddingRoutesRejectUnusableResults(t *testing.T) {
 				if !fallback && (strings.Contains(w.Body.String(), "embedding") || !strings.Contains(w.Body.String(), "unusable response")) {
 					t.Fatalf("exhaustion did not return a safe error: %s", w.Body)
 				}
-				embeddingRouteFailures(t, s, "a", 1)
-				embeddingRouteFailures(t, s, "b", 0)
+				embeddingRouteFailures(t, s, "a", 1, 0)
+				embeddingRouteFailures(t, s, "b", 0, 0)
 				runtimeTelemetry(t, s, wantRows, wantStatus, !fallback)
 			})
 		}
@@ -143,11 +143,11 @@ func TestEmbeddingRoutesEffectiveStepParameters(t *testing.T) {
 			embeddingRoutePayload(t, <-seenA, tc.wantA, "m-a")
 			if tc.fallback {
 				embeddingRoutePayload(t, <-seenB, tc.wantB, "m-b")
-				embeddingRouteFailures(t, s, "a", 1)
+				embeddingRouteFailures(t, s, "a", 1, 0)
 			} else {
-				embeddingRouteFailures(t, s, "a", 0)
+				embeddingRouteFailures(t, s, "a", 0, 0)
 			}
-			embeddingRouteFailures(t, s, "b", 0)
+			embeddingRouteFailures(t, s, "b", 0, 0)
 		})
 	}
 }
@@ -174,7 +174,7 @@ func TestEmbeddingRoutesInputForms(t *testing.T) {
 			if w.Code != http.StatusOK || hits.Load() != 1 || w.Body.String() != tc.response {
 				t.Fatalf("status=%d hits=%d body=%s", w.Code, hits.Load(), w.Body)
 			}
-			embeddingRouteFailures(t, s, "a", 0)
+			embeddingRouteFailures(t, s, "a", 0, 0)
 			runtimeTelemetry(t, s, 1, http.StatusOK, false)
 		})
 	}
@@ -219,8 +219,8 @@ func TestEmbeddingRoutesCancellationPreservesPriorFailures(t *testing.T) {
 	if hitsA.Load() != 1 || hitsB.Load() != 0 || w.Body.Len() != 0 {
 		t.Fatalf("cancelled request wrote output or retried: hits=%d/%d body=%s", hitsA.Load(), hitsB.Load(), w.Body)
 	}
-	embeddingRouteFailures(t, s, "a", 1)
-	embeddingRouteFailures(t, s, "b", 0)
+	embeddingRouteFailures(t, s, "a", 1, 1)
+	embeddingRouteFailures(t, s, "b", 0, 0)
 	runtimeTelemetry(t, s, 0, 0, false)
 }
 
@@ -230,7 +230,7 @@ func embeddingRouteRequest(ctx context.Context, body string) *http.Request {
 	return r
 }
 
-func embeddingRouteFailures(t *testing.T, s *Server, provider string, want int) {
+func embeddingRouteFailures(t *testing.T, s *Server, provider string, wantModel, wantKey int) {
 	t.Helper()
 	got := 0
 	for _, state := range s.hlth.Snapshot() {
@@ -238,8 +238,8 @@ func embeddingRouteFailures(t *testing.T, s *Server, provider string, want int) 
 			got += state.Failures
 		}
 	}
-	if got != want || s.pools[provider].Keys()[0].Failures != want {
-		t.Fatalf("%s health/key failures=%d/%d want=%d", provider, got, s.pools[provider].Keys()[0].Failures, want)
+	if got != wantModel || s.pools[provider].Keys()[0].Failures != wantKey {
+		t.Fatalf("%s health/key failures=%d/%d want=%d/%d", provider, got, s.pools[provider].Keys()[0].Failures, wantModel, wantKey)
 	}
 }
 

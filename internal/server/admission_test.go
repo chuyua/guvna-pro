@@ -245,7 +245,7 @@ func TestHalfOpenFailedProbeCoolsDownAcrossRoutes(t *testing.T) {
 					t.Fatalf("fallback status=%d", w.Code)
 				}
 			}
-			if hits.Load() != 1 || !s.hlth.IsDown("a", "m") {
+			if hits.Load() != int32(retries+1) || !s.hlth.IsDown("a", "m") {
 				t.Fatalf("failed probe did not cool down: hits=%d", hits.Load())
 			}
 			for _, st := range s.hlth.Snapshot() {
@@ -253,7 +253,7 @@ func TestHalfOpenFailedProbeCoolsDownAcrossRoutes(t *testing.T) {
 					t.Fatalf("failure counted more than once: %+v", st)
 				}
 			}
-			if n := s.pools["a"].Keys()[0].Failures; n != 1 {
+			if n := s.pools["a"].Keys()[0].Failures; n != 0 {
 				t.Fatalf("key failures=%d", n)
 			}
 		})
@@ -330,8 +330,8 @@ func TestLateSuccessPreservesNewKeyQuarantineAcrossRoutes(t *testing.T) {
 					tc.respond(w)
 					return
 				}
-				w.WriteHeader(503)
-				io.WriteString(w, `{"error":"unavailable"}`)
+				w.WriteHeader(429) // Exercise both key and model isolation with a rate limit.
+				io.WriteString(w, `{"error":"rate limited"}`)
 			}))
 			defer primary.Close()
 			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { tc.respond(w) }))

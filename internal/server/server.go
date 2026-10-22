@@ -495,8 +495,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					log.Printf("chat: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.mark(r, step.Provider, step.Model, 0, aerr)
-					s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, aerr)
+					s.mark(r, step.Provider, step.Model, http.StatusBadGateway, aerr)
+					s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, aerr)
 					failure := unusableBody(aerr)
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
@@ -640,16 +640,16 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			}
 			if readErr != nil {
 				log.Printf("embed: body read failed from %s/%s: %v", step.Provider, step.Model, readErr)
-				s.mark(r, step.Provider, step.Model, 0, readErr)
-				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
+				s.mark(r, step.Provider, step.Model, http.StatusBadGateway, readErr)
+				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, readErr)
 				failure := unusableBody(readErr)
 				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 				continue
 			}
 			if verr := validateEmbeddings(embedBody, embeddingRequestContract(body, step.Params)); verr != nil {
 				log.Printf("embed: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
-				s.mark(r, step.Provider, step.Model, 0, verr)
-				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+				s.mark(r, step.Provider, step.Model, http.StatusBadGateway, verr)
+				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, verr)
 				failure := unusableBody(verr)
 				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 				continue
@@ -660,7 +660,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.markSuccess(r, step.Provider, step.Model)
-			s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
+			s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, 0, 0)
 			return
 		}
 		lastStatus = resp.StatusCode
@@ -829,14 +829,14 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 			return relayResult{outcome: relayUncommitted, clientGone: true, err: r.Context().Err()}
 		}
 		if err != nil {
-			s.mark(r, step.Provider, step.Model, 0, err)
-			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
+			s.mark(r, step.Provider, step.Model, http.StatusBadGateway, err)
+			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, err)
 			log.Printf("chat: %s/%s body read failed: %v", step.Provider, step.Model, err)
 			return unusableBody(err)
 		}
 		if verr := validateChatCompletion(body, req.N); verr != nil {
-			s.mark(r, step.Provider, step.Model, 0, verr)
-			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+			s.mark(r, step.Provider, step.Model, http.StatusBadGateway, verr)
+			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, verr)
 			log.Printf("chat: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
 			return unusableBody(verr)
 		}
@@ -848,7 +848,7 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 		}
 		s.markSuccess(r, step.Provider, step.Model)
 		in, out := telemetry.ParseUsage(body)
-		s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+		s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out)
 		return relayResult{outcome: relayCommitted}
 	}
 	s.relayStream(w, r, step, chain, req, resp, keyEnv)
@@ -902,8 +902,8 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 		}
 		io.WriteString(w, payload+"\n\n")
 		flusher.Flush()
-		s.mark(r, step.Provider, step.Model, 0, err)
-		s.poolRecordResult(r, keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
+		s.mark(r, step.Provider, step.Model, http.StatusBadGateway, err)
+		s.poolRecordResult(r, keyEnv, step, chain, req, 502, in, out, err)
 	}
 
 	for {
@@ -962,7 +962,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 						}
 						flusher.Flush()
 						s.markSuccess(r, step.Provider, step.Model)
-						s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+						s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out)
 						return
 					}
 					if _, werr := w.Write(pending.Bytes()); werr != nil {
@@ -1012,7 +1012,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 						flusher.Flush()
 					}
 					s.markSuccess(r, step.Provider, step.Model)
-					s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+					s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out)
 					return
 				}
 				log.Printf("chat: stream error from %q: %v", step.Provider, err)
@@ -1023,27 +1023,20 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 	}
 }
 
-// poolRecord records usage against the serving key and marks its pool state:
-// failures for class != "", success otherwise.
-func (s *Server) poolRecord(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class) {
-	s.poolRecordResult(r, keyEnv, step, chain, req, status, in, out, class, nil)
+// poolRecord records usage and completes a usable successful response.
+func (s *Server) poolRecord(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64) {
+	s.poolRecordResult(r, keyEnv, step, chain, req, status, in, out, nil)
 }
 
 // poolRecordResult commits one terminal request event, including an error and
 // any partial usage, rather than recording separate token and error rows.
-func (s *Server) poolRecordResult(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class, err error) {
+func (s *Server) poolRecordResult(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, err error) {
 	lease := attemptLease(r, keyEnv)
 	if r.Context().Err() != nil || isClientGone(err) {
 		lease.Release()
 		return
 	}
-	if lease != nil {
-		if class != "" {
-			lease.Failure(class)
-		} else {
-			lease.Success()
-		}
-	}
+	completeKeyAttempt(lease, status, err)
 	s.recordAttempt(r, step, chain, req, status, err, keyEnv, in, out)
 }
 

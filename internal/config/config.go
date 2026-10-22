@@ -55,8 +55,8 @@ type QuarantineCfg struct {
 	Transient Duration `yaml:"transient"`
 }
 
-// DefaultQuarantine mirrors the step cooldown pattern: 401/403 = long (key is
-// dead or quota gone), 429 = rate limit (recovers quickly), 5xx = hiccup.
+// DefaultQuarantine isolates auth and rate-limit failures. Transient remains
+// available for legacy/manual key isolation; service failures are key-neutral.
 var DefaultQuarantine = QuarantineCfg{
 	Auth:      Duration{24 * time.Hour},
 	RateLimit: Duration{time.Minute},

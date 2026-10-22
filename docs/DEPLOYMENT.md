@@ -73,8 +73,8 @@ gateway.example.com {
 Provider keys live in env via `key_envs` lists in config.yaml; multiple keys per provider form a rotation pool:
 
 - `rotation:` per provider — `round_robin` (default) / `least_used` / `sequential`
-- Class-based quarantine — 401/403 → `auth` (24h), 429 → `rate_limit` (60s), 5xx/network → `transient` (60s); cool-off doubles per consecutive failure; success resets
-- On a quarantinable response the same request retries on the next healthy key (within the step retry budget); all keys down → chain falls to the next step
+- Automatic quarantine — 401/403 → `auth` (24h), 429 → `rate_limit` (60s); cool-off doubles per consecutive failure; validated completed success resets. Service/network failures, including invalid response bodies and gateway timeouts, do not penalize keys or reset prior failures.
+- Auth/rate-limit responses fail over to an unused healthy credential. Service/network setup failures retry the same healthy key up to `GUVNA_RETRIES` extra times; all extra attempts consume the shared retry budget and timed retries retain backoff. All keys down → chain falls to the next step. See [retry budgets and backoff](RELIABILITY.md#retry-budgets-and-backoff).
 - Per-key state is visible in `/admin/status` → `keys`; telemetry rows carry the serving `key`
 - Quarantine is in-memory — restart clears it
 

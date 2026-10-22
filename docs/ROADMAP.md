@@ -58,8 +58,8 @@ are now part of the single `guvna` executable: `guvna status`, `guvna logs` and
 ## Phase 4c — Key pools & rotation (DONE 2026-08-17)
 
 - Per-provider `key_envs:` lists (single `key_env` still accepted = 1-key pool); rotation strategies `round_robin` (default) / `least_used` / `sequential`
-- Class-based quarantine: 401/403 → auth (24h), 429 → rate_limit (60s), 5xx/network → transient (60s) — per-provider overridable, doubles per consecutive failure, capped; success resets; in-memory only
-- Key failover: dead key costs one attempt, retried on the next healthy key within the step retry budget; 401/403 consume retries; all keys down → step down → chain falls over; streaming rotation is per-request only
+- Automatic quarantine: 401/403 → auth (24h), 429 → rate_limit (60s) — per-provider overridable, doubles per consecutive failure, capped; validated success resets; in-memory only. Service/network failures are key-neutral.
+- Key failover: auth/rate-limit failures try each usable credential once; service/network retries prefer the same healthy key and have a separate transient limit. All extra attempts consume the shared retry budget; all keys down → chain falls over; streaming rotation is per-request only. See [reliability policy](RELIABILITY.md#retry-budgets-and-backoff).
 - Observability: per-key state in `/admin/status` (state, reason, failures, cool-off, requests/tokens), `key` column in telemetry rows (DB migration on existing volumes)
 - **Done:** deliberately-broken key in a live pool → requests succeed via failover, bad key quarantined with reason, telemetry rows carry the serving key — verified live on the VPS (bazaarlink pool) and locally (groq pool all-dead → last 403 propagated)
 

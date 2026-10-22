@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/creamy-ghost/guvna/internal/config"
-	"github.com/creamy-ghost/guvna/internal/keypool"
 )
 
 func TestWalkPayloadValidation(t *testing.T) {
@@ -103,8 +102,8 @@ func TestWalkBodyFaultsFallBack(t *testing.T) {
 						t.Fatalf("bad health=%v", st)
 					}
 				}
-				if s.pools["a"].Keys()[0].Failures != 1 {
-					t.Fatal("bad body was not charged to its key exactly once")
+				if s.pools["a"].Keys()[0].Failures != 0 {
+					t.Fatal("bad body penalized a healthy key")
 				}
 			})
 		}
@@ -187,8 +186,8 @@ func TestWalkChatStreamIdleDeadline(t *testing.T) {
 	if time.Since(start) > time.Second || !strings.Contains(w.Body.String(), "upstream stream did not complete") {
 		t.Fatalf("idle deadline did not fire: %s", w.Body)
 	}
-	if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
-		t.Fatal("idle timeout was not charged exactly once")
+	if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 0 {
+		t.Fatal("idle timeout must affect model health only")
 	}
 }
 
@@ -224,14 +223,7 @@ func TestWalkCancellationDuringBackoffDoesNotRetry(t *testing.T) {
 			defer up.Close()
 			s := runtimeServer(t, up.URL)
 			s.hlth.Mark("a", "m", 500, nil)
-			// Backoff only occurs if another key is available after the first
-			// 503 quarantines A. With one key, the step now fails over at once.
-			pool, err := keypool.New("a", []string{"A", "A2"}, "round_robin", config.QuarantineCfg{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			s.pools["a"] = pool
-			s.env = func(string) string { return "dummy" }
+			// A service failure retries the same healthy key with backoff.
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			s.retryWait = func(int) time.Duration { cancel(); return time.Second }
@@ -240,8 +232,8 @@ func TestWalkCancellationDuringBackoffDoesNotRetry(t *testing.T) {
 			if hits.Load() != 1 || time.Since(start) > time.Second {
 				t.Fatal("cancellation did not interrupt retry backoff")
 			}
-			if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
-				t.Fatal("cancel added a failure beyond the first upstream 503")
+			if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 0 {
+				t.Fatal("cancel changed model health or penalized the key")
 			}
 			runtimeTelemetry(t, s, 1, 503, true)
 		})
