@@ -24,7 +24,7 @@ Free-tier providers (Bazaarlink, Groq, Mistral, Gemini, OrcaRouter) bill in toke
   3. Session dedup / repetition pruning (content-addressed)
 - Config-as-code YAML; SQLite for usage/telemetry only
 - Single admin key + API keys (single-user)
-- Local CLI + remote CLI over the gateway's authenticated API; revocable scoped tokens remain future work
+- Host-local CLI over a filesystem socket; no public admin or remote management API
 - systemd unit on Arch + container on a VPS
 - Tests + release docs
 

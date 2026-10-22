@@ -22,7 +22,7 @@ any OpenAI-compatible client
         │ 50+ providers  │
         └────────────────┘
 
-Management:         guvna status / logs / chains (local + remote over gateway)
+Management:         guvna status / logs / chains → local admin.sock only
 
 * planned — see ROADMAP Phase 6; everything unmarked is shipped.
 ```
@@ -32,7 +32,7 @@ Management:         guvna status / logs / chains (local + remote over gateway)
 ### 1. Router (built)
 - `/v1/chat/completions` (+ `/v1/models`) OpenAI-compatible, streaming SSE passthrough, 15s keep-alives
 - **Chain routing is the core primitive**: chains = ordered (provider, model) steps. First 2xx step serves; non-2xx walks to the next step; all steps failed → last upstream response propagated as-is. No silent mid-stream restarts. Chains are retried (2 retries, 250ms→1s backoff) and failure-marked (3 consecutive failures → cool-off 60s doubling to 10min, auto-recovery).
-- **No default chains**: every chain is created per use case by the client via `POST /v1/chains` (any valid API key — apps self-provision; persisted to `<data-dir>/chains.yaml`, atomic rewrite). `DELETE /v1/chains/{name}` removes runtime chains. `/v1/models` lists chains (empty until the client creates them). Unknown model → 404 with a pointer to the creation API — no silent fallback.
+- **No default chains**: admins create runtime chains with local `guvna chains add`; persisted to `<data-dir>/chains.yaml` by atomic rewrite. Local `guvna chains rm` removes them. `/v1/models` lists chains (empty until the admin creates them). Unknown model → 404 with a pointer to the local command — no silent fallback. Public chain-management routes are absent.
 - **Provider-prefixed passthrough**: any model named `<prefix>/<model>` routes directly to that provider, bypassing chains. Prefixes are per-provider in config (`prefixes:` list, defaults to the provider name). If the suffix is in the provider's known models, only the suffix is sent upstream (e.g. `groq/llama-3.3-70b-versatile` → groq, model `llama-3.3-70b-versatile`); otherwise the full name is sent (namespaced catalogs, e.g. `openai/gpt-5.6-luna` → orcarouter, model `openai/gpt-5.6-luna`).
 - **Loose validation, no catalogs**: chain creation validates provider exists and model is non-empty — NOT model existence. The upstream provider IS the catalog; a stale local catalog would reject valid new models (upstream 404s at request time and the chain falls over instead).
 - **Key pools + rotation**: providers take `key_envs: [K1, K2, ...]` (a single `key_env` still works = 1-key pool). Per-provider rotation strategy (`rotation:`): `round_robin` (default) / `least_used` / `sequential`, picking only healthy keys. Automatic quarantine (`quarantine:` per-provider overrides): 401/403 → `auth` (default 24h), 429 → `rate_limit` (60s); durations double per consecutive failure (capped). Only a validated completed success resets prior key failures. Service/network failures leave keys neutral and continue to affect model health. Auth/rate-limit failover tries each usable credential once; service/network setup retries prefer the same healthy credential under a separate transient limit. All extra attempts consume the shared retry budget; see [retry policy](RELIABILITY.md#retry-budgets-and-backoff). All keys down → chain walks on. Streaming rotation is per-request; a mid-stream failure propagates an error chunk (no mid-stream swap). Key state (state/reason/failures/cool-off remaining/requests/tokens per key) is exposed in `/admin/status` `keys`; telemetry rows carry the serving `key`. Quarantine is in-memory (resets on restart, like step health).
@@ -40,8 +40,9 @@ Management:         guvna status / logs / chains (local + remote over gateway)
 - Provider adaptors: small per-provider interface (`Chat(ctx, body) (*http.Response, error)`), pattern from new-api's `relay_adaptor.go`. Two types built: `openai` (base + `/v1/chat/completions`) and `gemini` (base + `/v1beta/openai` + chat path — Gemini's official OpenAI-compat endpoint, passthrough no translation). Outbound requests carry `User-Agent: guvna/0.1` (bazaarlink throttles UA-less requests).
 - Auth: Bearer admin key (`ADMIN_KEY`) or client key (`API_KEYS`), always on; `/healthz` unauthenticated
 - Telemetry: in-memory event buffer, async batch flush to SQLite every 30s (pure-Go driver, no CGO); hot path never touches disk; crash loses <30s
-- Single gateway process, one API port. `guvna serve` starts the gateway;
-  management invokes the same executable in a separate process against that API.
+- Single gateway process, one model API port. `guvna serve` starts the gateway;
+  management invokes the same executable in a separate process over its local
+  filesystem socket, protected by permissions and the admin key.
   Legacy service invocations such as `guvna -config ...` remain supported.
 
 ### 2. Compression pipeline (planned — ROADMAP Phase 6, not built)
@@ -65,16 +66,16 @@ v2 (not in v1): LLMLingua-2 (ONNX MobileBERT, heavy — separate process or side
 
 ### 5. Security
 - Auth always on: one admin key (env `ADMIN_KEY`), client keys (env `API_KEYS`); the gateway refuses to start without them
-- Remote CLI authenticates with the admin key over the gateway's HTTPS endpoint — no new port, no separate token scheme (revocable scoped tokens: future work, ROADMAP Phase 4)
+- Public model listener has no `/admin/*` or `/v1/chains` management routes. Local management uses a filesystem socket and the admin key; a proxy's loopback peer address is not trusted as an isolation boundary.
 - No multi-user, registration, browser login or web-session authentication
 
 ### 6. Operator interface
-- CLI-only: status, logs and runtime chains use the gateway's existing authenticated HTTP API
+- Local CLI-only: status, logs, scoring and runtime chains use the authenticated management protocol on `admin.sock`
 - One executable provides serving and management commands; release assets are
   Linux amd64 `guvna` plus SHA-256 checksums. The combined entrypoint simplifies
   distribution without changing the service's memory-use guarantees.
-- No UI binary, web assets, login page or additional management listener
-- The CLI defaults to `http://127.0.0.1:20128`; the gateway itself listens on `:20128` (all interfaces), so deployment network access must be configured separately
+- No UI binary, web assets, login page or TCP management listener
+- The CLI defaults to `~/.guvna/admin.sock`; `--socket` or `GUVNA_ADMIN_SOCKET` selects a custom path. The model API listens on `:20128` and can be forwarded independently
 - See [CLI.md](CLI.md) for commands and [DEPLOYMENT.md](DEPLOYMENT.md) for exposure
 
 ## Sizing
@@ -88,5 +89,5 @@ v2 (not in v1): LLMLingua-2 (ONNX MobileBERT, heavy — separate process or side
 
 - `REQUIRE_API_KEY` equivalent always on when exposed
 - Config in git, not DB
-- Management through CLI and the authenticated API; no browser UI
+- Management through the host-local CLI socket only; no public admin API or browser UI
 - Port 20128

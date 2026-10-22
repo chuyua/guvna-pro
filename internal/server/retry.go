@@ -198,6 +198,7 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 			return finish()
 		}
 		beginAttempt(r)
+		beginAutoAttempt(r, step)
 		index++
 		used[key] = true
 		var resp *http.Response

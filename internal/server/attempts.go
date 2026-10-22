@@ -96,6 +96,7 @@ func (s *Server) recordAttempt(r *http.Request, step router.Step, chain string, 
 		}
 		e.Stream = trace.req.Stream
 	}
+	recordAutoAttempt(r, status, err)
 	if err != nil {
 		e.Err = err.Error()
 	}

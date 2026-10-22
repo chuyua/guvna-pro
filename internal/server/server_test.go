@@ -54,6 +54,13 @@ func testServerDefault(t *testing.T, providers []config.Provider, ch []config.Ch
 	return s, ts
 }
 
+func testAdminServer(t *testing.T, s *Server) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(s.AdminHandler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
 func completionUpstream(t *testing.T, status int, body string, stream bool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -450,7 +457,8 @@ func TestChatStreamingCapturesUsage(t *testing.T) {
 func TestAdminStatusRequiresAdminKey(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
-	s, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, chains, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 	s.tm.Record(telemetry.Event{Provider: "a", Chain: "main", Model: "m", Status: 200, TokensIn: 3, TokensOut: 5})
 	if err := s.tm.Flush(); err != nil {
 		t.Fatal(err)
@@ -500,7 +508,8 @@ func TestAdminStatusRequiresAdminKey(t *testing.T) {
 func TestAdminLogsReturnsRecentLines(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
-	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, chains, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/logs?n=5", nil)
 	req.Header.Set("Authorization", "Bearer admin-secret")
@@ -536,13 +545,14 @@ func postChain(t *testing.T, ts *httptest.Server, token string, name string, ste
 	return resp
 }
 
-func TestChainsCreateWithClientKey(t *testing.T) {
+func TestChainsCreateWithAdminKey(t *testing.T) {
 	up := completionUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`, false)
 	defer up.Close()
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	admin := testAdminServer(t, s)
 
-	resp := postChain(t, ts, "client-1", "mychain", []chainStep{{Provider: "a", Model: "m"}})
+	resp := postChain(t, admin, "admin-secret", "mychain", []chainStep{{Provider: "a", Model: "m"}})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201", resp.StatusCode)
@@ -557,12 +567,13 @@ func TestChainsCreateWithClientKey(t *testing.T) {
 
 func TestChainsCreateDuplicateConflict(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, nil, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
-	if resp := postChain(t, ts, "client-1", "dup", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
+	if resp := postChain(t, ts, "admin-secret", "dup", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("first create = %d, want 201", resp.StatusCode)
 	}
-	resp := postChain(t, ts, "client-1", "dup", []chainStep{{Provider: "a", Model: "m"}})
+	resp := postChain(t, ts, "admin-secret", "dup", []chainStep{{Provider: "a", Model: "m"}})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate create = %d, want 409", resp.StatusCode)
@@ -571,12 +582,13 @@ func TestChainsCreateDuplicateConflict(t *testing.T) {
 
 func TestChainsCreateRejectsBadNameAndUnknownProvider(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, nil, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
-	if resp := postChain(t, ts, "client-1", "Bad_Name", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
+	if resp := postChain(t, ts, "admin-secret", "Bad_Name", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad name = %d, want 400", resp.StatusCode)
 	}
-	if resp := postChain(t, ts, "client-1", "okname", []chainStep{{Provider: "nope", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
+	if resp := postChain(t, ts, "admin-secret", "okname", []chainStep{{Provider: "nope", Model: "m"}}); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown provider = %d, want 400", resp.StatusCode)
 	}
 }
@@ -594,13 +606,14 @@ func TestChatUnknownModelNotFound(t *testing.T) {
 
 func TestChainsDeletePersistsAndUnroutes(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	admin := testAdminServer(t, s)
 
-	if resp := postChain(t, ts, "client-1", "temp", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
+	if resp := postChain(t, admin, "admin-secret", "temp", []chainStep{{Provider: "a", Model: "m"}}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create = %d, want 201", resp.StatusCode)
 	}
-	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/chains/temp", nil)
-	req.Header.Set("Authorization", "Bearer client-1")
+	req, _ := http.NewRequest(http.MethodDelete, admin.URL+"/v1/chains/temp", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
 	del, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -619,10 +632,11 @@ func TestChainsDeletePersistsAndUnroutes(t *testing.T) {
 func TestChainsDeleteConfigChainRefused(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
-	_, ts := testServer(t, providers, chains, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, chains, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/chains/main", nil)
-	req.Header.Set("Authorization", "Bearer client-1")
+	req.Header.Set("Authorization", "Bearer admin-secret")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -685,7 +699,8 @@ func TestChatFailsOverAcrossKeys(t *testing.T) {
 func TestAdminStatusShowsKeys(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnvs: []string{"KEY_A1", "KEY_A2"}}}
 	chains := []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}
-	s, ts := testServer(t, providers, chains, map[string]string{"KEY_A1": "k", "KEY_A2": "k"})
+	s, _ := testServer(t, providers, chains, map[string]string{"KEY_A1": "k", "KEY_A2": "k"})
+	ts := testAdminServer(t, s)
 	s.pools["a"].Mark("KEY_A1", keypool.ClassAuth)
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/status", nil)
@@ -812,9 +827,10 @@ func TestStepParamsStreamAndModelNeverMerged(t *testing.T) {
 
 func TestChainsCreateParamsRejectedReserved(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, nil, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
-	resp := postChain(t, ts, "client-1", "bad", []chainStep{{Provider: "a", Model: "m", Params: map[string]any{"messages": []any{}}}})
+	resp := postChain(t, ts, "admin-secret", "bad", []chainStep{{Provider: "a", Model: "m", Params: map[string]any{"messages": []any{}}}})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("create with reserved param = %d, want 400", resp.StatusCode)
@@ -823,16 +839,17 @@ func TestChainsCreateParamsRejectedReserved(t *testing.T) {
 
 func TestChainsCreateEchoesParams(t *testing.T) {
 	providers := []config.Provider{{Name: "a", Type: "openai", BaseURL: "http://x", KeyEnv: "K"}}
-	_, ts := testServer(t, providers, nil, map[string]string{"K": "k"})
+	s, _ := testServer(t, providers, nil, map[string]string{"K": "k"})
+	ts := testAdminServer(t, s)
 
 	params := map[string]any{"reasoning_effort": "high", "max_tokens": 8192}
-	resp := postChain(t, ts, "client-1", "tuned", []chainStep{{Provider: "a", Model: "m", Params: params}})
+	resp := postChain(t, ts, "admin-secret", "tuned", []chainStep{{Provider: "a", Model: "m", Params: params}})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201", resp.StatusCode)
 	}
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/chains", nil)
-	req.Header.Set("Authorization", "Bearer client-1")
+	req.Header.Set("Authorization", "Bearer admin-secret")
 	lresp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

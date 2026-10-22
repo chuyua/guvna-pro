@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,9 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/creamy-ghost/guvna/internal/localadmin"
 )
 
 func TestServiceDispatchPreservesLegacyArguments(t *testing.T) {
@@ -127,15 +132,21 @@ func TestManagementDispatchUsesExistingGateway(t *testing.T) {
 	} {
 		t.Run(tc.args[0], func(t *testing.T) {
 			var requests atomic.Int32
-			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := mainTestSocket(t)
+			listener, err := localadmin.Listen(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requests.Add(1)
 				if r.Method != http.MethodGet || r.URL.RequestURI() != tc.path || r.Header.Get("Authorization") != "Bearer dummy-admin" {
 					t.Errorf("unexpected management request: %s %s auth=%q", r.Method, r.URL.RequestURI(), r.Header.Get("Authorization"))
 				}
 				io.WriteString(w, `{"chains":[],"lines":[],"future_field":true}`)
-			}))
+			})}
+			go gateway.Serve(listener)
 			defer gateway.Close()
-			args := append(append([]string{}, tc.args...), "--url", gateway.URL, "--token", "dummy-admin", "--json")
+			args := append(append([]string{}, tc.args...), "--socket", path, "--token", "dummy-admin", "--json")
 			var output bytes.Buffer
 			if err := run(args, &output, io.Discard, func([]string, io.Writer) error {
 				t.Fatal("management command started the gateway")
@@ -145,6 +156,73 @@ func TestManagementDispatchUsesExistingGateway(t *testing.T) {
 			}
 			if requests.Load() != 1 || !json.Valid(output.Bytes()) {
 				t.Fatalf("requests=%d output=%q", requests.Load(), output.String())
+			}
+		})
+	}
+}
+
+func mainTestSocket(t *testing.T) string {
+	t.Helper()
+	root := os.TempDir()
+	if runtime.GOOS == "windows" {
+		root = os.Getenv("PUBLIC")
+	}
+	dir, err := os.MkdirTemp(root, "gm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "admin.sock")
+}
+
+func TestServeEndpointsStopsBothListeners(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint("failure=", fail), func(t *testing.T) {
+			publicListener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer publicListener.Close()
+			path := mainTestSocket(t)
+			adminListener, err := localadmin.Listen(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adminListener.Close()
+			public := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "api") })}
+			admin := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "local") })}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			completed := make(chan error, 1)
+			go func() { completed <- serveEndpoints(ctx, public, admin, publicListener, adminListener) }()
+			client := localadmin.Client(path, time.Second)
+			resp, err := client.Get("http://local-admin/status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			client.CloseIdleConnections()
+			if fail {
+				publicListener.Close()
+			} else {
+				cancel()
+			}
+			select {
+			case err := <-completed:
+				if (err != nil) != fail {
+					t.Fatalf("unexpected termination error: %v", err)
+				}
+			case <-time.After(6 * time.Second):
+				t.Fatal("listeners did not shut down")
+			}
+			if _, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second); err == nil {
+				t.Fatal("public listener survived shutdown")
+			}
+			if _, err := net.DialTimeout("unix", path, time.Second); err == nil {
+				t.Fatal("management listener survived shutdown")
+			}
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatalf("management socket not cleaned up: %v", err)
 			}
 		})
 	}

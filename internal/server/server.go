@@ -199,9 +199,17 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/responses/{id}", s.auth.Middleware(http.HandlerFunc(s.handleResponseLookup)))
 	mux.Handle("DELETE /v1/responses/{id}", s.auth.Middleware(http.HandlerFunc(s.handleResponseDelete)))
 	mux.Handle("POST /v1/responses/{id}/cancel", s.auth.Middleware(http.HandlerFunc(s.handleResponseCancel)))
-	mux.Handle("GET /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainList)))
-	mux.Handle("POST /v1/chains", s.auth.Middleware(http.HandlerFunc(s.handleChainCreate)))
-	mux.Handle("DELETE /v1/chains/{name}", s.auth.Middleware(http.HandlerFunc(s.handleChainDelete)))
+	return mux
+}
+
+// AdminHandler serves local management over the filesystem socket only. Keep
+// these routes off Handler: a tunnel or proxy can forward public traffic from
+// loopback, so checking the peer address would not isolate management.
+func (s *Server) AdminHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /v1/chains", s.auth.AdminMiddleware(http.HandlerFunc(s.handleChainList)))
+	mux.Handle("POST /v1/chains", s.auth.AdminMiddleware(http.HandlerFunc(s.handleChainCreate)))
+	mux.Handle("DELETE /v1/chains/{name}", s.auth.AdminMiddleware(http.HandlerFunc(s.handleChainDelete)))
 	mux.Handle("GET /admin/status", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminStatus)))
 	mux.Handle("GET /admin/logs", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminLogs)))
 	mux.Handle("GET /admin/auto/scoring", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAutoScoring)))
@@ -213,8 +221,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleAdminStatus reports chain health and usage aggregates to the admin
-// (or a remote CLI with the admin key).
+// handleAdminStatus reports chain health and usage aggregates to the local CLI.
 func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.tm.Stats()
 	steps := s.hlth.Snapshot()
@@ -423,7 +430,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	chain, steps, err := s.rtr.Resolve(req.Model)
 	if err != nil {
 		if errors.Is(err, router.ErrNotFound) {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":"unknown chain or model %q — create a chain via POST /v1/chains or use a provider-prefixed model"}}`, req.Model), http.StatusNotFound)
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"unknown chain or model %q — create a chain with the local guvna chains add command or use a provider-prefixed model"}}`, req.Model), http.StatusNotFound)
 			return
 		}
 		http.Error(w, `{"error":{"message":"resolve failed"}}`, http.StatusInternalServerError)

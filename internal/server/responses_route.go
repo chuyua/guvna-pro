@@ -56,7 +56,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, router.ErrNotFound) {
 			responsesErr(w, http.StatusNotFound, "invalid_request_error", "model_not_found",
-				fmt.Sprintf("unknown chain or model %q — create a chain via POST /v1/chains or use a provider-prefixed model", req.Model))
+				fmt.Sprintf("unknown chain or model %q — create a chain with the local guvna chains add command or use a provider-prefixed model", req.Model))
 			return
 		}
 		responsesErr(w, http.StatusInternalServerError, "api_error", "resolve_failed", "resolve failed")

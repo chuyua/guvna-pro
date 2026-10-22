@@ -257,7 +257,7 @@ func TestAdminStatusKeepsTelemetryWhenUsageUnavailable(t *testing.T) {
 	r := httptest.NewRequest("GET", "/admin/status", nil)
 	r.Header.Set("Authorization", "Bearer admin-secret")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	s.AdminHandler().ServeHTTP(w, r)
 	var got struct {
 		Telemetry map[string]any `json:"telemetry"`
 		Error     string         `json:"usage_error"`

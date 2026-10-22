@@ -10,7 +10,8 @@ Guvna is a **single-user** gateway holding valuable secrets: admin key, client A
 
 In scope:
 
-- Auth bypass on `/v1`, `/admin/*`, or chain management endpoints
+- Auth bypass on model APIs or the local management socket
+- Any public exposure of `/admin/*` or chain management routes, which belong only on the filesystem socket
 - Provider-key leakage through logs, telemetry, error messages, or `/admin/status`
 - Path traversal / arbitrary file read via `-config`/`-data` handling
 - Injection into the SQLite telemetry store
@@ -24,6 +25,7 @@ Out of scope (by design):
 
 ## Design guarantees
 
-- Auth cannot be disabled: without valid admin/client keys the gateway refuses every route
+- Model API auth cannot be disabled (`/healthz` is the unauthenticated health check)
+- Management is local-only with admin authentication and socket permissions; public model listeners have no admin or chain-management handlers
 - Provider keys exist only in process env + memory; never logged, never persisted to disk by the gateway
 - Telemetry stores hashes-free request metadata (model, tokens, serving key reference), not message contents

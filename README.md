@@ -15,9 +15,9 @@ Guvna uses **config-as-code, SQLite telemetry and one static binary** for servin
 - **Key pools** — per-provider rotation (round-robin / least-used / sequential) with class-based quarantine (auth / rate-limit / transient) and automatic failover. One dead key never burns the pool.
 - **Provider-prefixed passthrough** — call any catalog model directly as `<provider>/<model>` when you don't need a chain.
 - **Self-healing** — unhealthy providers cool off (60s → 10min, auto-recovery); chains fail over across steps; no silent mid-stream restarts.
-- **Remote CLI** — `guvna status|logs|chains` against the gateway's HTTPS endpoint, from anywhere.
-- **CLI-only management** — no browser login, OAuth flow, web sessions or separate UI service. The CLI uses your configured gateway admin key.
-- **Observability** — async SQLite telemetry (requests, tokens, serving key), `/admin/status` + `/admin/logs`.
+- **Local CLI management** — `guvna status|logs|chains` connects through a local filesystem socket, with the configured admin key. Management has no TCP listener or public API routes.
+- **CLI-only management** — no browser login, OAuth flow, web sessions or separate UI service.
+- **Observability** — async SQLite telemetry, passive Auto request results and provider availability observations; `guvna status --scoring` displays the collected data.
 - **Free-tier native** — ships with configs for Bazaarlink, Groq, Mistral, Gemini, OrcaRouter free tiers.
 
 ## Quickstart
@@ -45,14 +45,11 @@ service invocations remain supported.
 
 ### First request
 
-Chains are created by clients over the API (there are no default chains):
+Create chains with the CLI on the gateway host (there are no default chains):
 
 ```sh
-curl -X POST http://127.0.0.1:20128/v1/chains \
-  -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
-  -d '{"name":"myfree","steps":[
-        {"provider":"bazaarlink","model":"qwen/qwen3.7-flash:free"},
-        {"provider":"groq","model":"llama-3.3-70b-versatile"}]}'
+export GUVNA_ADMIN_KEY="$ADMIN_KEY"
+./guvna chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
 
 # chat — any OpenAI SDK works, just point base_url at Guvna
 curl http://127.0.0.1:20128/v1/chat/completions \
@@ -62,21 +59,24 @@ curl http://127.0.0.1:20128/v1/chat/completions \
 
 If `bazaarlink` is down or rate-limited, the same request transparently falls through to `groq`. Or skip chains entirely: `"model": "groq/llama-3.3-70b-versatile"`.
 
-Manage the gateway from another terminal, locally or remotely:
+Manage the gateway from another terminal on the same host:
 
 ```sh
-export GUVNA_URL=http://127.0.0.1:20128 GUVNA_ADMIN_KEY="$ADMIN_KEY"
+export GUVNA_ADMIN_KEY="$ADMIN_KEY"
 ./guvna chains list
 ./guvna status
+./guvna status --scoring
 ./guvna logs -n 100
 ```
 
 The API gateway must keep running. Management commands invoke the same executable
-in a second process and use its existing HTTP API; combining the commands does
-not imply a reduction in the gateway's memory use. For remote use, set
-`GUVNA_URL` to your gateway's HTTPS endpoint. See [docs/CLI.md](docs/CLI.md) for
-installation, source builds, credentials and chain management. No separate port
-20129 service is provided.
+in a second process and connect to `~/.guvna/admin.sock`; combining the commands
+does not imply a reduction in the gateway's memory use. Use `--socket` or
+`GUVNA_ADMIN_SOCKET` when the service uses a different data directory. Public
+`/admin/*` and `/v1/chains` routes have been removed, including access with an
+admin key; remote `--url`/`GUVNA_URL` management is retired. See
+[docs/CLI.md](docs/CLI.md) for installation, credentials and local management.
+No separate TCP management port is provided.
 
 ## Configuration
 
