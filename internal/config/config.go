@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -98,11 +99,10 @@ type Step struct {
 var ParamsExcluded = map[string]bool{"model": true, "stream": true, "messages": true}
 
 // ValidateStepParams checks a step's params map: non-empty keys, safe field
-// names (alphanumeric + underscore), and no excluded fields. Values are
-// intentionally unconstrained — the gateway doesn't know model catalogs and
-// providers decide whether to accept or ignore a field.
+// names (alphanumeric + underscore), no excluded fields, and JSON-encodable
+// values. Provider-specific value semantics remain the upstream's decision.
 func ValidateStepParams(params map[string]any) error {
-	for k := range params {
+	for k, v := range params {
 		if k == "" {
 			return errors.New("step params: empty key")
 		}
@@ -113,6 +113,11 @@ func ValidateStepParams(params map[string]any) error {
 			if r != '_' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
 				return fmt.Errorf("step params: key %q must be alphanumeric + underscore", k)
 			}
+		}
+		if _, err := json.Marshal(v); err != nil {
+			// Marshalers may include parameter values in their errors. Report
+			// only the field name, never the potentially sensitive value.
+			return fmt.Errorf("step params: %q cannot be encoded as JSON", k)
 		}
 	}
 	return nil

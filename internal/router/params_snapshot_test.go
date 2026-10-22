@@ -11,7 +11,7 @@ func TestChainParamsSnapshotsAreIsolated(t *testing.T) {
 	params := func() map[string]any {
 		return map[string]any{
 			"nested":        map[string]any{"items": []any{map[string]any{"value": "original"}}},
-			"yaml":          map[any]any{"value": []any{"original"}},
+			"yaml":          map[string]any{"value": []any{"original"}},
 			"stop":          []string{"original"},
 			"nil_map":       map[string]any(nil),
 			"nil_slice":     []any(nil),
@@ -22,7 +22,7 @@ func TestChainParamsSnapshotsAreIsolated(t *testing.T) {
 	mutate := func(steps []Step) {
 		steps[0].Model = "changed"
 		steps[0].Params["nested"].(map[string]any)["items"].([]any)[0].(map[string]any)["value"] = "changed"
-		steps[0].Params["yaml"].(map[any]any)["value"].([]any)[0] = "changed"
+		steps[0].Params["yaml"].(map[string]any)["value"].([]any)[0] = "changed"
 		steps[0].Params["stop"].([]string)[0] = "changed"
 	}
 	for _, source := range []string{"config", "runtime"} {

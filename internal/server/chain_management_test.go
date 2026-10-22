@@ -104,7 +104,7 @@ func TestChainListPreservesDormantYAMLParams(t *testing.T) {
 	}{
 		{name: "non-string nested key", params: "          custom:\n            1: original\n", provider: "unavailable", source: "dormant"},
 		{name: "non-finite float", params: "          temperature: .nan\n", provider: "unavailable", source: "dormant"},
-		{name: "active non-finite float", params: "          temperature: .nan\n", provider: "a", source: "runtime"},
+		{name: "known provider non-finite float", params: "          temperature: .nan\n", provider: "a", source: "dormant"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := chainManagementServer(t)
