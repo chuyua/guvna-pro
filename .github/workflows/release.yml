@@ -52,11 +52,18 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
         run: |
-          gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
-            --verify-tag --generate-notes --title "$VERSION"
+          if [[ "$VERSION" == *-* ]]; then
+            gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
+              --verify-tag --generate-notes --title "$VERSION" \
+              --prerelease --latest=false
+          else
+            gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
+              --verify-tag --generate-notes --title "$VERSION"
+          fi
 
   image:
     needs: binary
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
