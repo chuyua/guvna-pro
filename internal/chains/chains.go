@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/creamy-ghost/guvna/internal/router"
 	"gopkg.in/yaml.v3"
@@ -33,41 +34,91 @@ type fileChain struct {
 
 // Store persists runtime chains to <data-dir>/chains.yaml with atomic rewrites.
 type Store struct {
-	mu   sync.Mutex // serializes snapshots and writes for this Store instance
-	path string
+	mu      sync.Mutex // serializes snapshots and writes for this Store instance
+	path    string
+	dormant map[string]fileChain // records not currently accepted by the router
+	loadErr error                // prevents writes after an unprotected load failure
 }
 
 func New(dataDir string) *Store {
 	return &Store{path: filepath.Join(dataDir, "chains.yaml")}
 }
 
-// Load reads runtime chains and applies them to the router.
-// Conflicts with existing (config-defined) chains are skipped with a warning.
+// Load reads runtime chains and applies them to the router. Invalid chains stay
+// dormant in the store so later writes cannot erase temporarily unavailable
+// providers. Existing (config-defined) chains take precedence over file records.
+// Malformed files are moved aside before writes are allowed; other load failures
+// block persistence until a successful reload protects the original data.
 func (s *Store) Load(r *router.Router) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			s.loadErr = nil
 			return nil
 		}
-		return fmt.Errorf("read chains: %w", err)
+		s.loadErr = fmt.Errorf("read chains: %w", err)
+		return s.loadErr
 	}
 	var f fileFormat
 	if err := yaml.Unmarshal(data, &f); err != nil {
-		return fmt.Errorf("parse chains.yaml: %w", err)
+		backup, backupErr := s.backupCorrupt()
+		if backupErr != nil {
+			s.loadErr = fmt.Errorf("parse chains.yaml: %w; preserve original: %w", err, backupErr)
+			return s.loadErr
+		}
+		s.loadErr = nil
+		return fmt.Errorf("parse chains.yaml: %w (original preserved at %s)", err, backup)
 	}
+	s.loadErr = nil
+	existing := make(map[string]bool)
+	for _, name := range r.ChainNames() {
+		existing[name] = true
+	}
+	dormant := make(map[string]fileChain)
 	for _, ch := range f.Chains {
+		if existing[ch.Name] {
+			fmt.Printf("chains: skipping %q from chains.yaml: chain already exists\n", ch.Name)
+			continue
+		}
 		steps := make([]router.Step, 0, len(ch.Steps))
 		for _, st := range ch.Steps {
 			steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model, Params: st.Params})
 		}
 		if err := r.AddChain(ch.Name, steps); err != nil {
-			fmt.Printf("chains: skipping %q from chains.yaml: %v\n", ch.Name, err)
+			dormant[ch.Name] = ch
+			fmt.Printf("chains: keeping %q dormant from chains.yaml: %v\n", ch.Name, err)
+			continue
 		}
+		existing[ch.Name] = true
+		delete(dormant, ch.Name)
 	}
+	s.dormant = dormant
 	return nil
 }
 
-// Save writes the current runtime chains atomically (tmp file + rename).
+// backupCorrupt reserves a unique name before moving the original, so an older
+// backup is never overwritten. Store.mu must be held by the caller.
+func (s *Store) backupCorrupt() (string, error) {
+	pattern := filepath.Base(s.path) + ".corrupt-" + time.Now().UTC().Format("20060102T150405.000000000Z") + "-*"
+	backup, err := os.CreateTemp(filepath.Dir(s.path), pattern)
+	if err != nil {
+		return "", fmt.Errorf("reserve corrupt backup: %w", err)
+	}
+	name := backup.Name()
+	if err := backup.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("close corrupt backup: %w", err)
+	}
+	if err := os.Rename(s.path, name); err != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("move corrupt chains to %s: %w", name, err)
+	}
+	return name, nil
+}
+
+// Save writes runtime and dormant chains atomically (tmp file + rename).
 func (s *Store) Save(r *router.Router) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,8 +144,16 @@ func (s *Store) RemoveChain(r *router.Router, name string) error {
 }
 
 func (s *Store) persist(runtime map[string][]router.Step) error {
+	if s.loadErr != nil {
+		return fmt.Errorf("%w: writes blocked until chains reload succeeds: %w", ErrPersistence, s.loadErr)
+	}
 	if err := s.writeSnapshot(runtime); err != nil {
 		return fmt.Errorf("%w: %w", ErrPersistence, err)
+	}
+	// A successfully persisted runtime chain replaces a dormant record with the
+	// same name. Retire it only after the write succeeds so failures lose nothing.
+	for name := range runtime {
+		delete(s.dormant, name)
 	}
 	return nil
 }
@@ -102,17 +161,24 @@ func (s *Store) persist(runtime map[string][]router.Step) error {
 // writeSnapshot requires Store.mu. Its input is an isolated candidate or a
 // committed router snapshot; it must not acquire any router lock.
 func (s *Store) writeSnapshot(runtime map[string][]router.Step) error {
-	f := fileFormat{Version: 2, Chains: make([]fileChain, 0, len(runtime))}
-	names := make([]string, 0, len(runtime))
-	for name := range runtime {
+	f := fileFormat{Version: 2, Chains: make([]fileChain, 0, len(runtime)+len(s.dormant))}
+	names := make([]string, 0, len(runtime)+len(s.dormant))
+	for name := range s.dormant {
 		names = append(names, name)
+	}
+	for name := range runtime {
+		if _, dormant := s.dormant[name]; !dormant {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		steps := runtime[name]
-		ch := fileChain{Name: name, Steps: make([]fileStep, 0, len(steps))}
-		for _, st := range steps {
-			ch.Steps = append(ch.Steps, fileStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
+		ch := s.dormant[name]
+		if steps, active := runtime[name]; active {
+			ch = fileChain{Name: name, Steps: make([]fileStep, 0, len(steps))}
+			for _, st := range steps {
+				ch.Steps = append(ch.Steps, fileStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
+			}
 		}
 		f.Chains = append(f.Chains, ch)
 	}
