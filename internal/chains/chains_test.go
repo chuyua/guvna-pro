@@ -2,8 +2,10 @@ package chains
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/creamy-ghost/guvna/internal/config"
@@ -276,5 +278,187 @@ func TestInvalidChainRecordSurvivesSave(t *testing.T) {
 	ch, exists := storedChains(t, dir)["invalid-model"]
 	if !exists || len(ch.Steps) != 1 || ch.Steps[0].Provider != "groq" || ch.Steps[0].Model != "" {
 		t.Fatalf("invalid record was erased: %+v", ch)
+	}
+}
+
+func TestCorruptFilePreservedBeforeWrites(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	r := newRouter()
+	if err := r.AddChain("existing", []router.Step{{Provider: "groq", Model: "old"}}); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("# keep this exact broken document\nchains: [\n")
+	if err := os.WriteFile(s.path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loadErr := s.Load(r)
+	if loadErr == nil {
+		t.Fatal("malformed file should report a parse error")
+	}
+	backups, err := filepath.Glob(s.path + ".corrupt-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("corrupt backups = %v, err = %v", backups, err)
+	}
+	if !strings.Contains(loadErr.Error(), backups[0]) {
+		t.Fatalf("load error does not identify backup: %v", loadErr)
+	}
+	if _, err := os.Stat(s.path); !os.IsNotExist(err) {
+		t.Fatalf("original path should be freed only after backup: %v", err)
+	}
+	if _, _, err := r.Resolve("from-config"); err != nil {
+		t.Fatalf("config chain unavailable after parse failure: %v", err)
+	}
+	operations := []func() error{
+		func() error { return s.Save(r) },
+		func() error { return s.AddChain(r, "added", []router.Step{{Provider: "gemini", Model: "new"}}) },
+		func() error { return s.RemoveChain(r, "existing") },
+	}
+	for i, operation := range operations {
+		if err := operation(); err != nil {
+			t.Fatalf("operation %d after backup: %v", i, err)
+		}
+		storedChains(t, dir)
+		got, err := os.ReadFile(backups[0])
+		if err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("operation %d changed backup: %q, err = %v", i, got, err)
+		}
+	}
+	if _, exists := storedChains(t, dir)["added"]; !exists {
+		t.Fatal("new chain missing after corrupt file recovery")
+	}
+}
+
+func TestCorruptBackupsAreIndependent(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	r := newRouter()
+	existing := s.path + ".corrupt-existing"
+	if err := os.WriteFile(existing, []byte("older backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, original := range []string{"chains: [\n", "chains: {\n"} {
+		if err := os.WriteFile(s.path, []byte(original), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Load(r); err == nil {
+			t.Fatal("malformed file should report a parse error")
+		}
+		if err := s.Load(r); err != nil {
+			t.Fatalf("reloading after quarantine: %v", err)
+		}
+	}
+	backups, err := filepath.Glob(s.path + ".corrupt-*")
+	if err != nil || len(backups) != 3 {
+		t.Fatalf("backups = %v, err = %v", backups, err)
+	}
+	want := map[string]bool{"older backup": false, "chains: [\n": false, "chains: {\n": false}
+	for _, backup := range backups {
+		data, err := os.ReadFile(backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := want[string(data)]; !exists {
+			t.Fatalf("unexpected backup content: %q", data)
+		}
+		want[string(data)] = true
+	}
+	for data, found := range want {
+		if !found {
+			t.Fatalf("backup content lost: %q", data)
+		}
+	}
+}
+
+func TestLoadFailuresBlockWritesUntilRecovery(t *testing.T) {
+	for _, failure := range []string{"read", "backup"} {
+		t.Run(failure, func(t *testing.T) {
+			dir := t.TempDir()
+			s := New(dir)
+			r := newRouter()
+			if err := r.AddChain("existing", []router.Step{{Provider: "groq", Model: "old"}}); err != nil {
+				t.Fatal(err)
+			}
+			var original []byte
+			if failure == "read" {
+				if err := os.Mkdir(s.path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				// The source component is legal, but appending the backup suffix
+				// exceeds the filesystem component limit without permission tricks.
+				s.path = filepath.Join(dir, strings.Repeat("c", 240))
+				original = []byte("chains: [\n")
+				if err := os.WriteFile(s.path, original, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Load(r); err == nil {
+				t.Fatal("load failure not reported")
+			}
+			operations := []func() error{
+				func() error { return s.Save(r) },
+				func() error { return s.AddChain(r, "blocked", []router.Step{{Provider: "gemini", Model: "new"}}) },
+				func() error { return s.RemoveChain(r, "existing") },
+			}
+			for i, operation := range operations {
+				if err := operation(); !errors.Is(err, ErrPersistence) {
+					t.Fatalf("operation %d should be blocked by load failure: %v", i, err)
+				}
+			}
+			if _, _, err := r.Resolve("blocked"); err == nil {
+				t.Fatal("failed persistence published a new chain")
+			}
+			if _, _, err := r.Resolve("existing"); err != nil {
+				t.Fatalf("failed persistence removed an existing chain: %v", err)
+			}
+			if failure == "backup" {
+				got, err := os.ReadFile(s.path)
+				if err != nil || !bytes.Equal(got, original) {
+					t.Fatalf("backup failure changed original: %q, err = %v", got, err)
+				}
+			}
+			if err := os.Remove(s.path); err != nil {
+				t.Fatal(err)
+			}
+			// Restore a normal path and valid file, then explicitly reload.
+			s.path = filepath.Join(dir, "chains.yaml")
+			if err := os.WriteFile(s.path, []byte("chains: []\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Load(r); err != nil {
+				t.Fatalf("successful reload: %v", err)
+			}
+			if err := s.AddChain(r, "recovered", []router.Step{{Provider: "gemini", Model: "new"}}); err != nil {
+				t.Fatalf("writes remained blocked after successful reload: %v", err)
+			}
+		})
+	}
+}
+
+func TestCorruptReloadPreservesKnownDormantChains(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	r := newRouter()
+	if err := os.WriteFile(s.path, []byte("chains:\n  - name: dormant\n    steps:\n      - provider: unavailable\n        model: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Load(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path, []byte("chains: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Load(r); err == nil {
+		t.Fatal("malformed reload should report a parse error")
+	}
+	if err := s.Load(r); err != nil {
+		t.Fatalf("reload after corrupt backup: %v", err)
+	}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := storedChains(t, dir)["dormant"]; !exists {
+		t.Fatal("corrupt reload discarded previously preserved dormant chain")
 	}
 }

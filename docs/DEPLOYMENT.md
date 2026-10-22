@@ -131,6 +131,14 @@ guvna chains rm myfree
 
 Chat with a chain name as the model, or bypass chains entirely with a provider-prefixed model (`groq/llama-3.3-70b-versatile`). Unknown model → 404 with a pointer to the local chain command.
 
+If `chains.yaml` cannot be parsed, startup preserves it as a uniquely named
+`chains.yaml.corrupt-<UTC timestamp>-<suffix>` backup and logs the parse error and
+backup path. The gateway continues with config-defined chains. Runtime-chain
+writes can then create a fresh `chains.yaml`; restore or repair records from the
+backup first if you need them. If reading the file or creating the backup fails,
+runtime-chain changes are rejected and the original file is left untouched. Fix
+or restore the file and restart the gateway to resume chain management.
+
 ## Observability
 
 ```sh
