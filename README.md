@@ -2,20 +2,20 @@
 
 Low-resource AI gateway in Go. One OpenAI-compatible endpoint that routes to free-tier LLM providers through named, self-healing chains — built for one user, runs in ~15–40MB of RAM.
 
-[![CI](https://github.com/creamy-ghost/guvna/actions/workflows/ci.yml/badge.svg)](https://github.com/creamy-ghost/guvna/actions/workflows/ci.yml)
+[![CI](https://github.com/chuyua/guvna-pro/actions/workflows/ci.yml/badge.svg)](https://github.com/chuyua/guvna-pro/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Why
 
 Most LLM API gateways sit at two extremes. Either they're TypeScript bloat — a Node service eating hundreds of MB of RAM to do what is fundamentally forwarding HTTP — or they're enterprise-grade platforms built for teams: multi-tenant, database-backed, dashboard-first, ops-budget-required.
 
-Guvna takes neither horn: **config-as-code, no database, one static binary** (~16MB, distroless image ~13MB) that runs in ~15–40MB of RAM and is sized for exactly one user.
+Guvna uses **config-as-code, SQLite telemetry and one static binary** for serving and management, sized for exactly one user.
 
 - **Chain-based routing** — define ordered provider/model fallback steps per use case (`mychain` → bazaarlink qwen → groq llama → mistral codestral). Clients call chain names; real provider model names never leak into your apps.
 - **Key pools** — per-provider rotation (round-robin / least-used / sequential) with class-based quarantine (auth / rate-limit / transient) and automatic failover. One dead key never burns the pool.
 - **Provider-prefixed passthrough** — call any catalog model directly as `<provider>/<model>` when you don't need a chain.
 - **Self-healing** — unhealthy providers cool off (60s → 10min, auto-recovery); chains fail over across steps; no silent mid-stream restarts.
-- **Remote CLI** — `guvna-cli status|logs|chains` against the gateway's HTTPS endpoint, from anywhere.
+- **Remote CLI** — `guvna status|logs|chains` against the gateway's HTTPS endpoint, from anywhere.
 - **CLI-only management** — no browser login, OAuth flow, web sessions or separate UI service. The CLI uses your configured gateway admin key.
 - **Observability** — async SQLite telemetry (requests, tokens, serving key), `/admin/status` + `/admin/logs`.
 - **Free-tier native** — ships with configs for Bazaarlink, Groq, Mistral, Gemini, OrcaRouter free tiers.
@@ -23,7 +23,7 @@ Guvna takes neither horn: **config-as-code, no database, one static binary** (~1
 ## Quickstart
 
 ```sh
-git clone https://github.com/creamy-ghost/guvna && cd guvna
+git clone https://github.com/chuyua/guvna-pro && cd guvna-pro
 cp .env.example .env        # fill in ADMIN_KEY, API_KEYS, and at least one provider key
 docker compose -f deploy/docker-compose.yml up -d
 ```
@@ -32,12 +32,16 @@ Or without Docker:
 
 ```sh
 go build -o guvna ./cmd/guvna
-go build -o guvna-cli ./cmd/guvna-cli
 set -a; source .env; set +a
-./guvna -config config.yaml        # listens on :20128 (all interfaces)
+./guvna serve -config config.yaml  # listens on :20128 (all interfaces)
 ```
 
-Tagged releases also publish an image to `ghcr.io/creamy-ghost/guvna`.
+Tagged releases publish the Linux amd64 executable `guvna` and `SHA256SUMS` to
+[GitHub Releases](https://github.com/chuyua/guvna-pro/releases), plus the existing
+amd64/arm64 image to `ghcr.io/chuyua/guvna-pro`. See [docs/CLI.md](docs/CLI.md)
+for download verification. `guvna --version` reports the release tag; source
+builds report `dev` unless a version is injected. Existing `guvna -config ...`
+service invocations remain supported.
 
 ### First request
 
@@ -62,12 +66,17 @@ Manage the gateway from another terminal, locally or remotely:
 
 ```sh
 export GUVNA_URL=http://127.0.0.1:20128 GUVNA_ADMIN_KEY="$ADMIN_KEY"
-./guvna-cli chains list
-./guvna-cli status
-./guvna-cli logs -n 100
+./guvna chains list
+./guvna status
+./guvna logs -n 100
 ```
 
-The API gateway must keep running; CLI-only management does not remove its HTTP API. For remote use, set `GUVNA_URL` to your gateway's HTTPS endpoint. See [docs/CLI.md](docs/CLI.md) for source builds, Windows commands, credentials and chain management. No separate port 20129 service is provided.
+The API gateway must keep running. Management commands invoke the same executable
+in a second process and use its existing HTTP API; combining the commands does
+not imply a reduction in the gateway's memory use. For remote use, set
+`GUVNA_URL` to your gateway's HTTPS endpoint. See [docs/CLI.md](docs/CLI.md) for
+installation, source builds, credentials and chain management. No separate port
+20129 service is provided.
 
 ## Configuration
 

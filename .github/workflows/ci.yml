@@ -26,3 +26,13 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Build and smoke test single binary
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags="-X main.version=ci" -o "$RUNNER_TEMP/guvna" ./cmd/guvna
+          "$RUNNER_TEMP/guvna" --help
+          "$RUNNER_TEMP/guvna" serve --help
+          test "$("$RUNNER_TEMP/guvna" --version)" = "guvna ci"

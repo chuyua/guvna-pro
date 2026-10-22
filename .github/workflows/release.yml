@@ -1,4 +1,4 @@
-name: Release image
+name: Release
 
 on:
   push:
@@ -13,7 +13,50 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  binary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build Linux amd64 binary
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" -o dist/guvna ./cmd/guvna
+
+      - name: Verify binary and checksum
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          ./dist/guvna --help
+          ./dist/guvna serve --help
+          test "$(./dist/guvna --version)" = "guvna ${VERSION}"
+          cd dist
+          sha256sum guvna > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Publish binary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
+            --verify-tag --generate-notes --title "$VERSION"
+
   image:
+    needs: binary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,5 +86,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

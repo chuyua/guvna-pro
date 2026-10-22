@@ -22,7 +22,7 @@ any OpenAI-compatible client
         │ 50+ providers  │
         └────────────────┘
 
-Management:         guvna-cli status / logs / chains (local + remote over gateway)
+Management:         guvna status / logs / chains (local + remote over gateway)
 
 * planned — see ROADMAP Phase 6; everything unmarked is shipped.
 ```
@@ -40,7 +40,9 @@ Management:         guvna-cli status / logs / chains (local + remote over gatewa
 - Provider adaptors: small per-provider interface (`Chat(ctx, body) (*http.Response, error)`), pattern from new-api's `relay_adaptor.go`. Two types built: `openai` (base + `/v1/chat/completions`) and `gemini` (base + `/v1beta/openai` + chat path — Gemini's official OpenAI-compat endpoint, passthrough no translation). Outbound requests carry `User-Agent: guvna/0.1` (bazaarlink throttles UA-less requests).
 - Auth: Bearer admin key (`ADMIN_KEY`) or client key (`API_KEYS`), always on; `/healthz` unauthenticated
 - Telemetry: in-memory event buffer, async batch flush to SQLite every 30s (pure-Go driver, no CGO); hot path never touches disk; crash loses <30s
-- Single gateway process, one API port. Management uses the separate CLI binary against that same API.
+- Single gateway process, one API port. `guvna serve` starts the gateway;
+  management invokes the same executable in a separate process against that API.
+  Legacy service invocations such as `guvna -config ...` remain supported.
 
 ### 2. Compression pipeline (planned — ROADMAP Phase 6, not built)
 Decision precedence when built (adapted from OmniRoute): per-request header (`x-guvna-compression`) → named profile → adaptive → config default → off. Cache-aware compression is always on (never touch already-cached prefixes).
@@ -68,6 +70,9 @@ v2 (not in v1): LLMLingua-2 (ONNX MobileBERT, heavy — separate process or side
 
 ### 6. Operator interface
 - CLI-only: status, logs and runtime chains use the gateway's existing authenticated HTTP API
+- One executable provides serving and management commands; release assets are
+  Linux amd64 `guvna` plus SHA-256 checksums. The combined entrypoint simplifies
+  distribution without changing the service's memory-use guarantees.
 - No UI binary, web assets, login page or additional management listener
 - The CLI defaults to `http://127.0.0.1:20128`; the gateway itself listens on `:20128` (all interfaces), so deployment network access must be configured separately
 - See [CLI.md](CLI.md) for commands and [DEPLOYMENT.md](DEPLOYMENT.md) for exposure

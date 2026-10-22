@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
@@ -42,34 +41,19 @@ func cliTestGateway(t *testing.T) (*httptest.Server, <-chan recordedCLIRequest) 
 	return s, requests
 }
 
-func captureCLIOutput(t *testing.T, command func() error) (string, error) {
+func captureCLIOutput(t *testing.T, run func(command) error) (string, error) {
 	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	saved := os.Stdout
-	os.Stdout = w
-	defer func() {
-		os.Stdout = saved
-		w.Close()
-		r.Close()
-	}()
-	err = command()
-	w.Close()
-	output, readErr := io.ReadAll(r)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	return string(output), err
+	var output bytes.Buffer
+	err := run(command{out: &output, errOut: io.Discard})
+	return output.String(), err
 }
 
 func TestChainsExplicitListUsesFlags(t *testing.T) {
 	s, requests := cliTestGateway(t)
 	t.Setenv("GUVNA_URL", s.URL)
 	t.Setenv("GUVNA_ADMIN_KEY", "environment-token")
-	output, err := captureCLIOutput(t, func() error {
-		return chainsCmd([]string{"list", "--url", s.URL, "--token", "flag-token", "--json"})
+	output, err := captureCLIOutput(t, func(c command) error {
+		return c.chainsCmd([]string{"list", "--url", s.URL, "--token", "flag-token", "--json"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +83,7 @@ func TestChainsMutationTrailingJSONFlag(t *testing.T) {
 				args = append(args, "--step", "a:one", "--step", "b:two")
 			}
 			args = append(args, "--json")
-			output, err := captureCLIOutput(t, func() error { return chainsCmd(args) })
+			output, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -140,7 +124,7 @@ func TestChainsInvalidFlagsDoNotSendRequests(t *testing.T) {
 			s, requests := cliTestGateway(t)
 			t.Setenv("GUVNA_URL", s.URL)
 			t.Setenv("GUVNA_ADMIN_KEY", "private-environment-token")
-			_, err := captureCLIOutput(t, func() error { return chainsCmd(args) })
+			_, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
 			if err == nil {
 				t.Fatal("invalid arguments were accepted")
 			}
@@ -167,7 +151,7 @@ func TestChainsFlagsBeforeNameAndEqualsValues(t *testing.T) {
 			s, requests := cliTestGateway(t)
 			t.Setenv("GUVNA_URL", s.URL)
 			t.Setenv("GUVNA_ADMIN_KEY", "dummy-token")
-			_, err := captureCLIOutput(t, func() error { return chainsCmd(args) })
+			_, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -191,8 +175,8 @@ func TestChainsDefaultListAcceptsFlags(t *testing.T) {
 	s, requests := cliTestGateway(t)
 	t.Setenv("GUVNA_URL", "http://unused.invalid")
 	t.Setenv("GUVNA_ADMIN_KEY", "unused-token")
-	output, err := captureCLIOutput(t, func() error {
-		return chainsCmd([]string{"--url=" + s.URL, "--token=-flag-token", "--json"})
+	output, err := captureCLIOutput(t, func(c command) error {
+		return c.chainsCmd([]string{"--url=" + s.URL, "--token=-flag-token", "--json"})
 	})
 	if err != nil || !json.Valid([]byte(output)) {
 		t.Fatalf("implicit list failed: output=%q err=%v", output, err)

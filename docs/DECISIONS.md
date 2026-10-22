@@ -197,3 +197,22 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 **Context:** The project owner wants command-line operation without a browser login or an additional web-management entry point.
 
 **Rationale:** The CLI already covers the required management operations and authenticates directly with the configured gateway admin key. Keeping one authenticated API avoids maintaining a second listener and web-session scheme. `ADMIN_KEY`, `API_KEYS` and provider keys remain user-configured credentials; no browser OAuth or external login account is required. This scope decision does not replace a security audit or remove the gateway's HTTP API.
+
+## 2026-10-22 — One executable for serving and management
+
+**Decision:** Distribute one Linux amd64 executable, `guvna`, plus SHA-256
+checksums. `guvna serve` starts the gateway; `guvna status`, `logs` and `chains`
+manage a running instance through its existing API. The earlier `guvna-cli`
+executable is superseded. Preserve legacy service invocation without `serve`,
+including `-config`, `-data` and `--healthcheck`. Docker uses the same command
+implementation and retains its existing image platforms.
+
+**Context:** Issue #10 was narrowed from two binaries to one for the project's
+single-user deployment model. Versioned tag releases should work without
+compiling on a small server.
+
+**Rationale:** A shared executable simplifies downloads, updates and command
+discovery. Management still runs as a separate process talking to the existing
+authenticated API; no listener, web service or dependency is added. This is a
+distribution decision, not a claim that the gateway will use significantly less
+memory. Standalone Windows/Arch artifacts and benchmark gates are out of scope.

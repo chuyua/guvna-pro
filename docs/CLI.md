@@ -1,6 +1,32 @@
 # CLI management
 
-Guvna is managed with `guvna-cli`; there is no browser login, OAuth flow or separate UI service on port 20129. The CLI talks to the running `guvna` HTTP API, normally on port 20128. OpenAI-compatible applications use that same API for inference.
+One `guvna` executable starts the gateway with `serve` and manages it with
+`status`, `logs` and `chains`. Management commands run in a second process and
+talk to the running gateway's HTTP API, normally on port 20128. There is no
+browser login, OAuth flow or separate UI service on port 20129. OpenAI-compatible
+applications use that same API for inference.
+
+## Install the Linux amd64 release
+
+The only standalone release target is Linux amd64. Download the executable and
+its checksum manifest into the same directory:
+
+```sh
+curl -fLO https://github.com/chuyua/guvna-pro/releases/latest/download/guvna
+curl -fLO https://github.com/chuyua/guvna-pro/releases/latest/download/SHA256SUMS
+sha256sum --check SHA256SUMS
+chmod +x guvna
+./guvna --version
+```
+
+Use `releases/download/<tag>/...` instead of `releases/latest/download/...` to
+pin a release. The version output is `guvna <tag>`. Release assets do not include
+a separate `guvna-cli`, Windows executable or Arch package. The existing Docker
+image remains available for amd64/arm64 and contains the same command surface.
+
+The executable download does not include configuration or credentials. Obtain
+`config.yaml` and `.env.example` from the matching tag's source archive, create
+your private `.env`, and follow the startup section below.
 
 ## Build from the current checkout
 
@@ -8,17 +34,21 @@ Run these commands at the repository root on Linux or macOS:
 
 ```sh
 go build -o guvna ./cmd/guvna
-go build -o guvna-cli ./cmd/guvna-cli
 ```
 
 PowerShell on Windows:
 
 ```powershell
 go build -o guvna.exe ./cmd/guvna
-go build -o guvna-cli.exe ./cmd/guvna-cli
 ```
 
-The examples below use `./guvna-cli`. In PowerShell use `.\guvna-cli.exe` with the same arguments.
+These are source builds, not additional release targets. They report `guvna dev`
+by default. A versioned build uses, for example,
+`go build -ldflags="-X main.version=v1.0.0" -o guvna ./cmd/guvna`.
+
+The examples below use `./guvna`. In PowerShell use `.\guvna.exe` with the same
+arguments. `./guvna --help` and `./guvna --version` do not require a config or
+credentials and do not start the gateway.
 
 ## Credentials and startup
 
@@ -32,7 +62,7 @@ After creating a private `.env` from `.env.example`, a POSIX shell can start the
 
 ```sh
 set -a; source .env; set +a
-./guvna -config config.yaml
+./guvna serve -config config.yaml
 ```
 
 In PowerShell, set the required environment variables in the process or load them through your service manager, then start the gateway:
@@ -41,8 +71,14 @@ In PowerShell, set the required environment variables in the process or load the
 $env:ADMIN_KEY = '<your-gateway-admin-key>'
 $env:API_KEYS = '<your-gateway-client-key>'
 # Also set the provider key environment variables named in config.yaml.
-.\guvna.exe -config config.yaml
+.\guvna.exe serve -config config.yaml
 ```
+
+Existing service invocations without `serve`, including `guvna -config ...`
+and `guvna -data ...`, remain supported. Running `guvna` with no arguments also
+starts the gateway with its existing defaults. `guvna --healthcheck -config ...`
+still probes the running gateway's `/healthz`; it does not start a service or
+call a model. Use `guvna serve --help` for service flags.
 
 Leave the gateway running. In a second terminal, set the CLI destination and its admin credential. If that terminal has already loaded the gateway environment:
 
@@ -63,10 +99,10 @@ The CLI's loopback default is a destination, not a server bind restriction. The 
 ## Status and logs
 
 ```sh
-./guvna-cli status
-./guvna-cli status --json
-./guvna-cli logs -n 100
-./guvna-cli logs -n 100 --json
+./guvna status
+./guvna status --json
+./guvna logs -n 100
+./guvna logs -n 100 --json
 ```
 
 Status shows telemetry queue/in-flight lengths, dropped events, successful and
@@ -83,10 +119,10 @@ requirements. The default route continues to use the decider.
 ## Runtime chains
 
 ```sh
-./guvna-cli chains list
-./guvna-cli chains list --json
-./guvna-cli chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
-./guvna-cli chains rm myfree
+./guvna chains list
+./guvna chains list --json
+./guvna chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
+./guvna chains rm myfree
 ```
 
 Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. Removing a config-defined chain is refused: edit its YAML configuration instead. The CLI does not currently express per-step `params`; use the JSON API when those are needed.
@@ -94,8 +130,10 @@ Each step is `provider:model`; provider names must exist in the gateway configur
 `--url URL` and `--token KEY` override the environment for an individual command. Prefer the environment for the token so it is not written into shell history. `--json` emits raw JSON for status, logs, chain lists and chain creation. For example:
 
 ```sh
-./guvna-cli status --url https://your-gateway.example.com --json
-./guvna-cli chains add myfree --step groq:llama-3.3-70b-versatile --json
+./guvna status --url https://your-gateway.example.com --json
+./guvna chains add myfree --step groq:llama-3.3-70b-versatile --json
 ```
 
-Run `./guvna-cli help` for the command summary. There is no `login` or `connect` subcommand in the current CLI.
+Run `./guvna help` for the command summary. There is no `login` or `connect`
+subcommand. A single executable simplifies installation and updates; it does not
+promise a significant reduction in the gateway's memory use.

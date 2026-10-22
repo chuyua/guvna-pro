@@ -2,6 +2,10 @@
 
 Build order with definition of done per phase. No time estimates — this is a personal project, build at your own pace. Each phase ends with something working and verifiable.
 
+**Current command names (2026-10-22):** The historical `guvna-cli` commands below
+are now part of the single `guvna` executable: `guvna status`, `guvna logs` and
+`guvna chains`. See [CLI.md](CLI.md). Standalone releases target Linux amd64 only.
+
 **Use-ready cut (2026-08-16):** Guvna is live and usable daily. Gateway runs on the VPS behind caddy (`https://gateway.example.com:9443`), chains self-heal (failure marking + cool-off), and usage/health are visible from the laptop via the remote CLI. Everything below the cut is daily-use; everything after is growth.
 
 ---
@@ -79,7 +83,7 @@ Build order with definition of done per phase. No time estimates — this is a p
 
 ## Phase 7 — Web UI (cancelled 2026-10-21)
 
-The former optional UI direction is superseded by CLI-only management. Its binary, browser login, web assets and deployment service have been removed. Status, logs and chain management remain available through `guvna-cli` over the existing gateway API. See [CLI.md](CLI.md) and the 2026-10-21 entry in [DECISIONS.md](DECISIONS.md).
+The former optional UI direction is superseded by CLI-only management. Its binary, browser login, web assets and deployment service have been removed. Status, logs and chain management remain available through `guvna` over the existing gateway API. See [CLI.md](CLI.md) and the 2026-10-21 entry in [DECISIONS.md](DECISIONS.md).
 
 ## Phase 8 — Arch local install
 
@@ -89,11 +93,11 @@ The former optional UI direction is superseded by CLI-only management. Its binar
 
 ## Phase 9 — Hardening + release
 
-- Bench harness vs litellm / OmniRoute / new-api (req/s, p99, RSS) → BENCHMARKS.md
-- Tests: routing, streaming, compression, auth
-- Docs: usage, config reference, deploy guide
-- Release: versioned builds, checksums, container image
-- **Done when:** clean test run + a documented release cut + benchmark numbers published
+- One executable: `guvna serve`, `status`, `logs`, `chains`, `--help` and `--version`, with legacy service flags preserved
+- Tests: command dispatch, old startup parameters, management API authentication and JSON output using local mocks, plus existing gateway regressions
+- Docs: installation, checksum verification, command usage and deployment
+- Release: Linux amd64 `guvna` and `SHA256SUMS`; tag version embedded in the binary; existing container image publication retained
+- **Done when:** clean test run, version/help smoke checks and checksum validation pass, and a new tag publishes the documented artifacts. Benchmarks do not block this release.
 
 ## Phase 10 — v2 backlog
 

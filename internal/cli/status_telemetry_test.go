@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"encoding/json"
@@ -15,7 +15,7 @@ func TestStatusPreservesJSONAndDisplaysTelemetryFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	args := []string{"--url", server.URL, "--token", "dummy"}
-	output, err := captureCLIOutput(t, func() error { return statusCmd(append(args, "--json")) })
+	output, err := captureCLIOutput(t, func(c command) error { return c.statusCmd(append(args, "--json")) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestStatusPreservesJSONAndDisplaysTelemetryFailure(t *testing.T) {
 			t.Fatalf("field %s lost from JSON", field)
 		}
 	}
-	output, err = captureCLIOutput(t, func() error { return statusCmd(args) })
+	output, err = captureCLIOutput(t, func(c command) error { return c.statusCmd(args) })
 	if err != nil {
 		t.Fatal(err)
 	}

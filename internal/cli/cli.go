@@ -1,19 +1,18 @@
-// guvna-cli — local and remote status, logs, and chain management for a
+// guvna — local and remote status, logs, and chain management for a
 // Guvna gateway. Local: talks to http://127.0.0.1:20128 (or GUVNA_URL).
 // Remote: point --url at the gateway's HTTPS endpoint (caddy) — the admin
 // key travels as a Bearer token; no new port is exposed.
 //
-//	guvna-cli status [--url URL] [--token KEY]
-//	guvna-cli logs [-n 100] [--url URL] [--token KEY]
-//	guvna-cli chains [list]
-//	guvna-cli chains add NAME --step provider:model [--step ...]
-//	guvna-cli chains rm NAME
-package main
+//	guvna status [--url URL] [--token KEY]
+//	guvna logs [-n 100] [--url URL] [--token KEY]
+//	guvna chains [list]
+//	guvna chains add NAME --step provider:model [--step ...]
+//	guvna chains rm NAME
+package cli
 
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,50 +24,43 @@ import (
 
 const defaultURL = "http://127.0.0.1:20128"
 
-func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+// Run executes a management command against an already-running gateway.
+// It never starts a server or exits the process.
+func Run(args []string, stdout, stderr io.Writer) error {
+	if stdout == nil {
+		stdout = io.Discard
 	}
-	var err error
-	switch os.Args[1] {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	c := command{out: stdout, errOut: stderr}
+	if len(args) == 0 {
+		return fmt.Errorf("management command required (want status|logs|chains)")
+	}
+	switch args[0] {
 	case "status":
-		err = statusCmd(os.Args[2:])
+		return c.statusCmd(args[1:])
 	case "logs":
-		err = logsCmd(os.Args[2:])
+		return c.logsCmd(args[1:])
 	case "chains":
-		err = chainsCmd(os.Args[2:])
-	case "help", "-h", "--help":
-		usage()
-		return
+		return c.chainsCmd(args[1:])
 	default:
-		usage()
-		os.Exit(1)
-	}
-	if errors.Is(err, flag.ErrHelp) {
-		return
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "guvna-cli: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("unknown management command %q (want status|logs|chains)", args[0])
 	}
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `guvna-cli — gateway status, logs, chain management
+type command struct {
+	out    io.Writer
+	errOut io.Writer
+}
 
-usage:
-  guvna-cli status [flags]
-  guvna-cli logs [-n lines] [flags]
-  guvna-cli chains [list] [flags]
-  guvna-cli chains add NAME --step provider:model [--step ...] [flags]
-  guvna-cli chains rm NAME [flags]
-
-flags:
-  --url    gateway base URL (default: %s or $GUVNA_URL)
-  --token  admin key (default: $GUVNA_ADMIN_KEY)
-  --json   emit raw JSON instead of a table
-`, defaultURL)
+func (c command) parse(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(c.errOut)
+	ordered, err := reorderArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	return fs.Parse(ordered)
 }
 
 type commonFlags struct {
@@ -174,62 +166,72 @@ type providerStat struct {
 	TokensOut int64  `json:"tokens_out"`
 }
 
-func statusCmd(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
+func (c command) statusCmd(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
-	fs.Parse(args)
+	if err := c.parse(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("%s accepts no positional arguments", fs.Name())
+	}
 
 	var raw json.RawMessage
 	if err := cf.get("/admin/status", &raw); err != nil {
 		return err
 	}
 	if cf.json {
-		return printJSON(raw)
+		return c.printJSON(raw)
 	}
 	var st statusResp
 	if err := json.Unmarshal(raw, &st); err != nil {
 		return err
 	}
 
-	fmt.Printf("Guvna %s  (uptime %s)\n", cf.url, st.Uptime)
-	fmt.Printf("chains: %s\n\n", strings.Join(st.Chains, "  "))
+	fmt.Fprintf(c.out, "Guvna %s  (uptime %s)\n", cf.url, st.Uptime)
+	fmt.Fprintf(c.out, "chains: %s\n\n", strings.Join(st.Chains, "  "))
 
-	fmt.Printf("%-12s %-28s %8s  %s\n", "PROVIDER", "MODEL", "FAILURES", "STATE")
+	fmt.Fprintf(c.out, "%-12s %-28s %8s  %s\n", "PROVIDER", "MODEL", "FAILURES", "STATE")
 	for _, s := range st.Steps {
 		state := "ok"
 		if s.Down {
 			state = fmt.Sprintf("DOWN %v", time.Duration(s.DownFor))
 		}
-		fmt.Printf("%-12s %-28s %8d  %s\n", s.Provider, s.Model, s.Failures, state)
+		fmt.Fprintf(c.out, "%-12s %-28s %8d  %s\n", s.Provider, s.Model, s.Failures, state)
 	}
 	if st.StepsDown > 0 {
-		fmt.Printf("\n%d step(s) down — skipped in chains until cool-off expires\n", st.StepsDown)
+		fmt.Fprintf(c.out, "\n%d step(s) down — skipped in chains until cool-off expires\n", st.StepsDown)
 	}
 
-	fmt.Printf("\nUSAGE (persisted)\n")
+	fmt.Fprintf(c.out, "\nUSAGE (persisted)\n")
 	if st.UsageError != "" {
-		fmt.Printf("  unavailable: %s\n", st.UsageError)
+		fmt.Fprintf(c.out, "  unavailable: %s\n", st.UsageError)
 	}
-	fmt.Printf("  requests %d   streams %d   errors %d\n", st.Usage.Requests, st.Usage.Streams, st.Usage.Errors)
-	fmt.Printf("  tokens %d in / %d out\n", st.Usage.TokensIn, st.Usage.TokensOut)
+	fmt.Fprintf(c.out, "  requests %d   streams %d   errors %d\n", st.Usage.Requests, st.Usage.Streams, st.Usage.Errors)
+	fmt.Fprintf(c.out, "  tokens %d in / %d out\n", st.Usage.TokensIn, st.Usage.TokensOut)
 	if len(st.Usage.ByProvider) > 0 {
-		fmt.Printf("\n  %-12s %8s %8s %12s %12s\n", "PROVIDER", "REQUESTS", "ERRORS", "TOKENS IN", "TOKENS OUT")
+		fmt.Fprintf(c.out, "\n  %-12s %8s %8s %12s %12s\n", "PROVIDER", "REQUESTS", "ERRORS", "TOKENS IN", "TOKENS OUT")
 		for _, p := range st.Usage.ByProvider {
-			fmt.Printf("  %-12s %8d %8d %12d %12d\n", p.Provider, p.Requests, p.Errors, p.TokensIn, p.TokensOut)
+			fmt.Fprintf(c.out, "  %-12s %8d %8d %12d %12d\n", p.Provider, p.Requests, p.Errors, p.TokensIn, p.TokensOut)
 		}
 	}
-	fmt.Printf("\nTELEMETRY\n  buffer %d   in-flight %d   dropped %d\n", st.Telemetry.BufferLen, st.Telemetry.InflightEvents, st.Telemetry.DroppedEvents)
-	fmt.Printf("  flushes %d ok / %d failed   retained for retry %d\n", st.Telemetry.FlushesOK, st.Telemetry.FlushesFailed, st.Telemetry.RetriedEvents)
+	fmt.Fprintf(c.out, "\nTELEMETRY\n  buffer %d   in-flight %d   dropped %d\n", st.Telemetry.BufferLen, st.Telemetry.InflightEvents, st.Telemetry.DroppedEvents)
+	fmt.Fprintf(c.out, "  flushes %d ok / %d failed   retained for retry %d\n", st.Telemetry.FlushesOK, st.Telemetry.FlushesFailed, st.Telemetry.RetriedEvents)
 	return nil
 }
 
-func logsCmd(args []string) error {
-	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+func (c command) logsCmd(args []string) error {
+	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
 	n := fs.Int("n", 100, "number of lines to fetch (max 512)")
-	fs.Parse(args)
+	if err := c.parse(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("%s accepts no positional arguments", fs.Name())
+	}
 
 	var out struct {
 		Lines []string `json:"lines"`
@@ -238,16 +240,16 @@ func logsCmd(args []string) error {
 		return err
 	}
 	if cf.json {
-		return printJSON(out)
+		return c.printJSON(out)
 	}
 	for _, l := range out.Lines {
-		fmt.Println(l)
+		fmt.Fprintln(c.out, l)
 	}
 	return nil
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func (c command) printJSON(v any) error {
+	enc := json.NewEncoder(c.out)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
@@ -267,31 +269,27 @@ type chainStep struct {
 	Model    string `json:"model"`
 }
 
-func chainsCmd(args []string) error {
+func (c command) chainsCmd(args []string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return chainsListCmd(args)
+		return c.chainsListCmd(args)
 	}
 	switch args[0] {
 	case "list":
-		return chainsListCmd(args[1:])
+		return c.chainsListCmd(args[1:])
 	case "add":
-		return chainsAddCmd(args[1:])
+		return c.chainsAddCmd(args[1:])
 	case "rm", "remove":
-		return chainsRmCmd(args[1:])
+		return c.chainsRmCmd(args[1:])
 	default:
 		return fmt.Errorf("unknown chains subcommand %q (want list|add|rm)", args[0])
 	}
 }
 
-func chainsListCmd(args []string) error {
+func (c command) chainsListCmd(args []string) error {
 	fs := flag.NewFlagSet("chains", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
-	ordered, err := reorderArgs(fs, args)
-	if err != nil {
-		return err
-	}
-	if err := fs.Parse(ordered); err != nil {
+	if err := c.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -303,15 +301,15 @@ func chainsListCmd(args []string) error {
 		return err
 	}
 	if cf.json {
-		return printJSON(out)
+		return c.printJSON(out)
 	}
-	fmt.Printf("%-20s %-8s  %s\n", "NAME", "SOURCE", "STEPS")
-	for _, c := range out.Chains {
-		steps := make([]string, 0, len(c.Steps))
-		for _, s := range c.Steps {
+	fmt.Fprintf(c.out, "%-20s %-8s  %s\n", "NAME", "SOURCE", "STEPS")
+	for _, ch := range out.Chains {
+		steps := make([]string, 0, len(ch.Steps))
+		for _, s := range ch.Steps {
 			steps = append(steps, s.Provider+":"+s.Model)
 		}
-		fmt.Printf("%-20s %-8s  %s\n", c.Name, c.Source, strings.Join(steps, " -> "))
+		fmt.Fprintf(c.out, "%-20s %-8s  %s\n", ch.Name, ch.Source, strings.Join(steps, " -> "))
 	}
 	return nil
 }
@@ -358,7 +356,7 @@ func reorderArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 	return append(append(flags, "--"), pos...), nil
 }
 
-func chainsAddCmd(args []string) error {
+func (c command) chainsAddCmd(args []string) error {
 	var steps []chainStep
 	fs := flag.NewFlagSet("chains add", flag.ContinueOnError)
 	var cf commonFlags
@@ -371,11 +369,7 @@ func chainsAddCmd(args []string) error {
 		steps = append(steps, chainStep{Provider: p, Model: m})
 		return nil
 	})
-	ordered, err := reorderArgs(fs, args)
-	if err != nil {
-		return err
-	}
-	if err := fs.Parse(ordered); err != nil {
+	if err := c.parse(fs, args); err != nil {
 		return err
 	}
 	if len(steps) == 0 {
@@ -391,21 +385,17 @@ func chainsAddCmd(args []string) error {
 		return err
 	}
 	if cf.json {
-		return printJSON(created)
+		return c.printJSON(created)
 	}
-	fmt.Printf("created chain %q (%d steps, persisted)\n", created.Name, len(created.Steps))
+	fmt.Fprintf(c.out, "created chain %q (%d steps, persisted)\n", created.Name, len(created.Steps))
 	return nil
 }
 
-func chainsRmCmd(args []string) error {
+func (c command) chainsRmCmd(args []string) error {
 	fs := flag.NewFlagSet("chains rm", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
-	ordered, err := reorderArgs(fs, args)
-	if err != nil {
-		return err
-	}
-	if err := fs.Parse(ordered); err != nil {
+	if err := c.parse(fs, args); err != nil {
 		return err
 	}
 
@@ -416,6 +406,6 @@ func chainsRmCmd(args []string) error {
 	if err := cf.do(http.MethodDelete, "/v1/chains/"+name, nil, nil); err != nil {
 		return err
 	}
-	fmt.Printf("removed chain %q\n", name)
+	fmt.Fprintf(c.out, "removed chain %q\n", name)
 	return nil
 }
