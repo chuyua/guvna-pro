@@ -34,8 +34,8 @@ func TestResponsesStreamIdleDeadline(t *testing.T) {
 	if time.Since(start) > time.Second || !strings.Contains(w.Body.String(), "event: response.failed\n") || strings.Contains(w.Body.String(), "event: response.completed\n") {
 		t.Fatalf("idle deadline did not fail promptly: %s", w.Body)
 	}
-	if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
-		t.Fatal("idle timeout was not charged exactly once")
+	if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 0 {
+		t.Fatal("idle timeout must affect model health only")
 	}
 }
 

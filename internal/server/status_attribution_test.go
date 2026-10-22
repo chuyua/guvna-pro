@@ -45,8 +45,8 @@ func TestStatusAttributionAcrossRoutes(t *testing.T) {
 		{408, "", false},
 		{422, "", false},
 		{429, keypool.ClassRateLimit, true},
-		{500, keypool.ClassTransient, true},
-		{503, keypool.ClassTransient, true},
+		{500, "", true},
+		{503, "", true},
 	}
 	for _, tc := range admissionRoutes {
 		for _, st := range statuses {
@@ -58,7 +58,7 @@ func TestStatusAttributionAcrossRoutes(t *testing.T) {
 					t.Fatalf("upstream error changed: status=%d body=%s", w.Code, w.Body.String())
 				}
 				attempts := 1
-				if st.keyClass != "" {
+				if st.keyClass != "" || st.status >= 500 {
 					attempts = min(retries+1, 3)
 				}
 				if got := int(calls.Load()); got != attempts {

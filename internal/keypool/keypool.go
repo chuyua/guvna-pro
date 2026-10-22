@@ -21,7 +21,7 @@ type Class string
 const (
 	ClassAuth      Class = "auth"       // 401/403: key dead or quota gone
 	ClassRateLimit Class = "rate_limit" // 429: temporarily rate-limited
-	ClassTransient Class = "transient"  // 5xx / upstream budget failures
+	ClassTransient Class = "transient"  // legacy/manual isolation; service failures are key-neutral
 )
 
 // Strategy selects the next key among healthy ones.
@@ -280,9 +280,9 @@ func (p *Pool) Available(env string) bool {
 
 // ClassFor maps an upstream status or error to a failure class using the
 // shared outcome classifier. Returns "" for non-quarantinable outcomes
-// (caller errors, model incompatibility, local network failures and
-// cancellation): those must never quarantine a healthy key. 5xx keeps the
-// documented transient quarantine; 401/403 quarantine as auth.
+// (caller errors, model incompatibility, service/network failures and
+// cancellation): those must never quarantine a healthy key. Only 401/403 and
+// 429 automatically quarantine a credential.
 func ClassFor(status int, err error) Class {
 	return Class(outcome.KeyClass(outcome.Classify(status, err)))
 }

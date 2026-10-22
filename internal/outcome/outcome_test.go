@@ -47,10 +47,10 @@ func TestClassifyErrors(t *testing.T) {
 }
 
 func TestKeyAndModelMapping(t *testing.T) {
-	if KeyClass(Auth) != "auth" || KeyClass(RateLimit) != "rate_limit" || KeyClass(UpstreamTransient) != "transient" {
-		t.Fatalf("key class mapping wrong: %q/%q/%q", KeyClass(Auth), KeyClass(RateLimit), KeyClass(UpstreamTransient))
+	if KeyClass(Auth) != "auth" || KeyClass(RateLimit) != "rate_limit" {
+		t.Fatalf("key class mapping wrong: %q/%q", KeyClass(Auth), KeyClass(RateLimit))
 	}
-	if KeyClass(LocalNetwork) != "" || KeyClass(ModelIncompatible) != "" || KeyClass(CallerError) != "" || KeyClass(Canceled) != "" {
+	if KeyClass(UpstreamTransient) != "" || KeyClass(LocalNetwork) != "" || KeyClass(ModelIncompatible) != "" || KeyClass(CallerError) != "" || KeyClass(Canceled) != "" {
 		t.Fatal("neutral outcomes must not quarantine a key")
 	}
 	if !ModelFailure(LocalNetwork) || !ModelFailure(UpstreamTransient) || !ModelFailure(RateLimit) {

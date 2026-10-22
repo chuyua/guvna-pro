@@ -17,7 +17,7 @@ import (
 
 const validDeciderBody = `{"choices":[{"message":{"content":"{\"order\":[\"a/m\"]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`
 
-func TestDeciderUpstreamFailuresQuarantineAndRecordKey(t *testing.T) {
+func TestDeciderFailureAttributionAndUsage(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		status    int
@@ -28,12 +28,14 @@ func TestDeciderUpstreamFailuresQuarantineAndRecordKey(t *testing.T) {
 		{"unauthorized", 401, `{"error":"unauthorized"}`, false, keypool.ClassAuth},
 		{"forbidden", 403, `{"error":"forbidden"}`, false, keypool.ClassAuth},
 		{"rate_limited", 429, `{"error":"rate limited"}`, false, keypool.ClassRateLimit},
-		{"server_error", 503, `{"error":"unavailable"}`, false, keypool.ClassTransient},
-		{"invalid_json", 200, `{broken`, false, keypool.ClassTransient},
-		{"invalid_ranking", 200, `{"choices":[{"message":{"content":"not a ranking"}}]}`, false, keypool.ClassTransient},
-		{"unrelated_ranking", 200, validDeciderBody, false, keypool.ClassTransient},
-		{"error_in_2xx", 200, `{"error":"broken","choices":[{"message":{"content":"{\"order\":[\"a/m\"]}"}}]}`, false, keypool.ClassTransient},
-		{"truncated", 200, `{"choices":`, true, keypool.ClassTransient},
+		{"truncated_unauthorized", 401, `{"error":`, true, keypool.ClassAuth},
+		{"truncated_rate_limited", 429, `{"error":`, true, keypool.ClassRateLimit},
+		{"server_error", 503, `{"error":"unavailable"}`, false, ""},
+		{"invalid_json", 200, `{broken`, false, ""},
+		{"invalid_ranking", 200, `{"choices":[{"message":{"content":"not a ranking"}}]}`, false, ""},
+		{"unrelated_ranking", 200, validDeciderBody, false, ""},
+		{"error_in_2xx", 200, `{"error":"broken","choices":[{"message":{"content":"{\"order\":[\"a/m\"]}"}}]}`, false, ""},
+		{"truncated", 200, `{"choices":`, true, ""},
 		{"bad_request", 400, `{"error":"bad request"}`, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,7 +140,7 @@ func TestDeciderCancellationIsNeutralAndOwnDeadlineIsFailure(t *testing.T) {
 			if phase == "own_deadline" {
 				want = 1
 			}
-			if ks.Failures != want || ks.Requests != int64(want) {
+			if ks.Failures != 0 || ks.Requests != int64(want) {
 				t.Fatalf("key=%+v", ks)
 			}
 		})

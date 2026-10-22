@@ -18,13 +18,13 @@ func TestClassFor(t *testing.T) {
 		{401, nil, ClassAuth},
 		{403, nil, ClassAuth},
 		{429, nil, ClassRateLimit},
-		{500, nil, ClassTransient},
-		{502, nil, ClassTransient},
+		{500, nil, ""},
+		{502, nil, ""},
 		{400, nil, ""},
 		{404, nil, ""},
 		{200, nil, ""},
-		{0, errors.New("boom"), ""},                   // local network failure: key neutral
-		{0, context.DeadlineExceeded, ClassTransient}, // gateway timeout: transient
+		{0, errors.New("boom"), ""},       // local network failure: key neutral
+		{0, context.DeadlineExceeded, ""}, // gateway timeout: key neutral
 	}
 	for _, c := range cases {
 		if got := ClassFor(c.status, c.err); got != c.want {

@@ -67,17 +67,17 @@ All four execution surfaces use `outcome.Classify` for one mutually exclusive fa
 | `401`, `403` (`auth`) | Neutral | Auth quarantine |
 | Other `4xx` except `429` (`caller_error`) | Neutral | Neutral |
 | `429` (`rate_limit`) | One failed step after credential attempts fail | Rate-limit quarantine |
-| `5xx`, unusable success bodies and gateway timeouts (`upstream_transient`) | One failed step | Transient quarantine |
+| `5xx`, unusable success bodies and gateway timeouts (`upstream_transient`) | One failed step | Neutral |
 | DNS, dial/connect failures including dial timeouts (`local_network`) | One failed step | Neutral |
 | Caller cancellation/deadline or downstream disconnect | Neutral | Neutral |
 
-Image compatibility applies to the effective Chat payload, including translated Responses image input. Embeddings have no image input contract. The retained transient quarantine for `5xx` is a service-failure isolation policy, not evidence that a credential is defective. A whole step counts at most one model failure even when several credentials were tried. A recovered attempt can complete without charging a model failure. Error responses retain the upstream status/body on exhausted fallback.
+Image compatibility applies to the effective Chat payload, including translated Responses image input. Embeddings have no image input contract. Service failures are not evidence that a credential is defective: they release its attempt lease without changing its failure count or quarantine. Only a validated completed success resets prior key failures. A whole step counts at most one model failure even when several attempts were made. A recovered attempt can complete without charging a model failure. Error responses retain the upstream status/body on exhausted fallback. The advisory decider uses the same key attribution, including malformed rankings, but does not change serving-model health.
 
 Image rejection is deferred until a later candidate completes a structurally valid body or stream and its downstream writes succeed. An all-failure walk, cancellation, timeout, malformed success, truncated stream or downstream disconnect does not confirm earlier image blame. Deferral releases a recovery probe immediately; its generation-bound token cannot overwrite a newer failure or recovery.
 
 ## Retry budgets and backoff
 
-Credential failover and transient retries have separate bounds. Each step tries a different usable credential after `401`, `403` or `429`, at most once per configured credential; `GUVNA_RETRIES=0` does not disable credential failover. DNS/connection failures may retry the same healthy key up to `GUVNA_RETRIES` extra times (default `2`). A `5xx` also uses that transient budget and selects a different usable key because the failed key remains quarantined under the policy above. The gateway never bypasses quarantine to force a retry.
+Credential failover and transient retries have separate bounds. Each step tries a different usable credential after `401`, `403` or `429`, at most once per configured credential; `GUVNA_RETRIES=0` does not disable credential failover. DNS/connection failures and `5xx` retry the same healthy key up to `GUVNA_RETRIES` extra times (default `2`). Each retry acquires a fresh lease, retains backoff and consumes the shared retry budget. If another request quarantines that key, an unused healthy credential may be selected instead. The gateway never bypasses quarantine to force a retry. `GUVNA_RETRIES=0` disables these service/network retries even with multiple healthy keys. Invalid bodies and active stream failures retain their existing fallback/termination behavior rather than starting another credential attempt.
 
 `GUVNA_RETRY_BUDGET` caps extra attempts across the entire candidate walk (default `16`; `0` permits only each initial attempt until a retry would be needed). Exhausting this shared budget stops the walk and returns the last available upstream response, or 503 when no HTTP response exists. It does not cancel a selected successful stream. Existing step/request deadlines independently cap time spent connecting, waiting, retrying and reading non-streaming bodies.
 

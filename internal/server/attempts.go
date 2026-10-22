@@ -47,6 +47,22 @@ func attemptLease(r *http.Request, key string) *keypool.Lease {
 	return nil
 }
 
+// completeKeyAttempt resets failures only after a usable successful response.
+// Service/network failures release the lease without erasing prior key evidence.
+func completeKeyAttempt(lease *keypool.Lease, status int, err error) {
+	if lease == nil {
+		return
+	}
+	class := outcome.Classify(status, err)
+	if class == "" {
+		lease.Success()
+	} else if keyClass := outcome.KeyClass(class); keyClass != "" {
+		lease.Failure(keypool.Class(keyClass))
+	} else {
+		lease.Release()
+	}
+}
+
 func withAttempt(r *http.Request, chain string, req chatRequest, body []byte) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), attemptKey{}, &attemptTrace{
 		chain: chain, req: req, hasImages: vision.RequestHasImages(body),

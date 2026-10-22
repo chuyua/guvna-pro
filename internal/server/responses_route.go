@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/responses"
 	"github.com/creamy-ghost/guvna/internal/router"
 )
@@ -140,8 +139,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					log.Printf("responses: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
-					s.mark(r, step.Provider, step.Model, 0, aerr)
-					s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, aerr)
+					s.mark(r, step.Provider, step.Model, http.StatusBadGateway, aerr)
+					s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, aerr)
 					failure := invalidResponsesResult(aerr)
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
@@ -213,8 +212,8 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		if r.Context().Err() != nil {
 			return relayResult{outcome: relayUncommitted, clientGone: true, status: resp.StatusCode, ct: ct, err: err}
 		}
-		s.mark(r, step.Provider, step.Model, 0, err)
-		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, err)
+		s.mark(r, step.Provider, step.Model, http.StatusBadGateway, err)
+		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, err)
 		log.Printf("responses: %s/%s body read failed: %v", step.Provider, step.Model, err)
 		return invalidResponsesResult(err)
 	}
@@ -229,15 +228,15 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		// try the next step instead of handing the caller an unusable success.
 		verr = fmt.Errorf("upstream 2xx body is not a chat completion: %w", verr)
 		log.Printf("responses: %s/%s unusable 2xx body: %v", step.Provider, step.Model, verr)
-		s.mark(r, step.Provider, step.Model, 0, verr)
-		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, verr)
+		s.mark(r, step.Provider, step.Model, http.StatusBadGateway, verr)
+		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, verr)
 		return invalidResponsesResult(verr)
 	}
 	if len(cc.Choices) == 0 {
 		verr := errors.New("upstream 2xx body has no choices")
 		log.Printf("responses: %s/%s %v", step.Provider, step.Model, verr)
-		s.mark(r, step.Provider, step.Model, 0, verr)
-		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, keypool.ClassTransient, verr)
+		s.mark(r, step.Provider, step.Model, http.StatusBadGateway, verr)
+		s.poolRecordResult(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, 502, 0, 0, verr)
 		return invalidResponsesResult(verr)
 	}
 	// The upstream echoes the model that actually served the request, e.g.
@@ -255,7 +254,7 @@ func (s *Server) relayResponsesBody(w http.ResponseWriter, r *http.Request, step
 		return relayResult{outcome: relayCommitted, clientGone: true}
 	}
 	s.markSuccess(r, step.Provider, step.Model)
-	s.poolRecord(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, in, out, "")
+	s.poolRecord(r, keyEnv, step, chain, chatRequest{Model: req.Model, Stream: req.Stream}, resp.StatusCode, in, out)
 	return relayResult{outcome: relayCommitted}
 }
 
@@ -308,8 +307,8 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 			return
 		}
 		in, out := tokens()
-		s.mark(r, step.Provider, step.Model, 0, err)
-		s.poolRecordResult(r, keyEnv, step, chain, chatReq, 502, in, out, keypool.ClassTransient, err)
+		s.mark(r, step.Provider, step.Model, http.StatusBadGateway, err)
+		s.poolRecordResult(r, keyEnv, step, chain, chatReq, 502, in, out, err)
 		message := "upstream stream invalid or interrupted"
 		var budgetErr *stepTimeoutError
 		if errors.As(err, &budgetErr) {
@@ -344,7 +343,7 @@ func (s *Server) relayResponsesStream(w http.ResponseWriter, r *http.Request, st
 		}
 		s.markSuccess(r, step.Provider, step.Model)
 		in, out := tokens()
-		s.poolRecord(r, keyEnv, step, chain, chatReq, resp.StatusCode, in, out, "")
+		s.poolRecord(r, keyEnv, step, chain, chatReq, resp.StatusCode, in, out)
 	}
 	// Parse errors are upstream failures; Chunk write errors are downstream
 	// failures. Keep these distinct so disconnects cannot quarantine a good key.
