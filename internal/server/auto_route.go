@@ -25,6 +25,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -120,7 +121,9 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 		s.finishAutoObservation(r, observation)
 	}()
 	var req autoRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	// encoding/json accepts the literal null into a struct without an error.
+	// Reject it before a later model rewrite attempts to assign into a nil map.
+	if err := json.Unmarshal(body, &req); err != nil || bytes.Equal(bytes.TrimSpace(body), []byte("null")) {
 		observation.fail(http.StatusBadRequest, "caller_error")
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
