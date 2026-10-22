@@ -1,6 +1,7 @@
 package keypool
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -22,7 +23,8 @@ func TestClassFor(t *testing.T) {
 		{400, nil, ""},
 		{404, nil, ""},
 		{200, nil, ""},
-		{0, errors.New("boom"), ClassTransient},
+		{0, errors.New("boom"), ""},                   // local network failure: key neutral
+		{0, context.DeadlineExceeded, ClassTransient}, // gateway timeout: transient
 	}
 	for _, c := range cases {
 		if got := ClassFor(c.status, c.err); got != c.want {

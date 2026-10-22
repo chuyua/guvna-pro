@@ -108,6 +108,9 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 // handleAutoBody also serves model:auto through the Chat endpoint. Reuse the
 // already bounded input and its start time instead of reading it a second time.
 func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []byte, started time.Time) {
+	if requestID(r) == "" {
+		r = withRequestID(r, s.newRequestID())
+	}
 	var req autoRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
@@ -234,6 +237,9 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 	if hasImages {
 		kept := make([]selector.Candidate, 0, len(ordered))
 		for _, c := range ordered {
+			if retryBudgetExhausted(r) {
+				break
+			}
 			if s.visionReg.Has(c.Step.Model) {
 				kept = append(kept, c)
 			}
@@ -245,6 +251,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 			return
 		}
 	}
+	ordered, source = s.applyAutoScoring(r, ordered, source, chat.Stream)
 	log.Printf("auto: min=%d max=%d eligible=%d images=%v degraded=%v source=%s order=%s",
 		minCtx, req.MaxContext, len(cands), hasImages, degraded, source, joinSteps(ordered))
 
@@ -262,6 +269,9 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 	var lastBody []byte
 	var lastCT string
 	for _, c := range ordered {
+		if retryBudgetExhausted(r) {
+			break
+		}
 		if r.Context().Err() != nil {
 			return
 		}
@@ -277,6 +287,8 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 		}
 		defer permit.Release()
 		r = withPermit(r, permit)
+		r = withAttempt(r, c.Chain, chat, body)
+		defer releaseAttempt(r)
 		stepCtx := r.Context()
 		cancelStep := func() {}
 		stopSetupBudget := func() {}
@@ -317,7 +329,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.mark(r, step.Provider, step.Model, 0, err)
-			s.record(step, c.Chain, chat, 0, err, keyEnv)
+			s.record(r, step, c.Chain, chat, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -332,7 +344,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 					}
 					log.Printf("auto: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
 					s.mark(r, step.Provider, step.Model, 0, aerr)
-					s.poolRecordResult(keyEnv, step, c.Chain, chat, 502, 0, 0, keypool.ClassTransient, aerr)
+					s.poolRecordResult(r, keyEnv, step, c.Chain, chat, 502, 0, 0, keypool.ClassTransient, aerr)
 					failure := unusableBody(aerr)
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
@@ -362,17 +374,9 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 		if r.Context().Err() != nil {
 			return
 		}
-		// Preserve 400 as the vision self-healing signal: a text-only model
-		// receiving an image request enters single-strike cool-off. Other request
-		// and config errors are neutral for model health; 401/403 have already
-		// been attributed to the key in tryStepAdaptor.
-		if resp.StatusCode == http.StatusNotFound {
-			log.Printf("auto: step %s/%s not found upstream (config residue), skipping", step.Provider, step.Model)
-		} else if resp.StatusCode == http.StatusBadRequest || retryable(resp.StatusCode, nil) {
-			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
-		}
+		s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		log.Printf("auto: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
-		s.record(step, c.Chain, chat, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode), keyEnv)
+		s.record(r, step, c.Chain, chat, resp.StatusCode, fmt.Errorf("status %d", resp.StatusCode), keyEnv)
 		permit.Release()
 	}
 	log.Printf("auto: all candidates failed: %v", lastErr)
@@ -485,10 +489,12 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 		log.Printf("auto: decider provider %q has no key pool", s.decideProvider)
 		return nil, fmt.Errorf("decider provider %q has no key pool", s.decideProvider)
 	}
-	keyEnv := pool.Pick()
-	if keyEnv == "" {
+	lease := pool.Acquire(nil)
+	if lease == nil {
 		return nil, errNoAvailableKeys
 	}
+	defer lease.Release()
+	keyEnv := lease.Env()
 	key := s.env(keyEnv)
 	if key == "" {
 		log.Printf("auto: decider key env %q not set", keyEnv)
@@ -524,20 +530,26 @@ func (s *Server) callDecider(parent, ctx context.Context, cands []selector.Candi
 	// model health. Record exactly one key result for a real upstream attempt.
 	finishKey := func(class keypool.Class, success bool, raw []byte) {
 		if callerGone() {
+			lease.Release()
 			return
 		}
 		if class != "" {
-			pool.Mark(keyEnv, class)
+			lease.Failure(class)
 		} else if success {
-			pool.MarkSuccess(keyEnv)
+			lease.Success()
+		} else {
+			lease.Release()
 		}
 		in, out := telemetry.ParseUsage(raw)
 		pool.Record(keyEnv, in, out)
 	}
+	if !lease.Available() {
+		return nil, errNoAvailableKeys
+	}
 	resp, err := a.Chat(ctx, payload)
 	if err != nil {
 		log.Printf("auto: decider call: %v", err)
-		finishKey(keypool.ClassTransient, false, nil)
+		finishKey(keypool.ClassFor(0, err), false, nil)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -623,7 +635,8 @@ func (s *Server) providerOrder() []string {
 	if v := s.env("GUVNA_PROVIDE_ORDER"); v != "" {
 		var out []string
 		for _, p := range strings.Fields(v) {
-			if _, ok := s.provider(p); ok {
+			provider, _, _ := strings.Cut(p, "/")
+			if _, ok := s.provider(provider); ok {
 				out = append(out, p)
 			}
 		}

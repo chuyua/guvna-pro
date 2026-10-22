@@ -57,15 +57,39 @@ This is a heuristic, not a model tokenizer: it can overestimate or underestimate
 
 ## HTTP failure attribution
 
-| Upstream status | Chat / Responses / Embeddings model health | Auto model health | Key state |
-|---|---|---|---|
-| `400` | Neutral | Preserve the existing single-strike self-healing cool-off | Neutral |
-| `401`, `403` | Neutral | Neutral | Quarantine the attempted key as an auth failure |
-| `404`, `408`, `422` | Neutral | Neutral | Neutral |
-| `429` | Count one failed step | Count one failed step | Rate-limit quarantine |
-| `5xx` | Count one failed step | Count one failed step | Transient quarantine |
+All four execution surfaces use `outcome.Classify` for one mutually exclusive failure class. A real HTTP status takes precedence over an attached descriptive error. Caller cancellation/deadlines and gateway budget expiry carry distinct classified errors.
 
-Auth, rate-limit and transient failures can try another available key within the existing retry count. Key retries do not multiply the model-health failure count. Ordinary request/configuration errors do not renew model cool-off, and their recovery permits are released. Auto's `400` exception retains its existing vision self-healing behavior; it is not a provider-wide circuit-breaker policy. Error responses continue through the configured fallback path and preserve the upstream status/body when no candidate succeeds.
+| Outcome | Model health | Key state |
+|---|---|---|
+| Successful validated `2xx` | Reset on completed relay | Healthy |
+| `400`, `422` (`model_incompatible`), text request | Neutral | Neutral |
+| `400`, `422`, image request | Deferred compatibility cool-off after another candidate serves a valid result | Neutral |
+| `401`, `403` (`auth`) | Neutral | Auth quarantine |
+| Other `4xx` except `429` (`caller_error`) | Neutral | Neutral |
+| `429` (`rate_limit`) | One failed step after credential attempts fail | Rate-limit quarantine |
+| `5xx`, unusable success bodies and gateway timeouts (`upstream_transient`) | One failed step | Transient quarantine |
+| DNS, dial/connect failures including dial timeouts (`local_network`) | One failed step | Neutral |
+| Caller cancellation/deadline or downstream disconnect | Neutral | Neutral |
+
+Image compatibility applies to the effective Chat payload, including translated Responses image input. Embeddings have no image input contract. The retained transient quarantine for `5xx` is a service-failure isolation policy, not evidence that a credential is defective. A whole step counts at most one model failure even when several credentials were tried. A recovered attempt can complete without charging a model failure. Error responses retain the upstream status/body on exhausted fallback.
+
+Image rejection is deferred until a later candidate completes a structurally valid body or stream and its downstream writes succeed. An all-failure walk, cancellation, timeout, malformed success, truncated stream or downstream disconnect does not confirm earlier image blame. Deferral releases a recovery probe immediately; its generation-bound token cannot overwrite a newer failure or recovery.
+
+## Retry budgets and backoff
+
+Credential failover and transient retries have separate bounds. Each step tries a different usable credential after `401`, `403` or `429`, at most once per configured credential; `GUVNA_RETRIES=0` does not disable credential failover. DNS/connection failures may retry the same healthy key up to `GUVNA_RETRIES` extra times (default `2`). A `5xx` also uses that transient budget and selects a different usable key because the failed key remains quarantined under the policy above. The gateway never bypasses quarantine to force a retry.
+
+`GUVNA_RETRY_BUDGET` caps extra attempts across the entire candidate walk (default `16`; `0` permits only each initial attempt until a retry would be needed). Exhausting this shared budget stops the walk and returns the last available upstream response, or 503 when no HTTP response exists. It does not cancel a selected successful stream. Existing step/request deadlines independently cap time spent connecting, waiting, retrying and reading non-streaming bodies.
+
+For `429` and `5xx`, a valid `Retry-After` in integer seconds or HTTP-date takes precedence. The wait is capped by `GUVNA_RETRY_MAX_WAIT` (default `30s`). Otherwise Full Jitter samples a delay from `[0, min(base * 2^(attempt-1), max_wait))`, with `GUVNA_RETRY_BASE=250ms` by default. Both durations must be positive. Waiting honors caller cancellation and the existing step deadline immediately. A key is rechecked after the wait in case another request quarantined it. The last bounded upstream error body is preserved if all usable credentials disappear during backoff.
+
+Switching to a different credential after `401` or `403` is immediate and still consumes the shared retry budget. Rate-limit failover retains backoff: because `Retry-After` has no portable credential scope, a `429` hint is conservatively treated as provider-wide even when switching keys. No scope is inferred from vendor-specific rate-limit headers.
+
+## Attempt telemetry
+
+Every real upstream attempt has one persisted row, with a request ID shared across the whole candidate walk (including Chat `model:auto`), a one-based attempt number restarting for each candidate, `latency_ms` measured from that actual upstream call through its body/stream completion, and `failure_class`. Successful rows have an empty failure class. Retried failures are recorded immediately; the selected terminal relay is recorded once with token usage. No extra terminal row duplicates the last retry. Cancellation is neutral and does not erase previous upstream failures. Key usage counts actual attempts, including failed credential attempts; secret key values are never persisted.
+
+`/admin/status` exposes buffer lifecycle counters under `telemetry`: `flushes_ok`, `flushes_failed`, `retried_events`, `dropped_events`, `buffer_len` and `inflight_events`. If persisted aggregates are unavailable, status still returns health and telemetry diagnostics with `usage_error`; zero usage values in that response must not be interpreted as a successful aggregate read. New attempt columns migrate existing SQLite databases without removing old rows. Buffer durability remains process-local; process termination can lose unflushed events.
 
 ## Recovery admission and key exhaustion
 
@@ -73,7 +97,7 @@ Auth, rate-limit and transient failures can try another available key within the
 
 The key pool returns no key while all credentials remain quarantined. That step makes no upstream call, does not retry an empty credential and does not count another model/key failure. If every candidate is unavailable, the walk returns 503; if a real upstream response was already obtained, it preserves that result. Keys become selectable at the exact expiry boundary. A delayed success cannot clear a key that is still quarantined by another request. Retries recheck the selected key after backoff and can select another available key if it was quarantined during the wait.
 
-The advisory Auto decider follows the same key availability and quarantine rules. Auth, rate-limit, network, server and invalid-success failures update its key state; caller cancellation is neutral. Valid rankings record successful key usage. The decider still does not change candidate model health and falls back to the existing static ordering when unavailable. Canceled decisions do not populate the ranking failure cache, and a canceled shared waiter does not cancel another request's leader decision.
+The advisory Auto decider follows the same key availability and quarantine rules. Auth, rate-limit, server and invalid-success failures update its key state; DNS/connection failures and caller cancellation are neutral for credentials. Valid rankings record successful key usage. The decider still does not change candidate model health and falls back to the existing static ordering when unavailable. Canceled decisions do not populate the ranking failure cache, and a canceled shared waiter does not cancel another request's leader decision.
 
 Half-open admission is per provider/model, not a provider-wide circuit breaker or a per-key single-flight limit. Healthy traffic remains concurrent.
 
@@ -104,4 +128,4 @@ Incoming-reader tests cover declared and actual size limits, exact-limit bodies,
 
 Recovery tests cover 64 concurrent admissions across ten route forms, probe release and old results, all-key quarantine, decider key results, key quarantine during backoff, 64 concurrent saves, snapshot isolation, and failed replacement cleanup. A Windows-only test verifies preservation of a locked target file.
 
-Provider-wide isolation, exact model tokenization, request-header limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture, retry counts and gateway deployment architecture are retained.
+Provider-wide isolation, exact model tokenization, request-header limits and multiple-choice Responses translation remain outside this batch. The existing named chains, selection architecture and gateway deployment architecture are retained.

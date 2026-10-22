@@ -86,7 +86,7 @@ func TestDeciderNetworkFailureRecordsKeyOnce(t *testing.T) {
 		t.Fatal("network failure accepted")
 	}
 	ks := s.pools["a"].Keys()[0]
-	if ks.Failures != 1 || ks.Reason != string(keypool.ClassTransient) || ks.Requests != 1 {
+	if ks.Failures != 0 || ks.Reason != "" || ks.Requests != 1 {
 		t.Fatalf("key=%+v", ks)
 	}
 }

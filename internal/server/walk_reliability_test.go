@@ -243,7 +243,7 @@ func TestWalkCancellationDuringBackoffDoesNotRetry(t *testing.T) {
 			if s.hlth.Snapshot()[0].Failures != 1 || s.pools["a"].Keys()[0].Failures != 1 {
 				t.Fatal("cancel added a failure beyond the first upstream 503")
 			}
-			runtimeTelemetry(t, s, 0, 0, false)
+			runtimeTelemetry(t, s, 1, 503, true)
 		})
 	}
 }

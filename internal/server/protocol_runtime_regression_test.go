@@ -75,6 +75,10 @@ func TestRuntimeResponsesTermination(t *testing.T) {
 			seedRecoveredKey(t, s)
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest("POST", "/v1/responses", nil)
+			r = withAttempt(withRequestID(r, "runtime-response"), "main", chatRequest{Model: "main", Stream: true}, nil)
+			beginAttempt(r)
+			setAttemptLease(r, s.pools["a"].Acquire(nil))
+			defer releaseAttempt(r)
 			s.relayResponsesStream(w, r, router.Step{Provider: "a", Model: "m"}, "main", &responses.Request{Model: "main", Stream: true}, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.payload))}, "A")
 			body := w.Body.String()
 			if strings.Count(body, "event: response."+tc.terminal+"\n") != 1 || strings.Count(body, "data: [DONE]") != 1 {

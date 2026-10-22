@@ -17,7 +17,7 @@ const (
 	CooldownBase = 60 * time.Second
 	// CooldownMax caps exponential cool-off growth.
 	CooldownMax = 10 * time.Minute
-	// PermanentCooldown is the fixed cool-off applied on a single 400/404.
+	// PermanentCooldown is the fixed cool-off for an attributed incompatibility.
 	PermanentCooldown = 5 * time.Minute
 )
 
@@ -61,7 +61,7 @@ func NewWithClock(now func() time.Time) *Tracker {
 // Mark records a failure for a step. Cool-off grows exponentially with
 // consecutive failures: 1m, 2m, 4m, ..., capped at CooldownMax.
 //
-// A 400 or 404 means the request is incompatible with this model — bad
+// An attributed 400, 404 or 422 means the request is incompatible with this model — bad
 // request shape for the model, or the model does not exist on the provider.
 // Such errors are permanent at the model level and do not heal on retry, so
 // one occurrence is enough to mark the step down; the cool-off is fixed
@@ -76,6 +76,11 @@ func (t *Tracker) Mark(provider, model string, status int, err error) {
 }
 
 func (t *Tracker) mark(st *state, status int, err error) {
+	// A failure advances the admission epoch. Other requests admitted before
+	// this result describe the same outage and cannot escalate it again or
+	// erase it with a delayed success. Fresh serial admissions still count.
+	st.generation++
+	st.probing = false
 	st.failures++
 	st.lastAt = t.now()
 	if err != nil {
@@ -83,7 +88,7 @@ func (t *Tracker) mark(st *state, status int, err error) {
 	} else {
 		st.lastErr = fmt.Sprintf("status %d", status)
 	}
-	if status == 400 || status == 404 {
+	if status == 400 || status == 404 || status == 422 {
 		if st.failures < FailureThreshold {
 			st.failures = FailureThreshold
 		}
@@ -137,6 +142,57 @@ type Permit struct {
 	done       bool // guarded by tracker.mu
 }
 
+// DeferredFailure releases an execution permit while preserving its admission
+// generation. Confirm may later attribute an incompatibility after another
+// candidate has served a usable result; stale or repeated confirmations do
+// nothing. It never holds a half-open recovery probe open while the walk moves on.
+type DeferredFailure struct {
+	tracker    *Tracker
+	key        stepKey
+	generation uint64
+	status     int
+	err        error
+	done       bool // guarded by tracker.mu
+}
+
+func (p *Permit) DeferFailure(status int, err error) *DeferredFailure {
+	if p == nil {
+		return nil
+	}
+	t := p.tracker
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p.done {
+		return nil
+	}
+	p.done = true
+	st := t.states[p.key]
+	if st == nil || st.generation != p.generation {
+		return nil
+	}
+	if p.probe {
+		st.probing = false
+	}
+	return &DeferredFailure{tracker: t, key: p.key, generation: p.generation, status: status, err: err}
+}
+
+func (d *DeferredFailure) Confirm() {
+	if d == nil {
+		return
+	}
+	t := d.tracker
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if d.done {
+		return
+	}
+	d.done = true
+	st := t.states[d.key]
+	if st != nil && st.generation == d.generation {
+		t.mark(st, d.status, d.err)
+	}
+}
+
 // TryAcquire admits healthy traffic freely, but only one probe after cool-off.
 // Callers must release every permit even if no upstream request is made.
 func (t *Tracker) TryAcquire(provider, model string) (*Permit, bool) {
@@ -186,9 +242,9 @@ func (p *Permit) finish(record, success bool, status int, err error) {
 			return
 		}
 		reset(st)
-		if p.probe {
-			st.generation++
-		}
+		// A completed newer success also fences deferred blame and older
+		// results, even when it did not own a half-open probe.
+		st.generation++
 	} else {
 		t.mark(st, status, err)
 	}

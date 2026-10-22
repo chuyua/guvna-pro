@@ -8,7 +8,9 @@
 package adaptors
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,15 +50,55 @@ var defaultDialer = &net.Dialer{Timeout: envDuration("GUVNA_DIAL_TIMEOUT", 10*ti
 // turns into EOF/timeouts. Falling back to the default dialer when the host is
 // an IP literal or has no A records keeps v6-only hosts working.
 func preferV4DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return dialPreferV4(ctx, network, addr, defaultDialer.Timeout, net.DefaultResolver.LookupIP, defaultDialer.DialContext)
+}
+
+// dialPreferV4 keeps one budget for DNS and all addresses. Each address gets a
+// share of the remaining time so a blackholed first address cannot consume the
+// entire timeout. Dependencies are explicit to test address fallback without
+// changing the process-wide resolver or dialer.
+func dialPreferV4(ctx context.Context, network, addr string, timeout time.Duration,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) (net.Conn, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil || net.ParseIP(host) != nil {
-		return defaultDialer.DialContext(ctx, network, addr)
+		return dial(ctx, network, addr)
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	ips, err := lookup(ctx, "ip4", host)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if err != nil || len(ips) == 0 {
-		return defaultDialer.DialContext(ctx, network, addr)
+		return dial(ctx, network, addr)
 	}
-	return defaultDialer.DialContext(ctx, "tcp4", net.JoinHostPort(ips[0].String(), port))
+	var failures []error
+	for i, ip := range ips {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(append(failures, err)...)
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		if deadline, ok := ctx.Deadline(); ok {
+			attemptCtx, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(ips)-i))
+		}
+		address := net.JoinHostPort(ip.String(), port)
+		conn, err := dial(attemptCtx, "tcp4", address)
+		cancel()
+		if err == nil {
+			return conn, nil
+		}
+		failures = append(failures, fmt.Errorf("dial %s: %w", address, err))
+	}
+	return nil, errors.Join(failures...)
 }
 
 // Client is shared across adaptors and reused for keep-alive.
@@ -220,7 +262,7 @@ func withClient(p config.Provider, key string, c *http.Client) (Adaptor, error) 
 }
 
 func (a *openAICompat) Chat(ctx context.Context, body []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.url, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +276,7 @@ func (a *openAICompat) Chat(ctx context.Context, body []byte) (*http.Response, e
 }
 
 func (a *openAICompat) Embed(ctx context.Context, body []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.embedURL, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.embedURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

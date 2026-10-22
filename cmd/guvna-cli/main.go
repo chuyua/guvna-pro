@@ -139,7 +139,16 @@ type statusResp struct {
 	Chains    []string `json:"chains"`
 	Steps     []step   `json:"steps"`
 	StepsDown int      `json:"steps_down"`
-	Usage     struct {
+	Telemetry struct {
+		FlushesOK      uint64 `json:"flushes_ok"`
+		FlushesFailed  uint64 `json:"flushes_failed"`
+		RetriedEvents  uint64 `json:"retried_events"`
+		DroppedEvents  uint64 `json:"dropped_events"`
+		BufferLen      int    `json:"buffer_len"`
+		InflightEvents int    `json:"inflight_events"`
+	} `json:"telemetry"`
+	UsageError string `json:"usage_error,omitempty"`
+	Usage      struct {
 		Requests   int            `json:"requests"`
 		Streams    int            `json:"streams"`
 		Errors     int            `json:"errors"`
@@ -171,12 +180,16 @@ func statusCmd(args []string) error {
 	parseCommon(fs, &cf)
 	fs.Parse(args)
 
-	var st statusResp
-	if err := cf.get("/admin/status", &st); err != nil {
+	var raw json.RawMessage
+	if err := cf.get("/admin/status", &raw); err != nil {
 		return err
 	}
 	if cf.json {
-		return printJSON(st)
+		return printJSON(raw)
+	}
+	var st statusResp
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return err
 	}
 
 	fmt.Printf("Guvna %s  (uptime %s)\n", cf.url, st.Uptime)
@@ -195,6 +208,9 @@ func statusCmd(args []string) error {
 	}
 
 	fmt.Printf("\nUSAGE (persisted)\n")
+	if st.UsageError != "" {
+		fmt.Printf("  unavailable: %s\n", st.UsageError)
+	}
 	fmt.Printf("  requests %d   streams %d   errors %d\n", st.Usage.Requests, st.Usage.Streams, st.Usage.Errors)
 	fmt.Printf("  tokens %d in / %d out\n", st.Usage.TokensIn, st.Usage.TokensOut)
 	if len(st.Usage.ByProvider) > 0 {
@@ -203,6 +219,8 @@ func statusCmd(args []string) error {
 			fmt.Printf("  %-12s %8d %8d %12d %12d\n", p.Provider, p.Requests, p.Errors, p.TokensIn, p.TokensOut)
 		}
 	}
+	fmt.Printf("\nTELEMETRY\n  buffer %d   in-flight %d   dropped %d\n", st.Telemetry.BufferLen, st.Telemetry.InflightEvents, st.Telemetry.DroppedEvents)
+	fmt.Printf("  flushes %d ok / %d failed   retained for retry %d\n", st.Telemetry.FlushesOK, st.Telemetry.FlushesFailed, st.Telemetry.RetriedEvents)
 	return nil
 }
 
