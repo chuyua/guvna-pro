@@ -74,7 +74,11 @@ func TestChoiceContractDefaultsMatchPayload(t *testing.T) {
 			var payload struct {
 				N json.RawMessage `json:"n"`
 			}
-			if err := json.Unmarshal(mergeParams([]byte(tc.body), params), &payload); err != nil {
+			forwarded, err := mergeParams([]byte(tc.body), params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(forwarded, &payload); err != nil {
 				t.Fatal(err)
 			}
 			var actual int

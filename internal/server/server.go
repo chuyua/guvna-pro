@@ -795,14 +795,18 @@ func withModel(body []byte, model string) []byte {
 
 // mergeParams applies a step's params as fill-missing defaults: a param is set
 // on the body only when the client didn't supply that field. Explicit client
-// values always win. The body is returned unchanged on any parse failure.
-func mergeParams(body []byte, params map[string]any) []byte {
+// values always win. Invalid JSON or an unencodable default fails the attempt
+// before an upstream request can be sent with silently missing parameters.
+func mergeParams(body []byte, params map[string]any) ([]byte, error) {
 	if len(params) == 0 {
-		return body
+		return body, nil
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
-		return body
+		return nil, errors.New("request parameters must be a JSON object")
+	}
+	if m == nil {
+		return nil, errors.New("request parameters must be a JSON object")
 	}
 	for k, v := range params {
 		if _, present := m[k]; present {
@@ -810,15 +814,15 @@ func mergeParams(body []byte, params map[string]any) []byte {
 		}
 		enc, err := json.Marshal(v)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("step params: %q cannot be encoded as JSON", k)
 		}
 		m[k] = enc
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
-		return body
+		return nil, errors.New("merged parameters cannot be encoded as JSON")
 	}
-	return out
+	return out, nil
 }
 
 func (s *Server) provider(name string) (config.Provider, bool) {

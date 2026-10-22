@@ -63,7 +63,16 @@ func TestEmbeddingRequestContract(t *testing.T) {
 			if tc.name == "malformed request" || tc.name == "null request" {
 				return
 			}
-			forwarded := mergeParams([]byte(tc.body), tc.params)
+			forwarded, err := mergeParams([]byte(tc.body), tc.params)
+			if tc.name == "unmarshalable defaults" {
+				if err == nil {
+					t.Fatal("unencodable defaults should fail before forwarding")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
 			if actual := embeddingRequestContract(forwarded, nil); actual != got {
 				t.Fatalf("contract=%+v differs from forwarded payload contract=%+v", got, actual)
 			}
