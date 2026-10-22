@@ -667,7 +667,7 @@ func TestChatFailsOverAcrossKeys(t *testing.T) {
 	}
 	var key string
 	var tokensOut int64
-	if err := s.tm.DB().QueryRow(`SELECT key, tokens_out FROM requests`).Scan(&key, &tokensOut); err != nil {
+	if err := s.tm.DB().QueryRow(`SELECT key, tokens_out FROM requests WHERE status=200`).Scan(&key, &tokensOut); err != nil {
 		t.Fatal(err)
 	}
 	if key != "KEY_A2" {

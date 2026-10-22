@@ -291,7 +291,7 @@ func TestAutoMarks400Down(t *testing.T) {
 	}
 	s, ts := autoServer(t, providers, chains, map[string]string{"KEY_A": "k", "KEY_B": "k"})
 
-	resp := doAuto(t, ts, nil)
+	resp := doAuto(t, ts, map[string]any{"messages": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "image_url", "image_url": map[string]string{"url": "https://example.com/a.png"}}}}}})
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first request status = %d, want 200 via failover", resp.StatusCode)
@@ -304,7 +304,7 @@ func TestAutoMarks400Down(t *testing.T) {
 	}
 
 	// Second request: the 400ing candidate is excluded before the walk.
-	resp = doAuto(t, ts, nil)
+	resp = doAuto(t, ts, map[string]any{"messages": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "image_url", "image_url": map[string]string{"url": "https://example.com/a.png"}}}}}})
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("second request status = %d, want 200", resp.StatusCode)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/creamy-ghost/guvna/internal/config"
+	"github.com/creamy-ghost/guvna/internal/outcome"
 )
 
 // Failure classes mirror upstream status semantics.
@@ -20,7 +21,7 @@ type Class string
 const (
 	ClassAuth      Class = "auth"       // 401/403: key dead or quota gone
 	ClassRateLimit Class = "rate_limit" // 429: temporarily rate-limited
-	ClassTransient Class = "transient"  // 5xx / network errors
+	ClassTransient Class = "transient"  // 5xx / upstream budget failures
 )
 
 // Strategy selects the next key among healthy ones.
@@ -47,14 +48,18 @@ type KeyStatus struct {
 }
 
 type keyState struct {
-	env       string
-	failures  int
-	downUntil time.Time
-	lastAt    time.Time
-	lastClass Class
-	requests  int64
-	tokensIn  int64
-	tokensOut int64
+	env        string
+	failures   int
+	downUntil  time.Time
+	lastAt     time.Time
+	lastClass  Class
+	generation uint64
+	// failureGeneration is the admission epoch that established the current
+	// quarantine. Only an auth result from that cohort may upgrade its class.
+	failureGeneration uint64
+	requests          int64
+	tokensIn          int64
+	tokensOut         int64
 }
 
 func (k *keyState) healthy(now time.Time) bool {
@@ -111,21 +116,36 @@ func NewWithClock(provider string, envs []string, strategy string, qc config.Qua
 // Pick returns the env var name of the key to use for the next attempt.
 // It returns "" if every key is still quarantined.
 func (p *Pool) Pick() string {
+	return p.PickExcluding(nil)
+}
+
+// PickExcluding selects with the configured strategy while skipping credentials
+// already used by this execution step. It never manufactures key failures.
+func (p *Pool) PickExcluding(excluded map[string]bool) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := p.now()
+	k := p.pick(excluded, p.now())
+	if k == nil {
+		return ""
+	}
+	return k.env
+}
+
+// pick requires p.mu and preserves the selection strategy for both the legacy
+// string API and generation-bound acquisitions.
+func (p *Pool) pick(excluded map[string]bool, now time.Time) *keyState {
 	best := -1
 	switch p.strat {
 	case StrategySequential:
 		for i, k := range p.keys {
-			if k.healthy(now) {
+			if !excluded[k.env] && k.healthy(now) {
 				best = i
 				break
 			}
 		}
 	case StrategyLeastUsed:
 		for i, k := range p.keys {
-			if !k.healthy(now) {
+			if excluded[k.env] || !k.healthy(now) {
 				continue
 			}
 			if best == -1 || k.lastAt.Before(p.keys[best].lastAt) {
@@ -136,20 +156,117 @@ func (p *Pool) Pick() string {
 		n := len(p.keys)
 		for i := 0; i < n; i++ {
 			idx := (p.rrNext + i) % n
-			if p.keys[idx].healthy(now) {
+			if !excluded[p.keys[idx].env] && p.keys[idx].healthy(now) {
 				best = idx
 				break
 			}
 		}
 	}
 	if best == -1 {
-		return ""
+		return nil
 	}
 	p.keys[best].lastAt = now
 	if p.strat == StrategyRoundRobin {
 		p.rrNext = (best + 1) % len(p.keys)
 	}
-	return p.keys[best].env
+	return p.keys[best]
+}
+
+// Lease binds one real attempt to the selected key's admission generation.
+// It does not make healthy traffic exclusive. Complete it exactly once with
+// Failure, Success or Release; stale completions cannot alter a later window.
+type Lease struct {
+	pool       *Pool
+	key        *keyState
+	generation uint64
+	done       bool // guarded by pool.mu
+}
+
+// Acquire atomically selects a key and captures its generation. It returns nil
+// when every key is quarantined or excluded. Call Available after a backoff.
+func (p *Pool) Acquire(excluded map[string]bool) *Lease {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := p.pick(excluded, p.now())
+	if k == nil {
+		return nil
+	}
+	return &Lease{pool: p, key: k, generation: k.generation}
+}
+
+func (l *Lease) Env() string {
+	if l == nil {
+		return ""
+	}
+	return l.key.env
+}
+
+// Available also checks generation: an expired quarantine does not revive an
+// attempt admitted before the failure that established it.
+func (l *Lease) Available() bool {
+	if l == nil {
+		return false
+	}
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !l.done && l.generation == l.key.generation && l.key.healthy(p.now())
+}
+
+// Failure completes an attempt. Concurrent auth evidence may upgrade the
+// current non-auth quarantine only if it came from the cohort that created
+// that exact window; it cannot extend another auth window or a recovered key.
+func (l *Lease) Failure(class Class) Class {
+	if l == nil {
+		return ""
+	}
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if l.done {
+		return ""
+	}
+	l.done = true
+	if class == "" {
+		return ""
+	}
+	k, now := l.key, p.now()
+	if l.generation != k.generation {
+		if l.generation == k.failureGeneration && !k.healthy(now) {
+			return p.upgradeAuth(k, class, now)
+		}
+		return ""
+	}
+	return p.mark(k, class, now)
+}
+
+// Success resets only an available key in this attempt's generation. A stale
+// response cannot reset a quarantine, even after that quarantine has expired.
+func (l *Lease) Success() {
+	if l == nil {
+		return
+	}
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if l.done {
+		return
+	}
+	l.done = true
+	if l.generation == l.key.generation && l.key.healthy(p.now()) {
+		reset(l.key)
+	}
+}
+
+// Release abandons the attempt without changing health or usage counters.
+func (l *Lease) Release() {
+	if l == nil {
+		return
+	}
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l.done = true
 }
 
 // Available rechecks a selected key after a cancellable backoff. Another
@@ -161,25 +278,18 @@ func (p *Pool) Available(env string) bool {
 	return k != nil && k.healthy(p.now())
 }
 
-// ClassFor maps an upstream status to a failure class. Returns "" for
-// non-quarantinable statuses (client errors, successes).
+// ClassFor maps an upstream status or error to a failure class using the
+// shared outcome classifier. Returns "" for non-quarantinable outcomes
+// (caller errors, model incompatibility, local network failures and
+// cancellation): those must never quarantine a healthy key. 5xx keeps the
+// documented transient quarantine; 401/403 quarantine as auth.
 func ClassFor(status int, err error) Class {
-	if err != nil {
-		return ClassTransient
-	}
-	switch {
-	case status == 401 || status == 403:
-		return ClassAuth
-	case status == 429:
-		return ClassRateLimit
-	case status >= 500:
-		return ClassTransient
-	}
-	return ""
+	return Class(outcome.KeyClass(outcome.Classify(status, err)))
 }
 
-// Mark records a failure for the key and quarantines it for the class's
-// cool-off, doubling per consecutive failure. Returns the class applied.
+// Mark is the legacy, unbound failure API. Repeated results within an active
+// quarantine do not extend it, except a single auth upgrade. Execution paths
+// should use Acquire/Lease to also reject old results across expiry/recovery.
 func (p *Pool) Mark(env string, class Class) Class {
 	if class == "" {
 		return ""
@@ -190,21 +300,63 @@ func (p *Pool) Mark(env string, class Class) Class {
 	if k == nil {
 		return ""
 	}
-	d := p.durationFor(class)
-	for i := 0; i < k.failures; i++ {
-		if d >= config.DefaultQuarantine.Auth.Duration {
-			break
-		}
-		d *= 2
+	return p.mark(k, class, p.now())
+}
+
+// mark requires p.mu. One accepted failure establishes a new generation.
+func (p *Pool) mark(k *keyState, class Class, now time.Time) Class {
+	if !k.healthy(now) {
+		return p.upgradeAuth(k, class, now)
 	}
-	if d > config.DefaultQuarantine.Auth.Duration {
-		d = config.DefaultQuarantine.Auth.Duration
-	}
+	d := p.cooldown(class, k.failures)
+	k.failureGeneration = k.generation
+	k.generation++
 	k.failures++
-	k.lastAt = p.now()
+	k.lastAt = now
 	k.lastClass = class
 	k.downUntil = k.lastAt.Add(d)
 	return class
+}
+
+// upgradeAuth replaces the current outage's classification, rather than
+// counting a second outage. Repeated auth evidence cannot stretch the window.
+func (p *Pool) upgradeAuth(k *keyState, class Class, now time.Time) Class {
+	if class != ClassAuth || k.lastClass == ClassAuth {
+		return ""
+	}
+	k.lastClass = ClassAuth
+	k.lastAt = now
+	k.generation++
+	k.downUntil = maxTime(k.downUntil, now.Add(p.cooldown(class, max(0, k.failures-1))))
+	return class
+}
+
+func (p *Pool) cooldown(class Class, failures int) time.Duration {
+	d := p.durationFor(class)
+	cap := config.DefaultQuarantine.Auth.Duration
+	for i := 0; i < failures && d < cap; i++ {
+		if d > cap/2 {
+			return cap
+		}
+		d *= 2
+	}
+	return min(d, cap)
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func reset(k *keyState) {
+	if k.failures != 0 || k.lastClass != "" || !k.downUntil.IsZero() {
+		k.generation++
+	}
+	k.failures = 0
+	k.downUntil = time.Time{}
+	k.lastClass = ""
 }
 
 // MarkSuccess resets a recovered key's failure state. A response arriving while
@@ -214,9 +366,7 @@ func (p *Pool) MarkSuccess(env string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if k := p.byEnv(env); k != nil && k.healthy(p.now()) {
-		k.failures = 0
-		k.downUntil = time.Time{}
-		k.lastClass = ""
+		reset(k)
 	}
 }
 

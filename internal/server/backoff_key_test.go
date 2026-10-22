@@ -27,8 +27,8 @@ func TestBackoffRechecksSelectedKeyAcrossRoutes(t *testing.T) {
 					hits.Add(1)
 					switch r.Header.Get("Authorization") {
 					case "Bearer key1":
-						w.WriteHeader(http.StatusUnauthorized)
-						io.WriteString(w, `{"error":{"message":"original authentication failure"}}`)
+						w.WriteHeader(http.StatusTooManyRequests)
+						io.WriteString(w, `{"error":{"message":"original rate-limit failure"}}`)
 					case "Bearer key3":
 						tc.respond(w)
 					default:
@@ -50,14 +50,14 @@ func TestBackoffRechecksSelectedKeyAcrossRoutes(t *testing.T) {
 				}
 				w := httptest.NewRecorder()
 				s.Handler().ServeHTTP(w, tc.request(context.Background()))
-				wantHits, wantStatus := int32(1), http.StatusUnauthorized
+				wantHits, wantStatus := int32(1), http.StatusTooManyRequests
 				if spare {
 					wantHits, wantStatus = 2, http.StatusOK
 				}
 				if hits.Load() != wantHits || waits.Load() != 1 || w.Code != wantStatus {
 					t.Fatalf("hits=%d waits=%d status=%d body=%s", hits.Load(), waits.Load(), w.Code, w.Body)
 				}
-				if !spare && !strings.Contains(w.Body.String(), "original authentication failure") {
+				if !spare && !strings.Contains(w.Body.String(), "original rate-limit failure") {
 					t.Fatalf("lost original upstream response: %s", w.Body)
 				}
 			})

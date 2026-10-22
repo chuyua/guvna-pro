@@ -67,8 +67,6 @@ func TestStatusAttributionAcrossRoutes(t *testing.T) {
 				wantFailures := 0
 				if st.failure {
 					wantFailures = 1 // Count a failed step, not each key retry.
-				} else if tc.route == "/v1/auto" && st.status == http.StatusBadRequest {
-					wantFailures = health.FailureThreshold // Auto's vision self-healing signal.
 				}
 				states := s.hlth.Snapshot()
 				if len(states) != 1 || states[0].Failures != wantFailures {
@@ -94,9 +92,6 @@ func TestStatusAttributionAcrossRoutes(t *testing.T) {
 func TestNeutralHTTPStatusReleasesHalfOpenAcrossRoutes(t *testing.T) {
 	for _, tc := range admissionRoutes {
 		for _, status := range []int{400, 401, 403, 404, 408, 422} {
-			if tc.route == "/v1/auto" && status == http.StatusBadRequest {
-				continue // Auto's intentional 400 cooldown is not a neutral result.
-			}
 			t.Run(fmt.Sprintf("%s/%d", tc.name, status), func(t *testing.T) {
 				s, _ := statusAttributionServer(t, tc, status)
 				seedHalfOpen(s)

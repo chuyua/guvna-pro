@@ -69,6 +69,17 @@ The CLI's loopback default is a destination, not a server bind restriction. The 
 ./guvna-cli logs -n 100 --json
 ```
 
+Status shows telemetry queue/in-flight lengths, dropped events, successful and
+failed flush counts, and retained events awaiting retry. If persisted usage
+cannot be queried, status still shows these in-memory diagnostics and reports
+`usage_error`. `status --json` preserves the complete server response,
+including key state and fields introduced by newer gateways.
+
+Auto ordering experiment metrics and the latest bounded comparison records are
+available through the authenticated `GET /admin/auto/scoring` API. See
+[AUTO-SHADOW.md](AUTO-SHADOW.md) for time filters, definitions and activation
+requirements. The default route continues to use the decider.
+
 ## Runtime chains
 
 ```sh

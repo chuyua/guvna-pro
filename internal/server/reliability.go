@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/creamy-ghost/guvna/internal/outcome"
 )
 
 // relayOutcome reports how far a relay got before it returned.
@@ -96,8 +98,9 @@ func stepContext(r *http.Request, deadline time.Time, stream bool, stepBudget ti
 // provider's health nor its keys are charged for it.
 type clientGoneError struct{ err error }
 
-func (e *clientGoneError) Error() string { return "client gone: " + e.err.Error() }
-func (e *clientGoneError) Unwrap() error { return e.err }
+func (e *clientGoneError) Error() string                 { return "client gone: " + e.err.Error() }
+func (e *clientGoneError) Unwrap() error                 { return e.err }
+func (e *clientGoneError) OutcomeClass() outcome.Outcome { return outcome.Canceled }
 
 // stepTimeoutError marks a failure caused by the gateway's own per-step or
 // whole-request budget. The upstream may be perfectly healthy; this attempt
@@ -105,8 +108,9 @@ func (e *clientGoneError) Unwrap() error { return e.err }
 // step is counted as a transient failure.
 type stepTimeoutError struct{ err error }
 
-func (e *stepTimeoutError) Error() string { return "step budget exhausted: " + e.err.Error() }
-func (e *stepTimeoutError) Unwrap() error { return e.err }
+func (e *stepTimeoutError) Error() string                 { return "step budget exhausted: " + e.err.Error() }
+func (e *stepTimeoutError) Unwrap() error                 { return e.err }
+func (e *stepTimeoutError) OutcomeClass() outcome.Outcome { return outcome.UpstreamTransient }
 
 func isClientGone(err error) bool {
 	var target *clientGoneError

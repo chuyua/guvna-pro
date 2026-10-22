@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creamy-ghost/guvna/internal/adaptors"
@@ -29,6 +30,7 @@ import (
 	"github.com/creamy-ghost/guvna/internal/health"
 	"github.com/creamy-ghost/guvna/internal/keypool"
 	"github.com/creamy-ghost/guvna/internal/logring"
+	"github.com/creamy-ghost/guvna/internal/outcome"
 	"github.com/creamy-ghost/guvna/internal/router"
 	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
@@ -70,17 +72,19 @@ func envInt(name string, def int) int {
 }
 
 type Server struct {
-	cfg       *config.Config
-	rtr       *router.Router
-	auth      *auth.Authenticator
-	tm        *telemetry.Telemetry
-	hlth      *health.Tracker
-	logs      *logring.Ring
-	store     *chains.Store
-	pools     map[string]*keypool.Pool
-	started   time.Time
-	env       func(string) string
-	retryWait func(attempt int) time.Duration
+	cfg        *config.Config
+	rtr        *router.Router
+	auth       *auth.Authenticator
+	tm         *telemetry.Telemetry
+	hlth       *health.Tracker
+	logs       *logring.Ring
+	reqSeq     atomic.Uint64
+	store      *chains.Store
+	pools      map[string]*keypool.Pool
+	started    time.Time
+	env        func(string) string
+	retryWait  func(attempt int) time.Duration
+	retrySleep func(context.Context, time.Duration) error
 
 	// /v1/auto selector state. ctxLen answers "how big is this model's
 	// window"; the decide* fields hold the decider target and its cached
@@ -95,6 +99,7 @@ type Server struct {
 	decideMu         sync.Mutex
 	decideCandidates []selector.Candidate
 	decideCache      selector.Cache
+	autoScoring      autoScoringState
 }
 
 func New(cfg *config.Config, rtr *router.Router, a *auth.Authenticator, tm *telemetry.Telemetry, hlth *health.Tracker, logs *logring.Ring, store *chains.Store) *Server {
@@ -170,12 +175,16 @@ func envDuration(name string, def time.Duration) time.Duration {
 	return def
 }
 
-// defaultRetryWait backs off 250ms then 1s for the two retry attempts.
+// defaultRetryWait spreads retries over a capped exponential Full Jitter window.
 func defaultRetryWait(attempt int) time.Duration {
-	if attempt <= 1 {
-		return 250 * time.Millisecond
-	}
-	return time.Second
+	return fullJitter(attempt, envDuration("GUVNA_RETRY_BASE", 250*time.Millisecond), envDuration("GUVNA_RETRY_MAX_WAIT", 30*time.Second))
+}
+
+// newRequestID returns a process-unique correlation id for one candidate walk.
+// The nanosecond prefix keeps it sortable; the sequence disambiguates same-ns
+// requests.
+func (s *Server) newRequestID() string {
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), s.reqSeq.Add(1))
 }
 
 func (s *Server) Handler() http.Handler {
@@ -195,6 +204,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/chains/{name}", s.auth.Middleware(http.HandlerFunc(s.handleChainDelete)))
 	mux.Handle("GET /admin/status", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminStatus)))
 	mux.Handle("GET /admin/logs", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAdminLogs)))
+	mux.Handle("GET /admin/auto/scoring", s.auth.AdminMiddleware(http.HandlerFunc(s.handleAutoScoring)))
 	return mux
 }
 
@@ -207,10 +217,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // (or a remote CLI with the admin key).
 func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.tm.Stats()
-	if err != nil {
-		http.Error(w, `{"error":{"message":"stats unavailable"}}`, http.StatusInternalServerError)
-		return
-	}
 	steps := s.hlth.Snapshot()
 	stepsDown := 0
 	for _, st := range steps {
@@ -223,18 +229,24 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		keys = append(keys, s.pools[name].Keys()...)
 	}
 	resp := struct {
-		Uptime    string              `json:"uptime"`
-		Chains    []string            `json:"chains"`
-		Steps     []health.StepStatus `json:"steps"`
-		StepsDown int                 `json:"steps_down"`
-		Keys      []keypool.KeyStatus `json:"keys"`
-		Usage     telemetry.Stats     `json:"usage"`
+		Uptime     string               `json:"uptime"`
+		Chains     []string             `json:"chains"`
+		Steps      []health.StepStatus  `json:"steps"`
+		StepsDown  int                  `json:"steps_down"`
+		Keys       []keypool.KeyStatus  `json:"keys"`
+		Usage      telemetry.Stats      `json:"usage"`
+		Telemetry  telemetry.FlushStats `json:"telemetry"`
+		UsageError string               `json:"usage_error,omitempty"`
 	}{Uptime: time.Since(s.started).Round(time.Second).String()}
 	resp.Chains = s.rtr.ChainNames()
 	resp.Steps = steps
 	resp.StepsDown = stepsDown
 	resp.Keys = keys
 	resp.Usage = stats
+	resp.Telemetry = s.tm.FlushStats()
+	if err != nil {
+		resp.UsageError = "persisted usage unavailable"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -398,6 +410,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeRequestBodyError(w, r, err)
 		return
 	}
+	r = withRequestID(r, s.newRequestID())
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
@@ -424,6 +437,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var lastCT string
 	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
+		if retryBudgetExhausted(r) {
+			break
+		}
 		if r.Context().Err() != nil {
 			return
 		}
@@ -434,6 +450,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		defer permit.Release()
 		r = withPermit(r, permit)
+		r = withAttempt(r, chain, req, body)
+		defer releaseAttempt(r)
 		if walkExpired(deadline) {
 			log.Printf("chat: request budget exhausted, stopping the walk")
 			break
@@ -464,7 +482,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("chat: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.mark(r, step.Provider, step.Model, 0, err)
-			s.record(step, chain, req, 0, err, keyEnv)
+			s.record(r, step, chain, req, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -478,7 +496,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					}
 					log.Printf("chat: step %s/%s aggregate failed: %v", step.Provider, step.Model, aerr)
 					s.mark(r, step.Provider, step.Model, 0, aerr)
-					s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, aerr)
+					s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, aerr)
 					failure := unusableBody(aerr)
 					lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 					continue
@@ -514,11 +532,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return
 		}
-		if retryable(resp.StatusCode, nil) {
-			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
-		}
+		s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		log.Printf("chat: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
-		s.record(step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
+		s.record(r, step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
 		permit.Release()
 	}
 	// All steps failed: propagate the last upstream response as-is.
@@ -544,6 +560,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		writeRequestBodyError(w, r, err)
 		return
 	}
+	r = withRequestID(r, s.newRequestID())
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
@@ -570,6 +587,9 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	var lastCT string
 	deadline := walkDeadline(chatTotalBudget)
 	for _, step := range steps {
+		if retryBudgetExhausted(r) {
+			break
+		}
 		if r.Context().Err() != nil {
 			return
 		}
@@ -580,6 +600,8 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		}
 		defer permit.Release()
 		r = withPermit(r, permit)
+		r = withAttempt(r, chain, req, body)
+		defer releaseAttempt(r)
 		if walkExpired(deadline) {
 			log.Printf("embed: request budget exhausted, stopping the walk")
 			break
@@ -602,7 +624,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			log.Printf("embed: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
 			s.mark(r, step.Provider, step.Model, 0, err)
-			s.record(step, chain, req, 0, err, keyEnv)
+			s.record(r, step, chain, req, 0, err, keyEnv)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -619,7 +641,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			if readErr != nil {
 				log.Printf("embed: body read failed from %s/%s: %v", step.Provider, step.Model, readErr)
 				s.mark(r, step.Provider, step.Model, 0, readErr)
-				s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
+				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, readErr)
 				failure := unusableBody(readErr)
 				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 				continue
@@ -627,7 +649,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			if verr := validateEmbeddings(embedBody, embeddingRequestContract(body, step.Params)); verr != nil {
 				log.Printf("embed: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
 				s.mark(r, step.Provider, step.Model, 0, verr)
-				s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+				s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
 				failure := unusableBody(verr)
 				lastStatus, lastBody, lastCT, lastErr = failure.status, failure.body, failure.ct, failure.err
 				continue
@@ -638,7 +660,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.markSuccess(r, step.Provider, step.Model)
-			s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
+			s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, 0, 0, "")
 			return
 		}
 		lastStatus = resp.StatusCode
@@ -649,11 +671,9 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return
 		}
-		if retryable(resp.StatusCode, nil) {
-			s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
-		}
+		s.mark(r, step.Provider, step.Model, resp.StatusCode, nil)
 		log.Printf("embed: step %s/%s failed: status %d", step.Provider, step.Model, resp.StatusCode)
-		s.record(step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
+		s.record(r, step, chain, req, resp.StatusCode, errors.New(http.StatusText(resp.StatusCode)), keyEnv)
 		permit.Release()
 	}
 	log.Printf("embed: all steps failed for model %q: %v", req.Model, lastErr)
@@ -669,93 +689,12 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 // tryEmbed is the embeddings sibling of tryStepAdaptor: same key-pool rotation
 // and retry, but the payload goes to the upstream's /v1/embeddings endpoint.
 func (s *Server) tryEmbed(ctx context.Context, r *http.Request, step router.Step, body []byte) (*http.Response, string, error) {
-	p, ok := s.provider(step.Provider)
-	if !ok {
-		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
-	}
-	pool := s.pools[step.Provider]
-	if pool == nil {
-		return nil, "", fmt.Errorf("provider %q: no key pool", step.Provider)
-	}
-	payload := mergeParams(withModel(body, step.Model), step.Params)
-	var lastErr error
-	var lastResp *http.Response
-	var lastKey string
-	for attempt := 0; attempt <= retries; attempt++ {
-		if err := abortCause(ctx, r); err != nil {
-			if lastResp != nil {
-				lastResp.Body.Close()
-			}
-			return nil, "", err
-		}
-		keyEnv := pool.Pick()
-		if keyEnv != "" && attempt > 0 && s.retryWait != nil {
-			if werr := sleepCtx(ctx, s.retryWait(attempt)); werr != nil {
-				if lastResp != nil {
-					lastResp.Body.Close()
-				}
-				return nil, "", abortCause(ctx, r)
-			}
-			if !pool.Available(keyEnv) {
-				keyEnv = pool.Pick()
-			}
-		}
-		if keyEnv == "" {
-			if lastResp != nil {
-				return lastResp, lastKey, nil
-			}
-			if lastErr != nil {
-				return nil, "", lastErr
-			}
-			return nil, "", errNoAvailableKeys
-		}
-		if lastResp != nil {
-			lastResp.Body.Close()
-			lastResp = nil
-		}
-		key := s.env(keyEnv)
-		if key == "" {
-			err := fmt.Errorf("provider %q: key env %q not set", p.Name, keyEnv)
-			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			lastErr = err
-			continue
-		}
-		a, err := adaptors.New(p, key)
-		if err != nil {
-			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			lastErr = err
-			continue
-		}
-		resp, err := a.Embed(ctx, payload)
-		if err != nil {
-			if aerr := abortCause(ctx, r); aerr != nil {
-				log.Printf("embed: %s/%s attempt %d aborted: %v", step.Provider, step.Model, attempt+1, aerr)
-				return nil, "", aerr
-			}
-			log.Printf("embed: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			pool.Mark(keyEnv, keypool.ClassFor(0, err))
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return resp, keyEnv, nil
-		}
-		log.Printf("embed: %s/%s attempt %d: status %d", step.Provider, step.Model, attempt+1, resp.StatusCode)
-		if !retryable(resp.StatusCode, nil) && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
-			return resp, keyEnv, nil // other 4xx: config/request error, never retried
-		}
-		pool.Mark(keyEnv, keypool.ClassFor(resp.StatusCode, nil))
-		if attempt == retries {
-			return resp, keyEnv, nil // transient failures exhausted: last response
-		}
-		lastResp, lastKey = resp, keyEnv
-	}
-	return nil, "", lastErr
+	return s.tryUpstream(ctx, r, step, body, adaptors.New, true)
 }
 
-// tryStep attempts one chain step, retrying transient failures (429, 5xx,
-// network errors) up to retries times with backoff. Each attempt picks a key
-// from the provider's pool; quarantinable failures rotate to the next key.
+// tryStep attempts one chain step with separate credential failover and
+// transient retry bounds, both subject to the request's shared retry budget.
+// Auth failover is immediate; rate limits and transient retries use backoff.
 // Streaming is safe: a retry only happens when no 2xx response has been
 // received yet — once the upstream starts streaming we are committed to that
 // stream.
@@ -793,117 +732,15 @@ func (s *Server) tryStepAuto(ctx context.Context, r *http.Request, step router.S
 }
 
 func (s *Server) tryStepAdaptor(ctx context.Context, r *http.Request, step router.Step, body []byte, mkAdaptor func(config.Provider, string) (adaptors.Adaptor, error)) (*http.Response, string, error) {
-	p, ok := s.provider(step.Provider)
-	if !ok {
-		return nil, "", fmt.Errorf("provider %q not in config", step.Provider)
-	}
-	pool := s.pools[step.Provider]
-	if pool == nil {
-		return nil, "", fmt.Errorf("provider %q: no key pool", step.Provider)
-	}
-	payload := mergeParams(withModel(body, step.Model), step.Params)
-	var lastErr error
-	var lastResp *http.Response
-	var lastKey string
-	for attempt := 0; attempt <= retries; attempt++ {
-		if err := abortCause(ctx, r); err != nil {
-			if lastResp != nil {
-				lastResp.Body.Close()
-			}
-			return nil, "", err
-		}
-		keyEnv := pool.Pick()
-		if keyEnv != "" && attempt > 0 && s.retryWait != nil {
-			if werr := sleepCtx(ctx, s.retryWait(attempt)); werr != nil {
-				if lastResp != nil {
-					lastResp.Body.Close()
-				}
-				return nil, "", abortCause(ctx, r)
-			}
-			if !pool.Available(keyEnv) {
-				keyEnv = pool.Pick()
-			}
-		}
-		if keyEnv == "" {
-			if lastResp != nil {
-				return lastResp, lastKey, nil
-			}
-			if lastErr != nil {
-				return nil, "", lastErr
-			}
-			return nil, "", errNoAvailableKeys
-		}
-		if lastResp != nil {
-			lastResp.Body.Close()
-			lastResp = nil
-		}
-		key := s.env(keyEnv)
-		if key == "" {
-			err := fmt.Errorf("provider %q: key env %q not set", p.Name, keyEnv)
-			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			lastErr = err
-			continue
-		}
-		a, err := mkAdaptor(p, key)
-		if err != nil {
-			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			lastErr = err
-			continue
-		}
-		resp, err := a.Chat(ctx, payload)
-		if err != nil {
-			if aerr := abortCause(ctx, r); aerr != nil {
-				log.Printf("chat: %s/%s attempt %d aborted: %v", step.Provider, step.Model, attempt+1, aerr)
-				return nil, "", aerr
-			}
-			log.Printf("chat: %s/%s attempt %d: %v", step.Provider, step.Model, attempt+1, err)
-			pool.Mark(keyEnv, keypool.ClassFor(0, err))
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return resp, keyEnv, nil
-		}
-		log.Printf("chat: %s/%s attempt %d: status %d", step.Provider, step.Model, attempt+1, resp.StatusCode)
-		if !retryable(resp.StatusCode, nil) && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
-			return resp, keyEnv, nil // other 4xx: config/request error, never retried
-		}
-		pool.Mark(keyEnv, keypool.ClassFor(resp.StatusCode, nil))
-		if attempt == retries {
-			return resp, keyEnv, nil // transient failures exhausted: last response
-		}
-		lastResp, lastKey = resp, keyEnv
-	}
-	return nil, "", lastErr
+	return s.tryUpstream(ctx, r, step, body, mkAdaptor, false)
 }
 
-// A disconnected caller has no next retry. Cancellation must also interrupt
-// backoff rather than briefly quarantining each otherwise healthy key.
-func (s *Server) waitRetry(ctx context.Context, attempt int) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if attempt == 0 || s.retryWait == nil {
-		return nil
-	}
-	t := time.NewTimer(s.retryWait(attempt))
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return ctx.Err()
-	}
-}
-
-// retryable reports whether a failure is transient: network errors, rate
-// limits, and 5xx. Client errors (4xx) are config or request problems and are
-// never retried or counted against provider health.
+// retryable reports whether a failure may be retried, using the shared
+// outcome classifier: credential failover (auth), rate limits, upstream
+// transient failures and local network errors are retryable; caller errors,
+// model incompatibility and cancellation are not.
 func retryable(status int, err error) bool {
-	if err != nil {
-		return true
-	}
-	return status == http.StatusTooManyRequests || status >= 500
+	return outcome.Retryable(outcome.Classify(status, err))
 }
 
 // withModel rewrites the "model" field of a chat completion body to the given
@@ -993,13 +830,13 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 		}
 		if err != nil {
 			s.mark(r, step.Provider, step.Model, 0, err)
-			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
+			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, err)
 			log.Printf("chat: %s/%s body read failed: %v", step.Provider, step.Model, err)
 			return unusableBody(err)
 		}
 		if verr := validateChatCompletion(body, req.N); verr != nil {
 			s.mark(r, step.Provider, step.Model, 0, verr)
-			s.poolRecordResult(keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
+			s.poolRecordResult(r, keyEnv, step, chain, req, 502, 0, 0, keypool.ClassTransient, verr)
 			log.Printf("chat: %s/%s returned an unusable 2xx body: %v", step.Provider, step.Model, verr)
 			return unusableBody(verr)
 		}
@@ -1011,7 +848,7 @@ func (s *Server) relaySuccess(w http.ResponseWriter, r *http.Request, step route
 		}
 		s.markSuccess(r, step.Provider, step.Model)
 		in, out := telemetry.ParseUsage(body)
-		s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+		s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 		return relayResult{outcome: relayCommitted}
 	}
 	s.relayStream(w, r, step, chain, req, resp, keyEnv)
@@ -1066,7 +903,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 		io.WriteString(w, payload+"\n\n")
 		flusher.Flush()
 		s.mark(r, step.Provider, step.Model, 0, err)
-		s.poolRecordResult(keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
+		s.poolRecordResult(r, keyEnv, step, chain, req, 502, in, out, keypool.ClassTransient, err)
 	}
 
 	for {
@@ -1125,7 +962,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 						}
 						flusher.Flush()
 						s.markSuccess(r, step.Provider, step.Model)
-						s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+						s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 						return
 					}
 					if _, werr := w.Write(pending.Bytes()); werr != nil {
@@ -1175,7 +1012,7 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 						flusher.Flush()
 					}
 					s.markSuccess(r, step.Provider, step.Model)
-					s.poolRecord(keyEnv, step, chain, req, resp.StatusCode, in, out, "")
+					s.poolRecord(r, keyEnv, step, chain, req, resp.StatusCode, in, out, "")
 					return
 				}
 				log.Printf("chat: stream error from %q: %v", step.Provider, err)
@@ -1188,27 +1025,26 @@ func (s *Server) relayStream(w http.ResponseWriter, r *http.Request, step router
 
 // poolRecord records usage against the serving key and marks its pool state:
 // failures for class != "", success otherwise.
-func (s *Server) poolRecord(keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class) {
-	s.poolRecordResult(keyEnv, step, chain, req, status, in, out, class, nil)
+func (s *Server) poolRecord(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class) {
+	s.poolRecordResult(r, keyEnv, step, chain, req, status, in, out, class, nil)
 }
 
 // poolRecordResult commits one terminal request event, including an error and
 // any partial usage, rather than recording separate token and error rows.
-func (s *Server) poolRecordResult(keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class, err error) {
-	p := s.pools[step.Provider]
-	if p != nil && keyEnv != "" {
+func (s *Server) poolRecordResult(r *http.Request, keyEnv string, step router.Step, chain string, req chatRequest, status int, in, out int64, class keypool.Class, err error) {
+	lease := attemptLease(r, keyEnv)
+	if r.Context().Err() != nil || isClientGone(err) {
+		lease.Release()
+		return
+	}
+	if lease != nil {
 		if class != "" {
-			p.Mark(keyEnv, class)
+			lease.Failure(class)
 		} else {
-			p.MarkSuccess(keyEnv)
+			lease.Success()
 		}
-		p.Record(keyEnv, in, out)
 	}
-	e := telemetry.Event{Provider: step.Provider, Chain: chain, Model: step.Model, Stream: req.Stream, Status: status, TokensIn: in, TokensOut: out, Key: keyEnv, Ts: time.Now()}
-	if err != nil {
-		e.Err = err.Error()
-	}
-	s.tm.Record(e)
+	s.recordAttempt(r, step, chain, req, status, err, keyEnv, in, out)
 }
 
 // dataPayload returns the JSON payload of an SSE data: line, or nil.
@@ -1220,33 +1056,6 @@ func dataPayload(line []byte) []byte {
 	return []byte(strings.TrimSpace(s[len("data:"):]))
 }
 
-func (s *Server) record(step router.Step, chain string, req chatRequest, status int, err error, key string) {
-	e := telemetry.Event{
-		Provider: step.Provider,
-		Chain:    chain,
-		Model:    step.Model,
-		Stream:   req.Stream,
-		Status:   status,
-		Key:      key,
-		Ts:       time.Now(),
-	}
-	if err != nil {
-		e.Err = err.Error()
-	}
-	s.tm.Record(e)
-}
-
-func (s *Server) recordTokens(step router.Step, chain string, req chatRequest, status int, in, out int64, key string) {
-	e := telemetry.Event{
-		Provider:  step.Provider,
-		Chain:     chain,
-		Model:     step.Model,
-		Stream:    req.Stream,
-		Status:    status,
-		TokensIn:  in,
-		TokensOut: out,
-		Key:       key,
-		Ts:        time.Now(),
-	}
-	s.tm.Record(e)
+func (s *Server) record(r *http.Request, step router.Step, chain string, req chatRequest, status int, err error, key string) {
+	s.recordAttempt(r, step, chain, req, status, err, key, 0, 0)
 }

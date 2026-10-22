@@ -147,14 +147,26 @@ func FallbackOrder(cands []Candidate, order []string, ranked map[string]int) []C
 		if oi {
 			return si < sj
 		}
-		pi := prio[cp[i].Step.Provider]
-		pj := prio[cp[j].Step.Provider]
+		pi := staticPriority(cp[i], prio)
+		pj := staticPriority(cp[j], prio)
 		if pi != pj {
 			return pi < pj
 		}
 		return cp[i].Chain < cp[j].Chain
 	})
 	return cp
+}
+
+// Exact model entries override the provider-wide entry, even if the latter
+// appears earlier. Unconfigured candidates follow every configured entry.
+func staticPriority(c Candidate, priority map[string]int) int {
+	if rank, ok := priority[c.Step.Provider+"/"+c.Step.Model]; ok {
+		return rank
+	}
+	if rank, ok := priority[c.Step.Provider]; ok {
+		return rank
+	}
+	return int(^uint(0) >> 1)
 }
 
 func scoreOf(step string, ranked map[string]int) (int, bool) {
