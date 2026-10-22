@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -266,8 +267,10 @@ type chainInfo struct {
 }
 
 type chainStep struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider   string         `json:"provider"`
+	Model      string         `json:"model"`
+	Params     map[string]any `json:"params,omitempty"`
+	ParamsYAML string         `json:"params_yaml,omitempty"`
 }
 
 func (c command) chainsCmd(args []string) error {
@@ -297,12 +300,16 @@ func (c command) chainsListCmd(args []string) error {
 		return fmt.Errorf("chains list accepts no positional arguments")
 	}
 
-	var out chainResp
-	if err := cf.get("/v1/chains", &out); err != nil {
+	var raw json.RawMessage
+	if err := cf.get("/v1/chains", &raw); err != nil {
 		return err
 	}
 	if cf.json {
-		return c.printJSON(out)
+		return c.printJSON(raw)
+	}
+	var out chainResp
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
 	}
 	fmt.Fprintf(c.out, "%-20s %-8s  %s\n", "NAME", "SOURCE", "STEPS")
 	for _, ch := range out.Chains {
@@ -404,7 +411,13 @@ func (c command) chainsRmCmd(args []string) error {
 	if name == "" || fs.NArg() != 1 {
 		return fmt.Errorf("chains rm NAME")
 	}
-	if err := cf.do(http.MethodDelete, "/v1/chains/"+name, nil, nil); err != nil {
+	escapedName := url.PathEscape(name)
+	// Complete dot segments must also be escaped so ServeMux does not clean
+	// them away before matching the single-name route.
+	if name == "." || name == ".." {
+		escapedName = strings.ReplaceAll(name, ".", "%2E")
+	}
+	if err := cf.do(http.MethodDelete, "/v1/chains/"+escapedName, nil, nil); err != nil {
 		return err
 	}
 	fmt.Fprintf(c.out, "removed chain %q\n", name)
