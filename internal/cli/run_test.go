@@ -7,7 +7,6 @@ import (
 	"flag"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,15 +22,14 @@ func TestRunStatusAndLogsRetainAuthenticationAndJSON(t *testing.T) {
 	} {
 		t.Run(tc.args[0], func(t *testing.T) {
 			var requests atomic.Int32
-			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gateway := cliTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requests.Add(1)
 				if r.Method != http.MethodGet || r.URL.RequestURI() != tc.path || r.Header.Get("Authorization") != "Bearer env-admin" {
 					t.Errorf("request changed: %s %s auth=%q", r.Method, r.URL.RequestURI(), r.Header.Get("Authorization"))
 				}
 				io.WriteString(w, `{"lines":["one","two"],"future_field":true}`)
 			}))
-			defer gateway.Close()
-			t.Setenv("GUVNA_URL", gateway.URL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", gateway)
 			t.Setenv("GUVNA_ADMIN_KEY", "env-admin")
 			var output bytes.Buffer
 			if err := Run(tc.args, &output, io.Discard); err != nil {
@@ -54,7 +52,7 @@ func TestRunHelpAndInvalidFlagsNeverSendRequests(t *testing.T) {
 		{[]string{"chains", "list", "--help"}, true},
 		{[]string{"chains", "add", "--help"}, true},
 		{[]string{"chains", "rm", "--help"}, true},
-		{[]string{"status", "--url"}, false},
+		{[]string{"status", "--socket"}, false},
 		{[]string{"status", "--token", "--json"}, false},
 		{[]string{"status", "unexpected"}, false},
 		{[]string{"logs", "--unknown"}, false},
@@ -65,7 +63,7 @@ func TestRunHelpAndInvalidFlagsNeverSendRequests(t *testing.T) {
 	} {
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
 			gateway, requests := cliTestGateway(t)
-			t.Setenv("GUVNA_URL", gateway.URL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", gateway)
 			t.Setenv("GUVNA_ADMIN_KEY", "private-help-token")
 			var stderr bytes.Buffer
 			err := Run(tc.args, io.Discard, &stderr)

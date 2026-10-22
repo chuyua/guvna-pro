@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/creamy-ghost/guvna/internal/health"
 	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
 )
@@ -28,6 +29,50 @@ type autoComparison struct {
 	Disagrees      bool      `json:"disagrees"`
 	Applied        bool      `json:"applied"`
 	Reason         string    `json:"reason"`
+}
+
+// Current breaker state and historical traffic are separate observations. A
+// provider without attempts in the requested window has no availability evidence.
+type autoProviderOverview struct {
+	Provider          string `json:"provider"`
+	Configured        bool   `json:"configured"`
+	ObservationStatus string `json:"observation_status"`
+	Attempts          int    `json:"attempts"`
+	TrackedModels     int    `json:"tracked_models"`
+	DownModels        int    `json:"down_models"`
+}
+
+func (s *Server) autoProviderOverview(observed telemetry.ProviderHealthSnapshot, current []health.StepStatus) []autoProviderOverview {
+	providers := make(map[string]*autoProviderOverview)
+	get := func(name string) *autoProviderOverview {
+		if providers[name] == nil {
+			providers[name] = &autoProviderOverview{Provider: name, ObservationStatus: "no_data"}
+		}
+		return providers[name]
+	}
+	for _, provider := range s.cfg.Providers {
+		get(provider.Name).Configured = true
+	}
+	for _, stat := range observed.Providers {
+		provider := get(stat.Provider)
+		provider.Attempts += stat.Attempts
+		if provider.Attempts > 0 {
+			provider.ObservationStatus = "observed"
+		}
+	}
+	for _, step := range current {
+		provider := get(step.Provider)
+		provider.TrackedModels++
+		if step.Down {
+			provider.DownModels++
+		}
+	}
+	result := make([]autoProviderOverview, 0, len(providers))
+	for _, provider := range providers {
+		result = append(result, *provider)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Provider < result[j].Provider })
+	return result
 }
 
 type autoScoringState struct {
@@ -194,6 +239,24 @@ func (s *Server) handleAutoScoring(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "candidate statistics unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	autoRequests, err := s.tm.AutoRequestStats(ctx, since, until)
+	if err != nil {
+		http.Error(w, "auto request statistics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	providerHealth, err := s.tm.ProviderHealthStats(ctx, since, until)
+	if err != nil {
+		http.Error(w, "provider health statistics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	currentModelHealth := s.hlth.Snapshot()
+	sort.Slice(currentModelHealth, func(i, j int) bool {
+		a, b := currentModelHealth[i], currentModelHealth[j]
+		if a.Provider != b.Provider {
+			return a.Provider < b.Provider
+		}
+		return a.Model < b.Model
+	})
 	state := &s.autoScoring
 	state.mu.Lock()
 	comparisons := make([]autoComparison, 0, state.count)
@@ -206,10 +269,22 @@ func (s *Server) handleAutoScoring(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(struct {
-		Mode                string                      `json:"mode"`
-		MinSamples          int                         `json:"min_samples"`
-		Metrics             telemetry.CandidateSnapshot `json:"metrics"`
-		Comparisons         []autoComparison            `json:"comparisons"`
-		ComparisonRetention string                      `json:"comparison_retention"`
-	}{s.autoScoringMode(), s.autoScoringMinSamples(), snapshot, comparisons, "latest 512, process lifetime"})
+		Mode                string                           `json:"mode"`
+		MinSamples          int                              `json:"min_samples"`
+		Metrics             telemetry.CandidateSnapshot      `json:"metrics"`
+		Comparisons         []autoComparison                 `json:"comparisons"`
+		ComparisonRetention string                           `json:"comparison_retention"`
+		AutoRequests        telemetry.AutoRequestSnapshot    `json:"auto_requests"`
+		ProviderHealth      telemetry.ProviderHealthSnapshot `json:"provider_health"`
+		CurrentModelHealth  []health.StepStatus              `json:"current_model_health"`
+		ProviderOverview    []autoProviderOverview           `json:"provider_overview"`
+		ObservedAt          time.Time                        `json:"observed_at"`
+		Telemetry           telemetry.FlushStats             `json:"telemetry"`
+	}{
+		Mode: s.autoScoringMode(), MinSamples: s.autoScoringMinSamples(),
+		Metrics: snapshot, Comparisons: comparisons, ComparisonRetention: "latest 512, process lifetime",
+		AutoRequests: autoRequests, ProviderHealth: providerHealth,
+		CurrentModelHealth: currentModelHealth, ProviderOverview: s.autoProviderOverview(providerHealth, currentModelHealth),
+		ObservedAt: time.Now(), Telemetry: s.tm.FlushStats(),
+	})
 }

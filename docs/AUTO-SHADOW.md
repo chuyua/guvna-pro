@@ -1,8 +1,10 @@
-# Auto ordering experiments
+# Passive Auto and provider observations
 
-The existing LLM decider remains the default. This experiment compares it with
-local observations without sending duplicate inference requests to candidates.
-It does not infer how an untried candidate would have answered.
+The existing LLM decider remains the default. Normal Auto requests now produce a
+completed request summary in every ordering mode. Provider observations come
+from real attempt telemetry across the model routes. Collection and inspection
+send no new inference requests, probes or randomized traffic. They do not infer
+how an untried candidate would have answered.
 
 ## Modes and rollback
 
@@ -67,22 +69,100 @@ to the same model through different endpoints can share a group. Window-edge
 requests and capped samples can be incomplete. None of these metrics proves
 that the unexecuted shadow policy would outperform the decider.
 
-## Inspection and bounds
+## Actual Auto request results
 
-Use the admin Bearer credential to request:
+Each invocation of the Auto handler (`/v1/auto` and Chat `model:auto`) records one
+summary after completion, including selection errors and cancellation. Rejected
+authentication and body-read errors before entering that handler are outside
+this collection scope. A summary stores request ID, configured `mode`, actual
+`policy` (`decider`, `static`, `telemetry`, or `none` before selection), original
+decider source, stream flag, actual attempt and distinct candidate counts,
+terminal status/class, and elapsed time. It stores no prompts, response content
+or credential values.
 
-```text
-GET /admin/auto/scoring
-GET /admin/auto/scoring?since=2026-10-21T00:00:00Z&until=2026-10-21T01:00:00Z
+`auto_requests.policies` groups actual requests by mode, policy and stream flag:
+
+- `requests`, `successes`, `failures`, `canceled`, `attempts` and
+  `no_attempt_requests` describe whole requests, not just individual attempts.
+- `first_attempt_success_rate` requires a validated successful completion with
+  exactly one actual upstream attempt.
+- `fallback_rate` counts requests which actually tried more than one distinct
+  provider/model. Rotating keys or retrying the same candidate is not fallback.
+- Rates use `requests - canceled` as their denominator. Selection failures
+  remain unsuccessful requests. Canceled requests are reported separately.
+- `p95_latency_ms` is the nearest-rank p95 of completed, noncanceled requests,
+  including failed requests. Elapsed time includes decision waits, retries and
+  the complete response body/stream, rather than just response headers.
+
+Summary windows use completion time in `[since, until)`. A request which starts
+before the window but completes within it is included as a whole request. No
+outcome is fabricated for the unexecuted shadow order: its success rate remains
+unknown. Comparing different time periods can reflect changes in workload or
+provider conditions; these observations alone do not prove a better policy.
+
+## Passive provider health
+
+`provider_health.providers` groups real attempt rows by provider and stream flag.
+Rows without request IDs or positive attempt metadata are legacy rows and do not
+participate. Failure counters are separate:
+
+| Counter | Meaning |
+| --- | --- |
+| `successes` | Complete validated 2xx response |
+| `upstream_failures` | 5xx, unusable 2xx or gateway timeout |
+| `network_failures` | DNS, connection or transport failure; may be local |
+| `auth_failures` | 401/403 credential issue |
+| `rate_limited` | 429 capacity/quota limit |
+| `request_errors` | Caller error or model/request incompatibility |
+| `canceled` / `other_failures` | Explicit cancellation / unrecognized class |
+
+`health_samples = successes + upstream_failures + network_failures + rate_limited`.
+`service_success_rate = successes / health_samples`, or `null` without such
+evidence. Authentication and request errors are not counted as provider service
+failures. This is observed availability along the request path, not a diagnosis
+of a provider-wide outage. `p95_latency_ms` includes failed noncanceled attempts;
+`last_attempt_at` identifies the latest observation. Existing attempt telemetry
+generally omits canceled attempts; the request summaries still expose Auto
+cancellations.
+
+`provider_overview` includes configured providers with no observations as
+`observation_status: no_data`. `current_model_health` and each provider's
+`down_models` describe the current in-memory model breaker state separately from
+the historical window. One cooled model does not establish that every model at
+the provider is down.
+
+## Local inspection and bounds
+
+On the gateway host, use the existing admin credential with the local CLI:
+
+```sh
+export GUVNA_ADMIN_KEY="$ADMIN_KEY"
+guvna status --scoring
+guvna status --scoring --since 2026-10-21T00:00:00Z --until 2026-10-21T01:00:00Z --json
 ```
 
-The response includes `metrics`, the requested mode and sample threshold, and
+The command connects only to the filesystem socket. Specify `--socket` when the
+service uses a custom data directory; see [CLI.md](CLI.md). There are no public
+`/admin/*` or `/v1/chains` management routes, including on the model API port
+forwarded by Cloudflare Tunnel. The management socket must not be proxied.
+
+The report includes `auto_requests`, `provider_health`, `provider_overview`,
+`current_model_health`, `observed_at` and `telemetry` flush/queue/drop counters.
+It retains `metrics`, the requested mode and sample threshold, and
 `comparisons` containing request IDs, both orders, disagreement, application
 status and a reason. `since` is inclusive; `until` is exclusive. Both are
-RFC3339 timestamps and the interval must be positive and no longer than 7 days.
-Metric queries read at most the newest 100000 matching rows and expose
-`truncated`; the admin query has a 1s deadline. Routing uses a 15s cache with
+RFC3339Nano timestamps and the interval must be positive and no longer than 7 days.
+Queries read bounded samples of at most 100000 rows and expose `truncated`;
+the provider query may conservatively report truncation when precision boundary
+filtering reaches its scan cap. All diagnostic queries share a 1s deadline and
+report storage errors explicitly. Routing uses a 15s cache with
 a 100ms query deadline and retains the decider on storage errors.
+
+New summaries use the same bounded FIFO and transactional background flush as
+attempt events (30s in the service). Recently completed traffic may still be
+queued; inspect `telemetry` before interpreting an empty or incomplete report.
+Failed batches are retained for retry where capacity permits; dropped counters
+cover both event kinds. A process crash can lose the current buffered interval.
 
 Comparison records are an in-memory ring of the latest 512 selections and are
 lost on restart. They are also logged. Request routing adds no synchronous

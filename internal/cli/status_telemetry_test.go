@@ -4,17 +4,15 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
 func TestStatusPreservesJSONAndDisplaysTelemetryFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := cliTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"uptime":"1h","chains":[],"steps":[],"keys":[{"env":"KEY_A"}],"future_field":{"kept":true},"usage_error":"persisted usage unavailable","telemetry":{"flushes_ok":2,"flushes_failed":3,"retried_events":4,"dropped_events":5,"buffer_len":6,"inflight_events":7}}`)
 	}))
-	defer server.Close()
-	args := []string{"--url", server.URL, "--token", "dummy"}
+	args := []string{"--socket", server, "--token", "dummy"}
 	output, err := captureCLIOutput(t, func(c command) error { return c.statusCmd(append(args, "--json")) })
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,23 @@
 
 Rules: one entry per decision, date, context, rationale. New sessions should read this first — these were hard-won, don't relitigate without new evidence.
 
+## 2026-10-22 — Local management boundary and passive collection
+
+**Decision:** Public model listeners have no `/admin/*` or `/v1/chains` management
+routes. The single `guvna` CLI manages the running service over a local filesystem
+socket, with admin Bearer authentication and local file permissions. This
+supersedes historical remote CLI and client-key chain self-provisioning decisions
+below; there is no management TCP listener or remote URL fallback.
+
+**Context:** The operator requires host-local management only; Cloudflare Tunnel
+forwards model APIs. A tunnel can originate from loopback, so peer-IP checks
+cannot enforce this boundary.
+
+**Collection:** Normal Auto traffic records whole-request outcomes; existing
+attempts provide passive provider classifications. Queries run locally through
+`guvna status --scoring`. Default routing remains decider; shadow outcomes stay
+unknown and no randomized experiments or new probes are introduced.
+
 ## 2026-08-14 — Project: Guvna
 
 **Decision:** Build a low-resource, single-user AI gateway from scratch in Go. Name: Guvna.
@@ -108,6 +125,9 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 
 ## 2026-08-16 — Remote CLI over the gateway, no new port
 
+**Superseded (2026-10-22):** This historical transport is retired. Management is
+available only through the local CLI socket; see the current decision above.
+
 **Decision:** Observability = `GET /admin/status` + `GET /admin/logs` in core (admin-key-only) + a `guvna-cli` binary (status/logs, `--json`), hitting the same caddy vhost over TLS.
 
 **Rationale:** Nothing new exposed — the admin key already authenticates; TLS terminates at caddy. `status`/`logs`/usage from the laptop was the top capability for daily use.
@@ -143,6 +163,9 @@ Rules: one entry per decision, date, context, rationale. New sessions should rea
 **Rationale:** Chains are a routing primitive, not a product decision baked into config. Client-driven creation keeps the gateway generic — each app provisions exactly what it needs. Provider-prefixed passthrough (`<prefix>/<model>`) covers direct single-model calls without any chain at all.
 
 ## 2026-08-16 — Chain creation surface: API + CLI, not config
+
+**Superseded in part (2026-10-22):** Runtime chain persistence remains; management
+is now local and admin-only. Public client-key chain creation is removed.
 
 **Decision:** Chains are runtime state (chains.yaml in the data dir, atomic rewrite), managed via `POST/DELETE /v1/chains` and `guvna-cli chains` — live, no redeploy. Config-defined chains still load (merged, conflicts skipped with a warning).
 

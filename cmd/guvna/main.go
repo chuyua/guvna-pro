@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/creamy-ghost/guvna/internal/cli"
 	"github.com/creamy-ghost/guvna/internal/config"
 	"github.com/creamy-ghost/guvna/internal/health"
+	"github.com/creamy-ghost/guvna/internal/localadmin"
 	"github.com/creamy-ghost/guvna/internal/logring"
 	"github.com/creamy-ghost/guvna/internal/router"
 	"github.com/creamy-ghost/guvna/internal/server"
@@ -28,10 +30,9 @@ import (
 )
 
 const (
-	envAdminKey  = "ADMIN_KEY"
-	envAPIKeys   = "API_KEYS"
-	flushEvery   = 30 * time.Second
-	defaultDBDir = ".guvna"
+	envAdminKey = "ADMIN_KEY"
+	envAPIKeys  = "API_KEYS"
+	flushEvery  = 30 * time.Second
 )
 
 // version is set from the release tag with -ldflags '-X main.version=<tag>'.
@@ -85,6 +86,7 @@ usage:
   guvna [-config path] [-data directory]  (legacy service startup)
   guvna --healthcheck [-config path]
   guvna status [flags]
+  guvna status --scoring [--since timestamp --until timestamp] [flags]
   guvna logs [-n 100] [flags]
   guvna chains [list] [flags]
   guvna chains add NAME --step provider:model [--step ...] [flags]
@@ -92,7 +94,7 @@ usage:
   guvna --version
 
 management flags:
-  --url    gateway base URL (default: http://127.0.0.1:20128 or $GUVNA_URL)
+  --socket local management socket (default: ~/.guvna/admin.sock or $GUVNA_ADMIN_SOCKET)
   --token  admin key (default: $GUVNA_ADMIN_KEY)
   --json   emit raw JSON instead of a table
 
@@ -171,28 +173,69 @@ func serve(args []string, stderr io.Writer) error {
 	ring := logring.New(512)
 	log.SetOutput(io.MultiWriter(stderr, ring))
 	api := server.New(cfg, rtr, authn, tm, hlth, ring, chainStore)
-	api.StartAutoDecider()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	publicListener, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return fmt.Errorf("public listener: %w", err)
+	}
+	defer publicListener.Close()
+	socketPath := localadmin.SocketPath(opts.dataDir)
+	adminListener, err := localadmin.Listen(socketPath)
+	if err != nil {
+		return err
+	}
+	defer adminListener.Close()
+	adminServer := &http.Server{Handler: api.AdminHandler(), ReadHeaderTimeout: 10 * time.Second}
+	api.StartAutoDecider()
+	log.Printf("public API listening on %s (db=%s); local management socket=%s", publicListener.Addr(), dbPath, socketPath)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return serveEndpoints(ctx, srv, adminServer, publicListener, adminListener)
+}
 
-	go func() {
-		log.Printf("listening on %s (db=%s)", srv.Addr, dbPath)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server: %v", err)
-		}
-	}()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stop)
-	<-stop
+// Both listeners are opened before startup succeeds. Any serving failure stops
+// the other endpoint too; management never falls back to the public listener.
+func serveEndpoints(ctx context.Context, public, admin *http.Server, publicListener, adminListener net.Listener) error {
+	serveErrors := make(chan error, 2)
+	for _, endpoint := range []struct {
+		name string
+		srv  *http.Server
+		ln   net.Listener
+	}{{"public API", public, publicListener}, {"local management", admin, adminListener}} {
+		go func() {
+			err := endpoint.srv.Serve(endpoint.ln)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			if err != nil {
+				err = fmt.Errorf("%s: %w", endpoint.name, err)
+			}
+			serveErrors <- err
+		}()
+	}
+	var result error
+	select {
+	case <-ctx.Done():
+	case result = <-serveErrors:
+	}
 	log.Printf("shutting down")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return srv.Shutdown(ctx)
+	shutdownErrors := make(chan error, 2)
+	for _, srv := range []*http.Server{public, admin} {
+		go func() {
+			err := srv.Shutdown(shutdownCtx)
+			if err != nil {
+				srv.Close()
+			}
+			shutdownErrors <- err
+		}()
+	}
+	return errors.Join(result, <-shutdownErrors, <-shutdownErrors)
 }
 
 // doHealthCheck probes a running instance's /healthz. Distroless images have
@@ -227,9 +270,5 @@ func loadConfig(flagPath string) (*config.Config, error) {
 }
 
 func dbDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return defaultDBDir
-	}
-	return filepath.Join(home, defaultDBDir)
+	return localadmin.DefaultDataDir()
 }

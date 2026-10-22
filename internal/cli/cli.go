@@ -1,10 +1,8 @@
-// guvna — local and remote status, logs, and chain management for a
-// Guvna gateway. Local: talks to http://127.0.0.1:20128 (or GUVNA_URL).
-// Remote: point --url at the gateway's HTTPS endpoint (caddy) — the admin
-// key travels as a Bearer token; no new port is exposed.
+// Package cli provides local status, logs and chain management over a
+// filesystem socket. Management never connects to the public HTTP listener.
 //
-//	guvna status [--url URL] [--token KEY]
-//	guvna logs [-n 100] [--url URL] [--token KEY]
+//	guvna status [--scoring] [--socket PATH] [--token KEY]
+//	guvna logs [-n 100] [--socket PATH] [--token KEY]
 //	guvna chains [list]
 //	guvna chains add NAME --step provider:model [--step ...]
 //	guvna chains rm NAME
@@ -20,9 +18,9 @@ import (
 	"os"
 	"strings"
 	"time"
-)
 
-const defaultURL = "http://127.0.0.1:20128"
+	"github.com/creamy-ghost/guvna/internal/localadmin"
+)
 
 // Run executes a management command against an already-running gateway.
 // It never starts a server or exits the process.
@@ -64,24 +62,17 @@ func (c command) parse(fs *flag.FlagSet, args []string) error {
 }
 
 type commonFlags struct {
-	url   string
-	token string
-	json  bool
+	socket string
+	token  string
+	json   bool
 }
 
 func parseCommon(fs *flag.FlagSet, cf *commonFlags) {
-	fs.StringVar(&cf.url, "url", envOr("GUVNA_URL", defaultURL), "gateway base URL")
+	fs.StringVar(&cf.socket, "socket", localadmin.SocketPath(localadmin.DefaultDataDir()), "local management socket path ($GUVNA_ADMIN_SOCKET)")
 	fs.StringVar(&cf.token, "token", os.Getenv("GUVNA_ADMIN_KEY"), "admin key (Bearer token)")
 	// Keep the environment default active without displaying a credential in help.
 	fs.Lookup("token").DefValue = ""
 	fs.BoolVar(&cf.json, "json", false, "raw JSON output")
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func (cf commonFlags) get(path string, out any) error {
@@ -102,7 +93,7 @@ func (cf commonFlags) do(method, path string, body any, out any) error {
 		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, strings.TrimRight(cf.url, "/")+path, rd)
+	req, err := http.NewRequest(method, "http://local-admin"+path, rd)
 	if err != nil {
 		return err
 	}
@@ -110,7 +101,8 @@ func (cf commonFlags) do(method, path string, body any, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := localadmin.Client(cf.socket, 10*time.Second)
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -170,11 +162,20 @@ func (c command) statusCmd(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	var cf commonFlags
 	parseCommon(fs, &cf)
+	scoring := fs.Bool("scoring", false, "show passive Auto and provider observations")
+	since := fs.String("since", "", "inclusive RFC3339Nano observation window start (with --scoring)")
+	until := fs.String("until", "", "exclusive RFC3339Nano observation window end (with --scoring)")
 	if err := c.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("%s accepts no positional arguments", fs.Name())
+	}
+	if *scoring {
+		return c.scoringStatus(cf, *since, *until)
+	}
+	if *since != "" || *until != "" {
+		return fmt.Errorf("--since and --until require --scoring")
 	}
 
 	var raw json.RawMessage
@@ -189,7 +190,7 @@ func (c command) statusCmd(args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(c.out, "Guvna %s  (uptime %s)\n", cf.url, st.Uptime)
+	fmt.Fprintf(c.out, "Guvna local %s  (uptime %s)\n", cf.socket, st.Uptime)
 	fmt.Fprintf(c.out, "chains: %s\n\n", strings.Join(st.Chains, "  "))
 
 	fmt.Fprintf(c.out, "%-12s %-28s %8s  %s\n", "PROVIDER", "MODEL", "FAILURES", "STATE")

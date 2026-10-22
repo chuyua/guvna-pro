@@ -4,9 +4,11 @@ Build order with definition of done per phase. No time estimates — this is a p
 
 **Current command names (2026-10-22):** The historical `guvna-cli` commands below
 are now part of the single `guvna` executable: `guvna status`, `guvna logs` and
-`guvna chains`. See [CLI.md](CLI.md). Standalone releases target Linux amd64 only.
+`guvna chains`. Management is now local-only over `admin.sock`; the public
+listener has no `/admin/*` or `/v1/chains` routes. Historical remote-management
+milestones below are superseded. See [CLI.md](CLI.md). Standalone releases target Linux amd64 only.
 
-**Use-ready cut (2026-08-16):** Guvna is live and usable daily. Gateway runs on the VPS behind caddy (`https://gateway.example.com:9443`), chains self-heal (failure marking + cool-off), and usage/health are visible from the laptop via the remote CLI. Everything below the cut is daily-use; everything after is growth.
+**Use-ready cut (2026-08-16):** Guvna is live and usable daily. Gateway model APIs run on the VPS behind caddy (`https://gateway.example.com:9443`), chains self-heal (failure marking + cool-off), and usage/health are visible through the host-local CLI. Everything below the cut is daily-use; everything after is growth.
 
 ---
 
@@ -38,21 +40,19 @@ are now part of the single `guvna` executable: `guvna status`, `guvna logs` and
 - Keys via `~/guvna/.env` (chmod 600), never in git
 - **Done:** streaming chat + admin status through the caddy subdomain from the laptop, container health checks green
 
-## Phase 4 — Remote CLI (DONE 2026-08-16, partial)
+## Phase 4 — CLI management (local-only since 2026-10-22)
 
-- Admin surface in core: `GET /admin/status` (uptime, chains, step health, usage aggregates) + `GET /admin/logs` (ring buffer tail), admin-key-only
-- `guvna-cli` binary: `status` (table or `--json`) + `logs [-n]`, local (`http://127.0.0.1:20128`) or remote (`--url https://gateway...:9443`, `--token`/`GUVNA_ADMIN_KEY`)
-- Scoped tokens: the admin key over the gateway's HTTPS endpoint — no new port exposed
-- **Not yet:** `connect` subcommand with revocable scoped tokens, `config`, `providers`
-- **Done when:** `guvna-cli status` from laptop shows real usage/health of the VPS instance — verified live
+- Single `guvna` executable: `status` (table or `--json`), `status --scoring`, `logs [-n]` and `chains`.
+- Admin handlers run only on the host-local filesystem socket, with an admin key and local permissions. No management TCP port or URL destination.
+- Passive collection exposes actual Auto request outcomes and classified provider observations without sending probe calls. Production sorting benefits still require observed evidence.
 
 ## Phase 4b — Custom chains API (DONE 2026-08-16)
 
-- **No default chains** — every chain is created per use case by the client; `/v1/models` starts empty; unknown model → 404 with a pointer to the creation API (no silent fallback)
-- `POST /v1/chains` (any valid API key — apps self-provision), `DELETE /v1/chains/{name}`, `GET /v1/chains`; persisted to `<data-dir>/chains.yaml` (atomic rewrite), merged over config at startup
+- **No default chains** — every chain is created per use case by the admin; `/v1/models` starts empty; unknown model → 404 with a pointer to the local command (no silent fallback)
+- Chain create/delete/list is admin-only on the local socket; persisted to `<data-dir>/chains.yaml` (atomic rewrite), merged over config at startup. The public chain endpoints are removed.
 - Provider-prefixed passthrough: `<prefix>/<model>` routes directly to a provider (strip suffix when known, else full name; per-provider `prefixes:` in config)
 - Loose validation: provider must exist, model non-empty — no model-existence checks (upstream is the catalog; stale local catalogs would reject valid new models)
-- `guvna-cli chains list|add|rm` (local + remote)
+- `guvna chains list|add|rm` (host-local only)
 - **Done:** create a chain via API from the laptop, chat through it, survive a container restart — verified live on the VPS (chain `myfree` persisted across `docker restart`)
 
 ## Phase 4c — Key pools & rotation (DONE 2026-08-17)

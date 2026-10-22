@@ -7,9 +7,13 @@ import (
 	"flag"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/creamy-ghost/guvna/internal/localadmin"
 )
 
 type recordedCLIRequest struct {
@@ -17,10 +21,32 @@ type recordedCLIRequest struct {
 	body                        []byte
 }
 
-func cliTestGateway(t *testing.T) (*httptest.Server, <-chan recordedCLIRequest) {
+func cliTestSocket(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	root := os.TempDir()
+	if runtime.GOOS == "windows" {
+		root = os.Getenv("PUBLIC") // AF_UNIX needs a short ASCII path on Windows.
+	}
+	dir, err := os.MkdirTemp(root, "gc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "admin.sock")
+	listener, err := localadmin.Listen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: handler}
+	go server.Serve(listener)
+	t.Cleanup(func() { server.Close(); listener.Close() })
+	return path
+}
+
+func cliTestGateway(t *testing.T) (string, <-chan recordedCLIRequest) {
 	t.Helper()
 	requests := make(chan recordedCLIRequest, 8)
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := cliTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
@@ -37,7 +63,6 @@ func cliTestGateway(t *testing.T) (*httptest.Server, <-chan recordedCLIRequest) 
 			io.WriteString(w, `{"chains":[]}`)
 		}
 	}))
-	t.Cleanup(s.Close)
 	return s, requests
 }
 
@@ -50,10 +75,10 @@ func captureCLIOutput(t *testing.T, run func(command) error) (string, error) {
 
 func TestChainsExplicitListUsesFlags(t *testing.T) {
 	s, requests := cliTestGateway(t)
-	t.Setenv("GUVNA_URL", s.URL)
+	t.Setenv("GUVNA_ADMIN_SOCKET", s)
 	t.Setenv("GUVNA_ADMIN_KEY", "environment-token")
 	output, err := captureCLIOutput(t, func(c command) error {
-		return c.chainsCmd([]string{"list", "--url", s.URL, "--token", "flag-token", "--json"})
+		return c.chainsCmd([]string{"list", "--socket", s, "--token", "flag-token", "--json"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +101,7 @@ func TestChainsMutationTrailingJSONFlag(t *testing.T) {
 				}
 			}()
 			s, requests := cliTestGateway(t)
-			t.Setenv("GUVNA_URL", s.URL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", s)
 			t.Setenv("GUVNA_ADMIN_KEY", "dummy-token")
 			args := []string{operation, "test-chain"}
 			if operation == "add" {
@@ -108,7 +133,7 @@ func TestChainsMutationTrailingJSONFlag(t *testing.T) {
 
 func TestChainsInvalidFlagsDoNotSendRequests(t *testing.T) {
 	for _, args := range [][]string{
-		{"list", "--url"},
+		{"list", "--socket"},
 		{"list", "--token", "--json"},
 		{"list", "--unknown", "dummy"},
 		{"list", "unexpected"},
@@ -116,13 +141,13 @@ func TestChainsInvalidFlagsDoNotSendRequests(t *testing.T) {
 		{"add", "test-chain", "--step", "a:one", "--token", "--json"},
 		{"add", "test-chain", "--step"},
 		{"add", "test-chain", "--step", "a:one", "--unknown"},
-		{"rm", "test-chain", "--url"},
+		{"rm", "test-chain", "--socket"},
 		{"rm", "test-chain", "--unknown"},
 		{"rm", "test-chain", "extra"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			s, requests := cliTestGateway(t)
-			t.Setenv("GUVNA_URL", s.URL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", s)
 			t.Setenv("GUVNA_ADMIN_KEY", "private-environment-token")
 			_, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
 			if err == nil {
@@ -149,7 +174,7 @@ func TestChainsFlagsBeforeNameAndEqualsValues(t *testing.T) {
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			s, requests := cliTestGateway(t)
-			t.Setenv("GUVNA_URL", s.URL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", s)
 			t.Setenv("GUVNA_ADMIN_KEY", "dummy-token")
 			_, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
 			if err != nil {
@@ -173,10 +198,10 @@ func TestChainsFlagsBeforeNameAndEqualsValues(t *testing.T) {
 
 func TestChainsDefaultListAcceptsFlags(t *testing.T) {
 	s, requests := cliTestGateway(t)
-	t.Setenv("GUVNA_URL", "http://unused.invalid")
+	t.Setenv("GUVNA_ADMIN_SOCKET", "http://unused.invalid")
 	t.Setenv("GUVNA_ADMIN_KEY", "unused-token")
 	output, err := captureCLIOutput(t, func(c command) error {
-		return c.chainsCmd([]string{"--url=" + s.URL, "--token=-flag-token", "--json"})
+		return c.chainsCmd([]string{"--socket=" + s, "--token=-flag-token", "--json"})
 	})
 	if err != nil || !json.Valid([]byte(output)) {
 		t.Fatalf("implicit list failed: output=%q err=%v", output, err)

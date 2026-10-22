@@ -1,10 +1,10 @@
 # CLI management
 
 One `guvna` executable starts the gateway with `serve` and manages it with
-`status`, `logs` and `chains`. Management commands run in a second process and
-talk to the running gateway's HTTP API, normally on port 20128. There is no
-browser login, OAuth flow or separate UI service on port 20129. OpenAI-compatible
-applications use that same API for inference.
+`status`, `logs` and `chains`. Management commands run on the gateway host and
+communicate through a private filesystem socket. OpenAI-compatible applications
+use the separate model API, normally on port 20128. There is no browser login,
+OAuth flow or additional TCP management port.
 
 ## Install the Linux amd64 release
 
@@ -80,27 +80,42 @@ starts the gateway with its existing defaults. `guvna --healthcheck -config ...`
 still probes the running gateway's `/healthz`; it does not start a service or
 call a model. Use `guvna serve --help` for service flags.
 
-Leave the gateway running. In a second terminal, set the CLI destination and its admin credential. If that terminal has already loaded the gateway environment:
+Leave the gateway running. In a second terminal on the same host, set its admin credential. If that terminal has already loaded the gateway environment:
 
 ```sh
-export GUVNA_URL=http://127.0.0.1:20128
 export GUVNA_ADMIN_KEY="$ADMIN_KEY"
 ```
 
 ```powershell
-$env:GUVNA_URL = 'http://127.0.0.1:20128'
 $env:GUVNA_ADMIN_KEY = $env:ADMIN_KEY
 ```
 
-Otherwise set `GUVNA_ADMIN_KEY` to the same private value as the gateway's `ADMIN_KEY`. No browser sign-in or external login account is involved. For a remote gateway, use its HTTPS URL and the matching admin key.
+Otherwise set `GUVNA_ADMIN_KEY` to the same private value as the gateway's `ADMIN_KEY`. No browser sign-in or external login account is involved.
 
-The CLI's loopback default is a destination, not a server bind restriction. The gateway currently listens on `:port` (all interfaces). Configure container publishing or host network controls for local-only access, and HTTPS plus network access controls for remote access. See [DEPLOYMENT.md](DEPLOYMENT.md).
+Management is local-only. The CLI connects to the filesystem socket
+`~/.guvna/admin.sock`; it has no TCP or remote URL fallback. The service uses
+`<data-dir>/admin.sock`, so a service started with `-data /data` needs CLI
+`--socket /data/admin.sock`. `GUVNA_ADMIN_SOCKET` can set the same socket path for
+both processes. On Linux the socket is mode `0600`; the CLI must run as the
+service user and still supply the admin key. Windows development uses the parent
+directory's ACL and the same Bearer authentication; use `GUVNA_ADMIN_SOCKET`
+with a short ASCII path if the development profile's non-ASCII path is unsupported.
+Unsupported Unix sockets or
+overlong paths fail explicitly rather than enabling network management.
+
+The public gateway listener continues serving model APIs and `/healthz`, but
+returns 404 for `/admin/*` and `/v1/chains`, even with the admin key or a
+loopback/forwarded peer address. `--url` and `GUVNA_URL` remote management are
+retired. Run the CLI on the gateway host (or in its container); see
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Status and logs
 
 ```sh
 ./guvna status
 ./guvna status --json
+./guvna status --scoring
+./guvna status --scoring --since 2026-10-21T00:00:00Z --until 2026-10-21T01:00:00Z --json
 ./guvna logs -n 100
 ./guvna logs -n 100 --json
 ```
@@ -111,10 +126,12 @@ cannot be queried, status still shows these in-memory diagnostics and reports
 `usage_error`. `status --json` preserves the complete server response,
 including key state and fields introduced by newer gateways.
 
-Auto ordering experiment metrics and the latest bounded comparison records are
-available through the authenticated `GET /admin/auto/scoring` API. See
-[AUTO-SHADOW.md](AUTO-SHADOW.md) for time filters, definitions and activation
-requirements. The default route continues to use the decider.
+`status --scoring` shows actual Auto request results, provider failure classes
+and current model cooldowns through the local socket; `--json` also includes the
+latest shadow comparisons. Normal Auto traffic is collected in every mode; enabling shadow is not
+required for collection. See [AUTO-SHADOW.md](AUTO-SHADOW.md) for metric meanings,
+time filters and activation requirements. The default route continues to use the
+decider; these queries do not probe providers.
 
 ## Runtime chains
 
@@ -125,12 +142,12 @@ requirements. The default route continues to use the decider.
 ./guvna chains rm myfree
 ```
 
-Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. Removing a config-defined chain is refused: edit its YAML configuration instead. The CLI does not currently express per-step `params`; use the JSON API when those are needed.
+Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. Removing a config-defined chain is refused: edit its YAML configuration instead. The CLI does not currently express per-step `params`; define them in configuration or use the authenticated management protocol over the local socket when needed. Client API keys cannot manage chains.
 
-`--url URL` and `--token KEY` override the environment for an individual command. Prefer the environment for the token so it is not written into shell history. `--json` emits raw JSON for status, logs, chain lists and chain creation. For example:
+`--socket PATH` and `--token KEY` override the environment for an individual command. Prefer the environment for the token so it is not written into shell history. `--json` emits raw JSON for status, logs, chain lists and chain creation. For example:
 
 ```sh
-./guvna status --url https://your-gateway.example.com --json
+./guvna status --socket /data/admin.sock --json
 ./guvna chains add myfree --step groq:llama-3.3-70b-versatile --json
 ```
 

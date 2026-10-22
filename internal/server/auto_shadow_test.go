@@ -95,7 +95,7 @@ func TestAutoShadowPreservesServingOrderAndAdminQuery(t *testing.T) {
 		r := httptest.NewRequest("GET", tc.url, nil)
 		r.Header.Set("Authorization", "Bearer "+tc.token)
 		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, r)
+		s.AdminHandler().ServeHTTP(w, r)
 		if w.Code != tc.status {
 			t.Fatalf("%s status=%d want=%d body=%s", tc.url, w.Code, tc.status, w.Body)
 		}

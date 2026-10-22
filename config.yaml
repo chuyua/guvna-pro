@@ -77,6 +77,6 @@ providers:
       - deepseek/deepseek-v4-flash-free
       - qwen/qwen3.8-27b-free
 
-# No default chains. Every chain is created per use case by the client
-# (POST /v1/chains, persisted to <data-dir>/chains.yaml). Clients may also
+# No default chains. Create chains locally with "guvna chains add"
+# (admin socket only, persisted to <data-dir>/chains.yaml). Clients may also
 # call provider-prefixed model names directly, e.g. "groq/llama-3.3-70b-versatile".

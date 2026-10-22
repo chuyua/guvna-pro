@@ -18,6 +18,7 @@ import (
 )
 
 type Event struct {
+	AutoRequest  *AutoRequestEvent
 	Provider     string
 	Chain        string
 	Model        string
@@ -154,7 +155,7 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
-	return nil
+	return createAutoRequestSchema(db)
 }
 
 // Record adds an event, evicting the oldest queued event at capacity. Once
@@ -260,8 +261,26 @@ func (t *Telemetry) flush() (err error) {
 		return err
 	}
 	defer stmt.Close()
+	var autoStmt *sql.Stmt
+	defer func() {
+		if autoStmt != nil {
+			autoStmt.Close()
+		}
+	}()
 	for i := range events {
 		e := events[(head+i)%len(events)]
+		if e.AutoRequest != nil {
+			if autoStmt == nil {
+				autoStmt, err = tx.Prepare(insertAutoRequestSQL)
+				if err != nil {
+					return err
+				}
+			}
+			if err := insertAutoRequest(autoStmt, *e.AutoRequest); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := stmt.Exec(e.Ts.UTC().Format(time.RFC3339Nano), e.Provider, e.Chain,
 			e.Model, e.Stream, e.Status, e.TokensIn, e.TokensOut, e.Key, e.Err,
 			e.RequestID, e.Attempt, e.LatencyMS, e.FailureClass); err != nil {

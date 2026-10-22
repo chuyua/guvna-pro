@@ -29,9 +29,9 @@ func chainManagementServer(t *testing.T) *Server {
 
 func chainManagementRequest(s *Server, method, path, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer client-1")
+	r.Header.Set("Authorization", "Bearer admin-secret")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	s.AdminHandler().ServeHTTP(w, r)
 	return w
 }
 
@@ -45,7 +45,7 @@ func TestChainCreateBodyFailuresDoNotMutate(t *testing.T) {
 			s.store = chains.New(dataDir)
 			before := s.rtr.ListChains()
 			r := httptest.NewRequest(http.MethodPost, "/v1/chains", strings.NewReader(input))
-			r.Header.Set("Authorization", "Bearer client-1")
+			r.Header.Set("Authorization", "Bearer admin-secret")
 			r.ContentLength = -1
 			status, code := http.StatusRequestEntityTooLarge, "request_too_large"
 			spy := &requestBodyReadSpy{}
@@ -67,7 +67,7 @@ func TestChainCreateBodyFailuresDoNotMutate(t *testing.T) {
 				status, code = http.StatusBadRequest, "read_body_failed"
 			}
 			w := httptest.NewRecorder()
-			s.Handler().ServeHTTP(w, r)
+			s.AdminHandler().ServeHTTP(w, r)
 			if status == 0 {
 				if w.Body.Len() != 0 {
 					t.Fatalf("canceled creation wrote a response: %s", w.Body)
@@ -109,12 +109,12 @@ func TestChainCreateExactLimitAndTrailingData(t *testing.T) {
 			requestBodyTestLimits(t, int64(len(body)), time.Second)
 			s := chainManagementServer(t)
 			r := httptest.NewRequest(http.MethodPost, "/v1/chains", strings.NewReader(body))
-			r.Header.Set("Authorization", "Bearer client-1")
+			r.Header.Set("Authorization", "Bearer admin-secret")
 			if tc.unknown {
 				r.ContentLength = -1
 			}
 			w := httptest.NewRecorder()
-			s.Handler().ServeHTTP(w, r)
+			s.AdminHandler().ServeHTTP(w, r)
 			if w.Code != tc.status {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body)
 			}

@@ -63,10 +63,11 @@ func TestGatewayProcess(t *testing.T) {
 			args := append([]string{"-test.run=^TestGatewayProcess$", "--"}, prefix...)
 			args = append(args, "-config", configPath, "-data", dataDir)
 			process := exec.CommandContext(ctx, os.Args[0], args...)
+			socketPath := mainTestSocket(t)
 			process.Env = append(os.Environ(),
 				"GUVNA_TEST_GATEWAY_PROCESS=1", "HOME="+dir, "USERPROFILE="+dir,
 				"ADMIN_KEY=smoke-admin", "API_KEYS=smoke-client", "GUVNA_TEST_UPSTREAM_KEY=dummy",
-				"GUVNA_DECIDER_PROVIDER=", "GUVNA_DECIDER_MODEL=")
+				"GUVNA_DECIDER_PROVIDER=", "GUVNA_DECIDER_MODEL=", "GUVNA_ADMIN_SOCKET="+socketPath)
 			var logs bytes.Buffer
 			process.Stdout, process.Stderr = &logs, &logs
 			if err := process.Start(); err != nil {
@@ -75,6 +76,8 @@ func TestGatewayProcess(t *testing.T) {
 			defer func() {
 				process.Process.Kill()
 				process.Wait()
+				// This path was created exclusively for the killed test process.
+				os.Remove(socketPath)
 				if t.Failed() {
 					t.Log(logs.String())
 				}
@@ -97,7 +100,7 @@ func TestGatewayProcess(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 			}
 
-			t.Setenv("GUVNA_URL", baseURL)
+			t.Setenv("GUVNA_ADMIN_SOCKET", socketPath)
 			t.Setenv("GUVNA_ADMIN_KEY", "smoke-admin")
 			manage := func(args ...string) []byte {
 				t.Helper()

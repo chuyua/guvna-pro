@@ -93,7 +93,7 @@ func stripAutoFields(body []byte) []byte {
 
 // handleAuto selects a model, then reuses the same tryStep/relaySuccess path as
 // handleChat. It does not build a chain: a chain would make the decision
-// visible to POST /v1/chains, where a client could overwrite the pool order.
+// visible to local chain management, where an admin could overwrite the pool order.
 func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	body, err := readRequestBody(w, r)
@@ -110,22 +110,35 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 	if requestID(r) == "" {
 		r = withRequestID(r, s.newRequestID())
 	}
+	r, observation := s.startAutoObservation(r, started)
+	defer func() {
+		if p := recover(); p != nil {
+			observation.fail(http.StatusInternalServerError, "gateway_error")
+			s.finishAutoObservation(r, observation)
+			panic(p)
+		}
+		s.finishAutoObservation(r, observation)
+	}()
 	var req autoRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		observation.fail(http.StatusBadRequest, "caller_error")
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
 	}
 	var chat chatRequest
 	if err := json.Unmarshal(body, &chat); err != nil {
+		observation.fail(http.StatusBadRequest, "caller_error")
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
 	}
+	observation.event.Stream = chat.Stream
 
 	minCtx := req.MinContext
 	if minCtx <= 0 {
 		minCtx = minContextDefault()
 	}
 	if req.MaxContext > 0 && req.MaxContext < minCtx {
+		observation.fail(http.StatusBadRequest, "caller_error")
 		http.Error(w, `{"error":{"message":"max_context must be >= min_context"}}`, http.StatusBadRequest)
 		return
 	}
@@ -142,6 +155,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 
 	pool := s.rtr.ListChains()
 	if len(pool) == 0 {
+		observation.fail(http.StatusServiceUnavailable, "no_candidates")
 		http.Error(w, `{"error":{"message":"no chains configured"}}`, http.StatusServiceUnavailable)
 		return
 	}
@@ -185,6 +199,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 			msg += ": " + strings.Join(detail, ", ")
 		}
 		log.Printf("auto: no candidate for min=%d max=%d", minCtx, req.MaxContext)
+		observation.fail(http.StatusNotFound, "no_candidates")
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, msg), http.StatusNotFound)
 		return
 	}
@@ -196,6 +211,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 			log.Printf("auto: skipping %s ctx=%d required_estimate=%d (%s)", dropped.Step, dropped.Context, required, dropped.Reason)
 		}
 		if len(cands) == 0 {
+			observation.fail(http.StatusBadRequest, "caller_error")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
@@ -226,6 +242,7 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 		&s.decideMu,
 		&s.decideCache,
 	)
+	observation.event.DeciderSource = source
 	if r.Context().Err() != nil {
 		return
 	}
@@ -246,11 +263,14 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 		log.Printf("auto: images=true kept=%d/%d vision-capable", len(kept), len(ordered))
 		ordered = kept
 		if len(ordered) == 0 {
+			observation.fail(http.StatusNotFound, "no_candidates")
 			http.Error(w, `{"error":{"message":"no vision-capable model available for image request"}}`, http.StatusNotFound)
 			return
 		}
 	}
+	originalSource := source
 	ordered, source = s.applyAutoScoring(r, ordered, source, chat.Stream)
+	observation.selected(originalSource, source)
 	log.Printf("auto: min=%d max=%d eligible=%d images=%v degraded=%v source=%s order=%s",
 		minCtx, req.MaxContext, len(cands), hasImages, degraded, source, joinSteps(ordered))
 
@@ -322,11 +342,15 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 				continue
 			}
 			if isClientGone(err) {
+				observation.cancel()
 				log.Printf("auto: client gone, stopping the walk at %s/%s: %v", step.Provider, step.Model, err)
 				return
 			}
 			log.Printf("auto: step %s/%s failed: %v", step.Provider, step.Model, err)
 			lastErr = err
+			if observation.event.Attempts == 0 {
+				observation.fail(http.StatusServiceUnavailable, "gateway_error")
+			}
 			s.mark(r, step.Provider, step.Model, 0, err)
 			s.record(r, step, c.Chain, chat, 0, err, keyEnv)
 			continue
@@ -355,9 +379,15 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 			}
 			cancelStep()
 			if res.clientGone {
+				observation.cancel()
 				return
 			}
 			if res.outcome == relayCommitted {
+				if observation.pending {
+					if _, ok := w.(http.Flusher); !ok && chat.Stream {
+						observation.fail(http.StatusInternalServerError, "gateway_error")
+					}
+				}
 				return
 			}
 			// Unusable 2xx body: nothing was written, so keep walking.
@@ -380,10 +410,16 @@ func (s *Server) handleAutoBody(w http.ResponseWriter, r *http.Request, body []b
 	}
 	log.Printf("auto: all candidates failed: %v", lastErr)
 	if lastStatus == 0 {
+		if observation.event.FailureClass == "" {
+			observation.fail(http.StatusServiceUnavailable, "gateway_error")
+		} else {
+			observation.event.Status = http.StatusServiceUnavailable
+		}
 		http.Error(w, `{"error":{"message":"no providers available"}}`, http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", lastCT)
+	observation.event.Status = lastStatus
 	w.WriteHeader(lastStatus)
 	w.Write(lastBody)
 }
@@ -610,8 +646,8 @@ func (s *Server) decidePrompt(cands []selector.Candidate) string {
 }
 
 // sanitizeLine strips control characters from a chain-supplied string before it
-// goes into the decider prompt. step.Model is client-writable via
-// POST /v1/chains with no character validation; without this, a crafted model
+// goes into the decider prompt. step.Model is admin-writable via local chain
+// management with no character validation; without this, a crafted model
 // name could inject newlines and forge ranking instructions.
 func sanitizeLine(s string) string {
 	return strings.Map(func(r rune) rune {

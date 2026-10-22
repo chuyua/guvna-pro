@@ -81,6 +81,11 @@ func TestRequestBodyNetworkTimeoutAcrossRoutes(t *testing.T) {
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
 			defer up.Close()
 			s, ts := testServer(t, []config.Provider{{Name: "a", Type: "openai", BaseURL: up.URL, KeyEnv: "A"}}, []config.Chain{{Name: "main", Steps: []config.Step{{Provider: "a", Model: "m"}}}}, map[string]string{"A": "dummy"})
+			token := "client-1"
+			if path == "/v1/chains" {
+				ts = testAdminServer(t, s)
+				token = "admin-secret"
+			}
 			conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), time.Second)
 			if err != nil {
 				t.Fatal(err)
@@ -89,7 +94,7 @@ func TestRequestBodyNetworkTimeoutAcrossRoutes(t *testing.T) {
 			if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer client-1\r\nContent-Length: 100\r\n\r\n{", path)
+			fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer %s\r\nContent-Length: 100\r\n\r\n{", path, token)
 			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 			if err != nil {
 				t.Fatal(err)
