@@ -129,7 +129,7 @@ func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.
 	reg, err := ctxsize.Load(envOr("GUVNA_CONTEXT_REGISTRY", ""))
 	if err != nil {
 		log.Printf("auto: context registry %v (using built-ins)", err)
-		reg = &ctxsize.Registry{DefaultContext: ctxsize.DefaultContext}
+		reg, _ = ctxsize.Load("")
 	}
 	if reg == nil {
 		reg = &ctxsize.Registry{DefaultContext: ctxsize.DefaultContext}
@@ -138,7 +138,7 @@ func loadAutoConfig() (func(string) int, *vision.Registry, string, string, time.
 	vreg, err := vision.Load(envOr("GUVNA_VISION_REGISTRY", ""))
 	if err != nil {
 		log.Printf("auto: vision registry %v (using built-ins)", err)
-		vreg = nil
+		vreg, _ = vision.Load("")
 	}
 	provider, model := envOr("GUVNA_DECIDER_PROVIDER", ""), envOr("GUVNA_DECIDER_MODEL", "")
 	interval := envDuration("GUVNA_DECIDE_INTERVAL", DefaultDecideInterval)

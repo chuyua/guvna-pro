@@ -16,6 +16,8 @@
 package ctxsize
 
 import (
+	"errors"
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -53,6 +55,9 @@ func Load(path string) (*Registry, error) {
 	}
 	data, err := readFile(path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read context registry %q: %w", path, err)
+		}
 		return base, nil
 	}
 	var r Registry
