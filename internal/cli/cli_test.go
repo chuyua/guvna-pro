@@ -304,3 +304,78 @@ func TestCommonFlagsHelpHidesEnvironmentCredential(t *testing.T) {
 		t.Fatal("help exposed the credential or changed its runtime default")
 	}
 }
+
+func TestChainsRemoveEscapesName(t *testing.T) {
+	for _, tc := range []struct{ name, escaped string }{
+		{"plain", "plain"},
+		{"bad/name", "bad%2Fname"},
+		{"bad?name", "bad%3Fname"},
+		{"bad#name", "bad%23name"},
+		{"bad%name", "bad%25name"},
+		{"bad%2Fname", "bad%252Fname"},
+		{"bad/../name", "bad%2F..%2Fname"},
+		{".", "%2E"},
+		{"..", "%2E%2E"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			type target struct {
+				name, escapedPath, rawQuery, fragment, authorization string
+			}
+			targets := make(chan target, 1)
+			mux := http.NewServeMux()
+			mux.HandleFunc("DELETE /v1/chains/{name}", func(w http.ResponseWriter, r *http.Request) {
+				targets <- target{r.PathValue("name"), r.URL.EscapedPath(), r.URL.RawQuery, r.URL.Fragment, r.Header.Get("Authorization")}
+				w.WriteHeader(http.StatusNoContent)
+			})
+			t.Setenv("GUVNA_ADMIN_SOCKET", cliTestSocket(t, mux))
+			t.Setenv("GUVNA_ADMIN_KEY", "dummy-token")
+			output, err := captureCLIOutput(t, func(c command) error {
+				return c.chainsCmd([]string{"rm", tc.name})
+			})
+			if err != nil || !strings.Contains(output, "removed chain ") {
+				t.Fatalf("remove: output=%q err=%v", output, err)
+			}
+			got := <-targets
+			if got.name != tc.name || got.escapedPath != "/v1/chains/"+tc.escaped || got.rawQuery != "" || got.fragment != "" || got.authorization != "Bearer dummy-token" {
+				t.Fatalf("delete target = %+v, want name=%q escaped=%q with no query or fragment", got, tc.name, tc.escaped)
+			}
+		})
+	}
+}
+
+func TestChainsListJSONPreservesResponse(t *testing.T) {
+	const response = `{"chains":[{"name":"dormant","source":"dormant","steps":[{"provider":"missing","model":"original","params":{"seed":9007199254740993,"nested":[{"seed":18446744073709551615,"fraction":0.123456789012345678901}]},"future_step":{"count":9007199254740995}}],"future_chain":true}],"future_root":{"count":9007199254740997}}`
+	for _, jsonOutput := range []bool{false, true} {
+		name := "table"
+		if jsonOutput {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			socket := cliTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, response)
+			}))
+			t.Setenv("GUVNA_ADMIN_SOCKET", socket)
+			t.Setenv("GUVNA_ADMIN_KEY", "dummy-token")
+			args := []string{"list"}
+			if jsonOutput {
+				args = append(args, "--json")
+			}
+			output, err := captureCLIOutput(t, func(c command) error { return c.chainsCmd(args) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if jsonOutput {
+				var compact bytes.Buffer
+				if err := json.Compact(&compact, []byte(output)); err != nil {
+					t.Fatalf("invalid JSON output: %q err=%v", output, err)
+				}
+				if compact.String() != response {
+					t.Fatalf("chain response changed: got=%s want=%s", compact.String(), response)
+				}
+			} else if got := strings.Join(strings.Fields(output), " "); got != "NAME SOURCE STEPS dormant dormant missing:original" {
+				t.Fatalf("table output changed: %q", output)
+			}
+		})
+	}
+}

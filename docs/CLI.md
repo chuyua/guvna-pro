@@ -145,7 +145,8 @@ decider; these queries do not probe providers.
 Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. The CLI does not currently express per-step `params`; define them in configuration or use the authenticated management protocol over the local socket when needed. Client API keys cannot manage chains.
 
 `chains list` includes inactive file records with `SOURCE` set to `dormant`;
-`--json` also includes their original steps and per-step `params`. Step params
+`--json` also includes their original steps and per-step `params`, preserving
+large numbers and fields introduced by newer gateways. Step params
 that JSON cannot express (such as YAML mappings with non-string keys or `.nan`)
 are returned as a list-only `params_yaml` string instead of `params`. These records
 are retained when a provider is unavailable or a config-defined chain has the
@@ -158,7 +159,10 @@ available, their definitions are valid, and no config chain shadows them.
 has both a config chain and a dormant record, only the dormant record is deleted;
 the config chain keeps routing. Removing a config-defined chain without a dormant
 record is refused: edit its YAML configuration instead. A failed persistence
-leaves both the record and the active routes unchanged.
+leaves both the record and the active routes unchanged. Invalid names containing
+URL special characters remain removable; quote shell special characters, for example
+`./guvna chains rm 'bad?name'`. A record with an empty name still requires editing
+`chains.yaml` manually.
 
 `--socket PATH` and `--token KEY` override the environment for an individual command. Prefer the environment for the token so it is not written into shell history. `--json` emits raw JSON for status, logs, chain lists and chain creation. For example:
 
