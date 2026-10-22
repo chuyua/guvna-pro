@@ -3,7 +3,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -137,6 +140,9 @@ func (c *Config) Validate() error {
 	if c.Port == 0 {
 		c.Port = DefaultPort
 	}
+	if c.Port < 1 || c.Port > 65535 {
+		return errors.New("port must be between 1 and 65535")
+	}
 	providers := make(map[string]bool, len(c.Providers))
 	for _, p := range c.Providers {
 		if p.Name == "" {
@@ -155,16 +161,36 @@ func (c *Config) Validate() error {
 		if p.BaseURL == "" {
 			return fmt.Errorf("provider %q: missing base_url", p.Name)
 		}
+		base, err := url.Parse(p.BaseURL)
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Hostname() == "" {
+			return fmt.Errorf("provider %q: base_url must be an absolute http or https URL with a host", p.Name)
+		}
+		// Adaptors append an endpoint path to this prefix. A query or fragment
+		// would absorb that suffix instead of identifying the intended endpoint.
+		if strings.ContainsAny(p.BaseURL, "?#") {
+			return fmt.Errorf("provider %q: base_url must not contain a query or fragment", p.Name)
+		}
+		if port := base.Port(); port != "" {
+			n, err := strconv.Atoi(port)
+			if err != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("provider %q: base_url port must be between 1 and 65535", p.Name)
+			}
+		}
 		if p.KeyEnv == "" && len(p.KeyEnvs) == 0 {
 			return fmt.Errorf("provider %q: missing key_env or key_envs", p.Name)
 		}
 		if p.KeyEnv != "" && len(p.KeyEnvs) > 0 {
 			return fmt.Errorf("provider %q: set either key_env or key_envs, not both", p.Name)
 		}
+		keyEnvs := make(map[string]bool, len(p.AllKeyEnvs()))
 		for _, env := range p.AllKeyEnvs() {
 			if env == "" {
 				return fmt.Errorf("provider %q: empty key env name", p.Name)
 			}
+			if keyEnvs[env] {
+				return fmt.Errorf("provider %q: duplicate key env name %q", p.Name, env)
+			}
+			keyEnvs[env] = true
 		}
 		switch p.Rotation {
 		case "", "round_robin", "least_used", "sequential":

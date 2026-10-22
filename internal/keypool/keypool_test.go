@@ -225,3 +225,47 @@ func TestMarkEmptyClassNoop(t *testing.T) {
 		t.Error("empty class must not mark")
 	}
 }
+
+func TestValidatedPoolPreservesRateLimitIsolation(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{{
+		Name: "p", Type: "openai", BaseURL: "https://provider.example", KeyEnvs: []string{"K1", "K2", "K1"},
+	}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("duplicate envs must be rejected before constructing a runtime pool")
+	}
+	cfg.Providers[0].KeyEnvs = []string{"K1", "K2"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	provider := cfg.Providers[0]
+	clock := &leaseClock{}
+	clock.tick.Store(time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC).UnixNano())
+	p, err := NewWithClock(provider.Name, provider.AllKeyEnvs(), provider.Rotation, provider.Quarantine, clock.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := acquireLease(t, p)
+	if first.Env() != "K1" || first.Failure(ClassFor(429, nil)) != ClassRateLimit {
+		t.Fatal("first key did not enter the rate-limit quarantine")
+	}
+	for i := 0; i < 3; i++ {
+		lease := acquireLease(t, p)
+		if lease.Env() != "K2" {
+			t.Fatalf("quarantined credential selected again: %q", lease.Env())
+		}
+		lease.Release()
+	}
+	if p.Available("K1") || p.Acquire(map[string]bool{"K2": true}) != nil {
+		t.Fatal("rate-limited key remained available through a duplicate state")
+	}
+	status := p.Keys()
+	if len(status) != 2 || status[0].State != "quarantined" || status[0].Reason != string(ClassRateLimit) || status[1].State != "healthy" {
+		t.Fatalf("unexpected configured pool isolation: %+v", status)
+	}
+	clock.add(config.DefaultQuarantine.RateLimit.Duration)
+	recovered := p.Acquire(map[string]bool{"K2": true})
+	if recovered == nil || recovered.Env() != "K1" {
+		t.Fatal("the unique credential did not recover at quarantine expiry")
+	}
+	recovered.Release()
+}
