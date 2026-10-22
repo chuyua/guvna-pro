@@ -8,6 +8,7 @@ import (
 
 	"github.com/creamy-ghost/guvna/internal/config"
 	"github.com/creamy-ghost/guvna/internal/router"
+	"gopkg.in/yaml.v3"
 )
 
 func newRouter() *router.Router {
@@ -104,7 +105,7 @@ func TestLoadMissingFileIsNoop(t *testing.T) {
 
 func TestLoadConflictSkipped(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "chains.yaml"), []byte("chains:\n  - name: from-config\n    steps:\n      - provider: groq\n        model: llama-3.3-70b-versatile\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "chains.yaml"), []byte("chains:\n  - name: from-config\n    steps:\n      - provider: unavailable\n        model: old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	r := newRouter()
@@ -112,9 +113,22 @@ func TestLoadConflictSkipped(t *testing.T) {
 	if err := s.Load(r); err != nil {
 		t.Fatal(err)
 	}
-	// config chain must still be intact and still config-sourced (not removable)
+	// Config precedence applies even when the shadowed file record is invalid.
+	_, steps, err := r.Resolve("from-config")
+	if err != nil || len(steps) != 1 || steps[0].Provider != "groq" {
+		t.Fatalf("config chain changed: steps=%+v err=%v", steps, err)
+	}
 	if err := r.RemoveChain("from-config"); err == nil {
 		t.Fatal("config chain wrongly replaced by runtime file")
+	}
+	if err := s.AddChain(r, "added", []router.Step{{Provider: "groq", Model: "new"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := storedChains(t, dir)["from-config"]; exists {
+		t.Fatal("shadowed file record was persisted as a dormant chain")
 	}
 }
 
@@ -151,5 +165,116 @@ func TestSaveOnlyRuntimeChains(t *testing.T) {
 	}
 	if len(r2.RuntimeChains()) != 1 {
 		t.Fatalf("runtime chains = %+v", r2.RuntimeChains())
+	}
+}
+
+func storedChains(t *testing.T, dir string) map[string]fileChain {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "chains.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f fileFormat
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	chains := make(map[string]fileChain, len(f.Chains))
+	for _, ch := range f.Chains {
+		if _, duplicate := chains[ch.Name]; duplicate {
+			t.Fatalf("duplicate stored chain %q", ch.Name)
+		}
+		chains[ch.Name] = ch
+	}
+	return chains
+}
+
+func TestDormantChainsSurviveWritesAndRecover(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "chains.yaml"), []byte("chains:\n  - name: dormant\n    steps:\n      - provider: temporarily-missing\n        model: x\n        params:\n          max_tokens: 42\n  - name: good\n    steps:\n      - provider: groq\n        model: llama-3.3-70b-versatile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouter()
+	s := New(dir)
+	if err := s.Load(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Resolve("dormant"); err == nil {
+		t.Fatal("unavailable chain was published")
+	}
+	operations := []func() error{
+		func() error { return s.Save(r) },
+		func() error {
+			return s.AddChain(r, "added", []router.Step{{Provider: "gemini", Model: "gemini-2.5-flash"}})
+		},
+		func() error { return s.RemoveChain(r, "good") },
+	}
+	for i, operation := range operations {
+		if err := operation(); err != nil {
+			t.Fatalf("operation %d: %v", i, err)
+		}
+		ch, ok := storedChains(t, dir)["dormant"]
+		if !ok || len(ch.Steps) != 1 || ch.Steps[0].Provider != "temporarily-missing" || ch.Steps[0].Params["max_tokens"] != 42 {
+			t.Fatalf("operation %d lost dormant chain: %+v", i, ch)
+		}
+	}
+	restored := router.New(&config.Config{Providers: []config.Provider{
+		{Name: "groq"}, {Name: "gemini"}, {Name: "temporarily-missing"},
+	}})
+	if err := New(dir).Load(restored); err != nil {
+		t.Fatal(err)
+	}
+	_, steps, err := restored.Resolve("dormant")
+	if err != nil || len(steps) != 1 || steps[0].Provider != "temporarily-missing" || steps[0].Params["max_tokens"] != 42 {
+		t.Fatalf("restored provider did not reactivate chain: steps=%+v err=%v", steps, err)
+	}
+	if _, _, err := restored.Resolve("good"); err == nil {
+		t.Fatal("removed active chain returned after restart")
+	}
+}
+
+func TestRuntimeChainReplacesDormantRecord(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "chains.yaml"), []byte("chains:\n  - name: replace\n    steps:\n      - provider: unavailable\n        model: old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouter()
+	s := New(dir)
+	if err := s.Load(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddChain(r, "replace", []router.Step{{Provider: "groq", Model: "new"}}); err != nil {
+		t.Fatal(err)
+	}
+	ch := storedChains(t, dir)["replace"]
+	if len(ch.Steps) != 1 || ch.Steps[0].Provider != "groq" || ch.Steps[0].Model != "new" {
+		t.Fatalf("runtime chain did not replace dormant record: %+v", ch)
+	}
+	if err := s.RemoveChain(r, "replace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := storedChains(t, dir)["replace"]; exists {
+		t.Fatal("removed replacement resurrected dormant record")
+	}
+}
+
+func TestInvalidChainRecordSurvivesSave(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "chains.yaml"), []byte("chains:\n  - name: invalid-model\n    steps:\n      - provider: groq\n        model: \"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouter()
+	s := New(dir)
+	if err := s.Load(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	ch, exists := storedChains(t, dir)["invalid-model"]
+	if !exists || len(ch.Steps) != 1 || ch.Steps[0].Provider != "groq" || ch.Steps[0].Model != "" {
+		t.Fatalf("invalid record was erased: %+v", ch)
 	}
 }

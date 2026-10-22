@@ -73,14 +73,22 @@ the container as its service user:
 docker exec -e GUVNA_ADMIN_KEY="$ADMIN_KEY" guvna /guvna status --socket /data/admin.sock
 ```
 
-A normal shutdown removes the socket. Startup refuses a preexisting socket,
-ordinary file or symlink rather than deleting it. After an unclean shutdown,
-confirm that the original gateway is stopped, then remove only its stale
-`admin.sock` before restarting. Keep custom socket paths short enough for the
-operating system's Unix-domain socket path limit. Windows development requires
-AF_UNIX support and uses the containing directory's ACL plus Bearer auth. A short
-ASCII `GUVNA_ADMIN_SOCKET` path may be needed for a non-ASCII development profile;
-unsupported paths never fall back to a TCP management listener.
+A normal shutdown removes the socket. On Linux and supported Unix systems,
+startup automatically replaces only a socket owned by the effective service user
+whose connection attempt explicitly returns `ECONNREFUSED`. Live sockets, ordinary
+files, symlinks and uncertain failures are preserved and startup fails. A
+nonblocking OS lock covers inspection, cleanup and binding so concurrent starts
+cannot remove a newly bound listener. Leave the persistent `<socket>.lock` marker
+in place; the OS releases its lock when the process closes it or exits.
+
+Keep custom socket paths short enough for the operating system's Unix-domain
+socket path limit. Windows development requires AF_UNIX support and uses the
+containing directory's ACL plus Bearer auth. Because portable socket ownership
+metadata is unavailable there, existing Windows socket paths are never removed
+automatically: after an unclean shutdown, confirm the original gateway is stopped
+before removing only its stale `admin.sock`. A short ASCII `GUVNA_ADMIN_SOCKET`
+path may be needed for a non-ASCII development profile; unsupported paths never
+fall back to a TCP management listener.
 
 ## TLS exposure
 
