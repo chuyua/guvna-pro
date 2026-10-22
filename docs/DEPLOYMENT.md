@@ -2,12 +2,15 @@
 
 Guvna is a single static binary with config-as-code. Two supported ways to run it.
 
-Administration uses `guvna-cli` over the same API as clients. No browser login or separate UI service is required or provided. See [CLI.md](CLI.md) to build and use the CLI from the current checkout.
+The same `guvna` executable provides `serve`, `status`, `logs` and `chains`.
+Administration uses the same API as clients. No browser login or separate UI
+service is required or provided. See [CLI.md](CLI.md) for release downloads,
+checksum verification and source builds.
 
 ## Option A — Docker Compose
 
 ```sh
-git clone https://github.com/creamy-ghost/guvna && cd guvna
+git clone https://github.com/chuyua/guvna-pro && cd guvna-pro
 cp .env.example .env              # add ADMIN_KEY + API_KEYS + provider keys
 docker compose -f deploy/docker-compose.yml up -d
 ```
@@ -23,18 +26,31 @@ docker run -d --name guvna \
   -e GOMEMLIMIT=256MiB \
   -v guvna-data:/data \
   -v "$PWD/config.yaml:/config.yaml:ro" \
-  ghcr.io/creamy-ghost/guvna:latest
+  ghcr.io/chuyua/guvna-pro:latest
 ```
 
-## Option B — Plain binary / systemd user unit
+The image contains only the `guvna` executable. Its default entrypoint preserves
+the existing `-config /config.yaml -data /data` service invocation. For command
+inspection without starting a service:
 
 ```sh
-go install github.com/creamy-ghost/guvna/cmd/guvna@latest
-cp .env.example .env && set -a && source .env && set +a   # or use systemd EnvironmentFile=
-guvna -config config.yaml                             # data dir defaults to ~/.guvna
+docker run --rm --entrypoint /guvna ghcr.io/chuyua/guvna-pro:latest --version
 ```
 
-A minimal unit runs it as your user on port 20128, keys via env, never in git.
+## Option B — Plain binary
+
+Install the Linux amd64 release using the checksummed download instructions in
+[CLI.md](CLI.md), or build the current checkout:
+
+```sh
+go build -o guvna ./cmd/guvna
+cp .env.example .env && set -a && source .env && set +a   # or use systemd EnvironmentFile=
+./guvna serve -config config.yaml                      # data dir defaults to ~/.guvna
+```
+
+Existing `guvna -config ...` and `-data ...` service commands continue to work.
+A service manager can run the same command with keys supplied through its
+environment. No dedicated Arch package or systemd unit is included in the release.
 
 The gateway currently binds `:20128` (all interfaces), or the port configured in YAML. This differs from the CLI's default destination of `127.0.0.1:20128`: pointing the CLI at loopback does not restrict the server listener. The bridge-mode `docker run` example above publishes only on host loopback; the supplied Compose file uses host networking and needs host network access controls for equivalent isolation.
 
@@ -76,9 +92,9 @@ curl -X POST http://127.0.0.1:20128/v1/chains \
 curl -X DELETE http://127.0.0.1:20128/v1/chains/myfree -H "Authorization: Bearer $CLIENT_KEY"
 
 # CLI (same surface, works remotely over HTTPS)
-guvna-cli chains list
-guvna-cli chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
-guvna-cli chains rm myfree
+guvna chains list
+guvna chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:llama-3.3-70b-versatile
+guvna chains rm myfree
 ```
 
 Chat with a chain name as the model, or bypass chains entirely with a provider-prefixed model (`groq/llama-3.3-70b-versatile`). Unknown model → 404 with a pointer to the creation API.
@@ -87,8 +103,8 @@ Chat with a chain name as the model, or bypass chains entirely with a provider-p
 
 ```sh
 export GUVNA_URL=http://127.0.0.1:20128 GUVNA_ADMIN_KEY=...
-guvna-cli status          # chains, step health, usage table (--json for raw)
-guvna-cli logs -n 100     # tail the in-memory ring
+guvna status          # chains, step health, usage table (--json for raw)
+guvna logs -n 100     # tail the in-memory ring
 curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:20128/admin/status | jq
 ```
 

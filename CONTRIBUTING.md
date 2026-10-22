@@ -13,7 +13,8 @@ go test -race ./...
 gofmt -l .          # must print nothing
 ```
 
-CI runs exactly these four on every PR.
+CI runs these four on every PR, plus a static single-binary build and help/version
+smoke checks. The standalone release target is Linux amd64.
 
 ## Conventions
 
@@ -32,5 +33,5 @@ CI runs exactly these four on every PR.
 ## Areas that especially welcome help
 
 - Additional provider adapters (anything OpenAI-compatible is usually ~20 lines)
-- Windows/macOS support for the CLI
+- Management-command and deployment tests
 - Telemetry views / export

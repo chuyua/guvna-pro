@@ -18,6 +18,7 @@ import (
 
 	"github.com/creamy-ghost/guvna/internal/auth"
 	"github.com/creamy-ghost/guvna/internal/chains"
+	"github.com/creamy-ghost/guvna/internal/cli"
 	"github.com/creamy-ghost/guvna/internal/config"
 	"github.com/creamy-ghost/guvna/internal/health"
 	"github.com/creamy-ghost/guvna/internal/logring"
@@ -33,27 +34,112 @@ const (
 	defaultDBDir = ".guvna"
 )
 
+// version is set from the release tag with -ldflags '-X main.version=<tag>'.
+var version = "dev"
+
 func main() {
 	log.SetPrefix("guvna: ")
-	configPath := flag.String("config", "config.yaml", "path to config.yaml")
-	dataDir := flag.String("data", dbDir(), "data directory (config override + SQLite)")
-	healthCheck := flag.Bool("healthcheck", false, "check /healthz of a running instance and exit 0/1")
-	flag.Parse()
-
-	if *healthCheck {
-		os.Exit(doHealthCheck(*configPath))
+	if err := run(os.Args[1:], os.Stdout, os.Stderr, serve); err != nil && !errors.Is(err, flag.ErrHelp) {
+		fmt.Fprintf(os.Stderr, "guvna: %v\n", err)
+		os.Exit(1)
 	}
+}
 
-	log.Printf("starting, config=%s", *configPath)
+// run dispatches before reading configuration or credentials, so management,
+// help and version invocations cannot accidentally start a gateway.
+func run(args []string, stdout, stderr io.Writer, start func([]string, io.Writer) error) error {
+	if len(args) == 0 {
+		return start(args, stderr)
+	}
+	switch args[0] {
+	case "serve":
+		return start(args[1:], stderr)
+	case "status", "logs", "chains":
+		return cli.Run(args, stdout, stderr)
+	case "help", "-h", "--help":
+		if len(args) != 1 {
+			return fmt.Errorf("%s accepts no arguments", args[0])
+		}
+		usage(stdout)
+		return nil
+	case "--version":
+		if len(args) != 1 {
+			return fmt.Errorf("--version accepts no arguments")
+		}
+		_, err := fmt.Fprintf(stdout, "guvna %s\n", version)
+		return err
+	default:
+		// Existing deployments pass service flags without a subcommand.
+		if strings.HasPrefix(args[0], "-") {
+			return start(args, stderr)
+		}
+		return fmt.Errorf("unknown command %q (want serve|status|logs|chains)", args[0])
+	}
+}
 
-	cfg, err := loadConfig(*configPath)
+func usage(out io.Writer) {
+	fmt.Fprint(out, `guvna — single-user AI gateway and management CLI
+
+usage:
+  guvna serve [-config path] [-data directory]
+  guvna [-config path] [-data directory]  (legacy service startup)
+  guvna --healthcheck [-config path]
+  guvna status [flags]
+  guvna logs [-n 100] [flags]
+  guvna chains [list] [flags]
+  guvna chains add NAME --step provider:model [--step ...] [flags]
+  guvna chains rm NAME [flags]
+  guvna --version
+
+management flags:
+  --url    gateway base URL (default: http://127.0.0.1:20128 or $GUVNA_URL)
+  --token  admin key (default: $GUVNA_ADMIN_KEY)
+  --json   emit raw JSON instead of a table
+
+Run guvna serve --help for service flags, or guvna COMMAND --help for management flags.
+`)
+}
+
+type serveOptions struct {
+	configPath  string
+	dataDir     string
+	healthCheck bool
+}
+
+func parseServe(args []string, stderr io.Writer) (serveOptions, error) {
+	var opts serveOptions
+	fs := flag.NewFlagSet("guvna serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&opts.configPath, "config", "config.yaml", "path to config.yaml")
+	fs.StringVar(&opts.dataDir, "data", dbDir(), "data directory (config override + SQLite)")
+	fs.BoolVar(&opts.healthCheck, "healthcheck", false, "check /healthz of a running instance and exit 0/1")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	if fs.NArg() != 0 {
+		return opts, fmt.Errorf("serve accepts no positional arguments")
+	}
+	return opts, nil
+}
+
+func serve(args []string, stderr io.Writer) error {
+	opts, err := parseServe(args, stderr)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		return err
+	}
+	if opts.healthCheck {
+		return doHealthCheck(opts.configPath)
+	}
+	log.Printf("starting, config=%s", opts.configPath)
+
+	cfg, err := loadConfig(opts.configPath)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 
 	adminKey := os.Getenv(envAdminKey)
 	if adminKey == "" {
-		log.Fatalf("%s env var required", envAdminKey)
+		return fmt.Errorf("%s env var required", envAdminKey)
 	}
 	var clientKeys []string
 	for _, k := range strings.Split(os.Getenv(envAPIKeys), ",") {
@@ -62,28 +148,28 @@ func main() {
 		}
 	}
 	if len(clientKeys) == 0 {
-		log.Fatalf("%s env var required (comma-separated client keys)", envAPIKeys)
+		return fmt.Errorf("%s env var required (comma-separated client keys)", envAPIKeys)
 	}
 
-	dbPath := filepath.Join(*dataDir, "guvna.db")
-	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
-		log.Fatalf("data dir: %v", err)
+	dbPath := filepath.Join(opts.dataDir, "guvna.db")
+	if err := os.MkdirAll(opts.dataDir, 0o700); err != nil {
+		return fmt.Errorf("data dir: %w", err)
 	}
 	tm, err := telemetry.Open(dbPath, flushEvery)
 	if err != nil {
-		log.Fatalf("telemetry: %v", err)
+		return fmt.Errorf("telemetry: %w", err)
 	}
 	defer tm.Close()
 
 	rtr := router.New(cfg)
-	chainStore := chains.New(*dataDir)
+	chainStore := chains.New(opts.dataDir)
 	if err := chainStore.Load(rtr); err != nil {
 		log.Printf("chains: %v", err)
 	}
 	authn := auth.New(adminKey, clientKeys)
 	hlth := health.New()
 	ring := logring.New(512)
-	log.SetOutput(io.MultiWriter(os.Stderr, ring))
+	log.SetOutput(io.MultiWriter(stderr, ring))
 	api := server.New(cfg, rtr, authn, tm, hlth, ring, chainStore)
 	api.StartAutoDecider()
 	srv := &http.Server{
@@ -101,16 +187,17 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
 	<-stop
 	log.Printf("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+	return srv.Shutdown(ctx)
 }
 
 // doHealthCheck probes a running instance's /healthz. Distroless images have
 // no shell or curl, so the binary itself is the container healthcheck.
-func doHealthCheck(configPath string) int {
+func doHealthCheck(configPath string) error {
 	port := 20128
 	if cfg, err := loadConfig(configPath); err == nil {
 		port = cfg.Port
@@ -120,15 +207,13 @@ func doHealthCheck(configPath string) int {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 	if err != nil {
-		log.Printf("healthcheck: %v", err)
-		return 1
+		return fmt.Errorf("healthcheck: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("healthcheck: status %d", resp.StatusCode)
-		return 1
+		return fmt.Errorf("healthcheck: status %d", resp.StatusCode)
 	}
-	return 0
+	return nil
 }
 
 // loadConfig prefers ~/.guvna/config.yaml; falls back to the flag path.
