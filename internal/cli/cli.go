@@ -266,8 +266,10 @@ type chainInfo struct {
 }
 
 type chainStep struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider   string         `json:"provider"`
+	Model      string         `json:"model"`
+	Params     map[string]any `json:"params,omitempty"`
+	ParamsYAML string         `json:"params_yaml,omitempty"`
 }
 
 func (c command) chainsCmd(args []string) error {

@@ -72,14 +72,17 @@ func (s *Store) Load(r *router.Router) error {
 		return fmt.Errorf("parse chains.yaml: %w (original preserved at %s)", err, backup)
 	}
 	s.loadErr = nil
-	existing := make(map[string]bool)
-	for _, name := range r.ChainNames() {
-		existing[name] = true
+	existing := make(map[string]string)
+	for _, ch := range r.ListChains() {
+		existing[ch.Name] = ch.Source
 	}
 	dormant := make(map[string]fileChain)
 	for _, ch := range f.Chains {
-		if existing[ch.Name] {
-			fmt.Printf("chains: skipping %q from chains.yaml: chain already exists\n", ch.Name)
+		if source, exists := existing[ch.Name]; exists {
+			if source == "config" {
+				dormant[ch.Name] = ch
+				fmt.Printf("chains: keeping %q dormant from chains.yaml: config chain takes precedence\n", ch.Name)
+			}
 			continue
 		}
 		steps := make([]router.Step, 0, len(ch.Steps))
@@ -91,7 +94,7 @@ func (s *Store) Load(r *router.Router) error {
 			fmt.Printf("chains: keeping %q dormant from chains.yaml: %v\n", ch.Name, err)
 			continue
 		}
-		existing[ch.Name] = true
+		existing[ch.Name] = "runtime"
 		delete(dormant, ch.Name)
 	}
 	s.dormant = dormant
@@ -136,10 +139,106 @@ func (s *Store) AddChain(r *router.Router, name string, steps []router.Step) err
 	return r.AddChainPersisted(name, steps, s.persist)
 }
 
-// RemoveChain saves a candidate snapshot before the router removes the chain.
+// ListChains returns active and dormant chains with isolated step parameters.
+// A config chain and its shadowed file record have the same name but different
+// sources. An active runtime chain supersedes a dormant record of the same name.
+func (s *Store) ListChains(r *router.Router) []router.ChainInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := r.ListChains()
+	runtime := make(map[string]bool)
+	for _, ch := range out {
+		if ch.Source == "runtime" {
+			runtime[ch.Name] = true
+		}
+	}
+	for name, ch := range s.dormant {
+		if runtime[name] {
+			continue
+		}
+		steps := make([]router.Step, 0, len(ch.Steps))
+		for _, st := range ch.Steps {
+			step := router.Step{Provider: st.Provider, Model: st.Model}
+			if st.Params != nil {
+				step.Params = cloneParam(st.Params).(map[string]any)
+			}
+			steps = append(steps, step)
+		}
+		out = append(out, router.ChainInfo{Name: name, Source: "dormant", Steps: steps})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name == out[j].Name {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// cloneParam copies the containers produced by YAML decoding, including invalid
+// params retained in dormant records that have never passed router validation.
+func cloneParam(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		if v == nil {
+			return v
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = cloneParam(item)
+		}
+		return out
+	case map[any]any:
+		if v == nil {
+			return v
+		}
+		out := make(map[any]any, len(v))
+		for key, item := range v {
+			out[key] = cloneParam(item)
+		}
+		return out
+	case []any:
+		if v == nil {
+			return v
+		}
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = cloneParam(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+// RemoveChain saves a candidate snapshot before removing a runtime or dormant
+// record. Removing a dormant record never changes a config chain of that name.
 func (s *Store) RemoveChain(r *router.Router, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.dormant[name]; exists {
+		// Keep the original map intact for rollback. Store.mu prevents readers
+		// from observing the candidate before persistence has succeeded.
+		original := s.dormant
+		candidate := make(map[string]fileChain, len(original)-1)
+		for key, ch := range original {
+			if key != name {
+				candidate[key] = ch
+			}
+		}
+		s.dormant = candidate
+		runtime := r.RuntimeChains()
+		var err error
+		if _, active := runtime[name]; active {
+			err = r.RemoveChainPersisted(name, s.persist)
+		} else {
+			err = s.persist(runtime)
+		}
+		if err != nil {
+			s.dormant = original
+		}
+		return err
+	}
 	return r.RemoveChainPersisted(name, s.persist)
 }
 

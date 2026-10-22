@@ -142,7 +142,23 @@ decider; these queries do not probe providers.
 ./guvna chains rm myfree
 ```
 
-Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. Removing a config-defined chain is refused: edit its YAML configuration instead. The CLI does not currently express per-step `params`; define them in configuration or use the authenticated management protocol over the local socket when needed. Client API keys cannot manage chains.
+Each step is `provider:model`; provider names must exist in the gateway configuration. Runtime chains are persisted in the gateway's data directory. The CLI does not currently express per-step `params`; define them in configuration or use the authenticated management protocol over the local socket when needed. Client API keys cannot manage chains.
+
+`chains list` includes inactive file records with `SOURCE` set to `dormant`;
+`--json` also includes their original steps and per-step `params`. Step params
+that JSON cannot express (such as YAML mappings with non-string keys or `.nan`)
+are returned as a list-only `params_yaml` string instead of `params`. These records
+are retained when a provider is unavailable or a config-defined chain has the
+same name. Config takes precedence for routing, so a shared name appears twice:
+once as `config` and once as `dormant`. Dormant records do not execute. They are
+retried on the next startup/load, and become active if their providers are
+available, their definitions are valid, and no config chain shadows them.
+
+`chains rm NAME` removes a runtime chain or its dormant file record. If the name
+has both a config chain and a dormant record, only the dormant record is deleted;
+the config chain keeps routing. Removing a config-defined chain without a dormant
+record is refused: edit its YAML configuration instead. A failed persistence
+leaves both the record and the active routes unchanged.
 
 `--socket PATH` and `--token KEY` override the environment for an individual command. Prefer the environment for the token so it is not written into shell history. `--json` emits raw JSON for status, logs, chain lists and chain creation. For example:
 

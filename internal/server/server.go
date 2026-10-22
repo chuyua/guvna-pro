@@ -35,6 +35,7 @@ import (
 	"github.com/creamy-ghost/guvna/internal/selector"
 	"github.com/creamy-ghost/guvna/internal/telemetry"
 	"github.com/creamy-ghost/guvna/internal/vision"
+	"gopkg.in/yaml.v3"
 )
 
 // KeepAliveInterval is how long the relay waits without upstream data before
@@ -303,15 +304,33 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleChainList returns the current chains (config + runtime) with sources.
+// handleChainList returns active and dormant chains with their sources.
 func (s *Server) handleChainList(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		Chains []chainInfo `json:"chains"`
 	}{}
-	for _, c := range s.rtr.ListChains() {
+	var current []router.ChainInfo
+	if s.store != nil {
+		current = s.store.ListChains(s.rtr)
+	} else {
+		current = s.rtr.ListChains()
+	}
+	for _, c := range current {
 		steps := make([]chainStep, 0, len(c.Steps))
 		for _, st := range c.Steps {
-			steps = append(steps, chainStep{Provider: st.Provider, Model: st.Model, Params: st.Params})
+			step := chainStep{Provider: st.Provider, Model: st.Model, Params: st.Params}
+			if _, err := json.Marshal(st.Params); err != nil {
+				// File records may contain YAML values that JSON cannot
+				// express. Preserve those params without breaking the entire list.
+				data, err := yaml.Marshal(st.Params)
+				if err != nil {
+					log.Printf("chains: encode parameters for %q: %v", c.Name, err)
+					http.Error(w, `{"error":{"message":"chain parameters could not be encoded"}}`, http.StatusInternalServerError)
+					return
+				}
+				step.Params, step.ParamsYAML = nil, string(data)
+			}
+			steps = append(steps, step)
 		}
 		resp.Chains = append(resp.Chains, chainInfo{Name: c.Name, Source: c.Source, Steps: steps})
 	}
@@ -320,9 +339,10 @@ func (s *Server) handleChainList(w http.ResponseWriter, r *http.Request) {
 }
 
 type chainStep struct {
-	Provider string         `json:"provider"`
-	Model    string         `json:"model"`
-	Params   map[string]any `json:"params,omitempty"`
+	Provider   string         `json:"provider"`
+	Model      string         `json:"model"`
+	Params     map[string]any `json:"params,omitempty"`
+	ParamsYAML string         `json:"params_yaml,omitempty"`
 }
 
 type chainInfo struct {
@@ -350,7 +370,9 @@ func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	steps := make([]router.Step, 0, len(req.Steps))
-	for _, st := range req.Steps {
+	for i, st := range req.Steps {
+		// params_yaml is list-only metadata, not an alternative create payload.
+		req.Steps[i].ParamsYAML = ""
 		steps = append(steps, router.Step{Provider: st.Provider, Model: st.Model, Params: st.Params})
 	}
 	if s.store != nil {
@@ -377,8 +399,8 @@ func (s *Server) handleChainCreate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(chainInfo{Name: req.Name, Source: "runtime", Steps: req.Steps})
 }
 
-// handleChainDelete removes a runtime chain. Config-defined chains are
-// refused — they live in config.yaml.
+// handleChainDelete removes a runtime or dormant record. A dormant record may
+// share a name with a config-defined chain; deleting it leaves the config intact.
 func (s *Server) handleChainDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var err error
