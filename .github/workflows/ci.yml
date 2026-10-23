@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify release tag safety (no publish)
+        run: bash .github/scripts/test-release-policy.sh
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

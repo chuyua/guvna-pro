@@ -15,10 +15,20 @@ env:
 jobs:
   binary:
     runs-on: ubuntu-latest
+    outputs:
+      release_kind: ${{ steps.classify.outputs.kind }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate tag publication policy
+        id: classify
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          kind="$(bash .github/scripts/release-policy.sh "$VERSION")"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -51,12 +61,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
+          RELEASE_KIND: ${{ steps.classify.outputs.kind }}
         run: |
-          gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
-            --verify-tag --generate-notes --title "$VERSION"
+          if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+            gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
+              --verify-tag --generate-notes --title "$VERSION" \
+              --prerelease --latest=false
+          else
+            gh release create "$VERSION" dist/guvna dist/SHA256SUMS \
+              --verify-tag --generate-notes --title "$VERSION"
+          fi
 
   image:
     needs: binary
+    if: ${{ needs.binary.outputs.release_kind == 'stable' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
