@@ -73,14 +73,22 @@ the container as its service user:
 docker exec -e GUVNA_ADMIN_KEY="$ADMIN_KEY" guvna /guvna status --socket /data/admin.sock
 ```
 
-A normal shutdown removes the socket. Startup refuses a preexisting socket,
-ordinary file or symlink rather than deleting it. After an unclean shutdown,
-confirm that the original gateway is stopped, then remove only its stale
-`admin.sock` before restarting. Keep custom socket paths short enough for the
-operating system's Unix-domain socket path limit. Windows development requires
-AF_UNIX support and uses the containing directory's ACL plus Bearer auth. A short
-ASCII `GUVNA_ADMIN_SOCKET` path may be needed for a non-ASCII development profile;
-unsupported paths never fall back to a TCP management listener.
+A normal shutdown removes the socket. On Linux and supported Unix systems,
+startup automatically replaces only a socket owned by the effective service user
+whose connection attempt explicitly returns `ECONNREFUSED`. Live sockets, ordinary
+files, symlinks and uncertain failures are preserved and startup fails. A
+nonblocking OS lock covers inspection, cleanup and binding so concurrent starts
+cannot remove a newly bound listener. Leave the persistent `<socket>.lock` marker
+in place; the OS releases its lock when the process closes it or exits.
+
+Keep custom socket paths short enough for the operating system's Unix-domain
+socket path limit. Windows development requires AF_UNIX support and uses the
+containing directory's ACL plus Bearer auth. Because portable socket ownership
+metadata is unavailable there, existing Windows socket paths are never removed
+automatically: after an unclean shutdown, confirm the original gateway is stopped
+before removing only its stale `admin.sock`. A short ASCII `GUVNA_ADMIN_SOCKET`
+path may be needed for a non-ASCII development profile; unsupported paths never
+fall back to a TCP management listener.
 
 ## TLS exposure
 
@@ -112,7 +120,9 @@ To rotate a key: edit `.env`, then `docker compose up -d --force-recreate` (or r
 
 The gateway starts with **zero chains**. An admin creates them locally per use
 case; chains persist in the data directory's `chains.yaml` and survive restarts.
-Config-defined chains also load (merged, conflicts skipped with a warning).
+Config-defined chains take precedence over file records with the same name.
+Shadowed file records and records with temporarily unavailable providers remain
+in `chains.yaml` as dormant records, preserving their original steps and params.
 
 ```sh
 export GUVNA_ADMIN_KEY="$ADMIN_KEY"
@@ -121,7 +131,28 @@ guvna chains add myfree --step bazaarlink:qwen/qwen3.7-flash:free --step groq:ll
 guvna chains rm myfree
 ```
 
+`chains list` (including `--json`) shows these inactive records with source
+`dormant`; they do not route requests. A config chain and a dormant file record
+can appear as two rows with the same name. `chains rm NAME` deletes a dormant
+record without changing a config chain of that name; config-only chains still
+require editing `config.yaml`. Deleted dormant records do not return on restart.
+Retained records are retried on the next startup/load and become active when
+their definitions are valid, their providers are available, and any conflicting
+config chain has been removed.
+
+JSON chain lists preserve ordinary step `params`. If YAML parameters
+cannot be represented in JSON, the step exposes a `params_yaml` string instead;
+the file record is retained unchanged and remains removable.
+
 Chat with a chain name as the model, or bypass chains entirely with a provider-prefixed model (`groq/llama-3.3-70b-versatile`). Unknown model → 404 with a pointer to the local chain command.
+
+If `chains.yaml` cannot be parsed, startup preserves it as a uniquely named
+`chains.yaml.corrupt-<UTC timestamp>-<suffix>` backup and logs the parse error and
+backup path. The gateway continues with config-defined chains. Runtime-chain
+writes can then create a fresh `chains.yaml`; restore or repair records from the
+backup first if you need them. If reading the file or creating the backup fails,
+runtime-chain changes are rejected and the original file is left untouched. Fix
+or restore the file and restart the gateway to resume chain management.
 
 ## Observability
 

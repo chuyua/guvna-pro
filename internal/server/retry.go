@@ -112,7 +112,10 @@ func (s *Server) tryUpstream(ctx context.Context, r *http.Request, step router.S
 	if pool == nil {
 		return nil, "", fmt.Errorf("provider %q: no key pool", step.Provider)
 	}
-	payload := mergeParams(withModel(body, step.Model), step.Params)
+	payload, err := mergeParams(withModel(body, step.Model), step.Params)
+	if err != nil {
+		return nil, "", fmt.Errorf("provider %q model %q parameters: %w", step.Provider, step.Model, err)
+	}
 	used := make(map[string]bool)
 	var lastResp *http.Response
 	var lastErr error

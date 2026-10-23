@@ -124,7 +124,7 @@ func parseServe(args []string, stderr io.Writer) (serveOptions, error) {
 	return opts, nil
 }
 
-func serve(args []string, stderr io.Writer) error {
+func serve(args []string, stderr io.Writer) (retErr error) {
 	opts, err := parseServe(args, stderr)
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ func serve(args []string, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("telemetry: %w", err)
 	}
-	defer tm.Close()
+	defer finishTelemetry(tm.Close, &retErr)
 
 	rtr := router.New(cfg)
 	chainStore := chains.New(opts.dataDir)
@@ -195,6 +195,15 @@ func serve(args []string, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return serveEndpoints(ctx, srv, adminServer, publicListener, adminListener)
+}
+
+// Always expose final telemetry flush failures. Losing the last buffered events
+// at shutdown must not turn an otherwise clean exit into a silent success.
+func finishTelemetry(closeFn func() error, result *error) {
+	if err := closeFn(); err != nil {
+		log.Printf("telemetry close: %v", err)
+		*result = errors.Join(*result, fmt.Errorf("telemetry close: %w", err))
+	}
 }
 
 // Both listeners are opened before startup succeeds. Any serving failure stops

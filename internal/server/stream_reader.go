@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -229,14 +230,31 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 	var id, model string
 	var created int64
 	var usage json.RawMessage
+	var usageSize int64
 	choices := make(map[int]*choiceAgg)
 	var choiceOrder []int
-	sc := bufio.NewScanner(io.LimitReader(resp.Body, 256<<20))
-	sc.Buffer(make([]byte, 0, 64*1024), maxStreamEventBytes)
+	limit := maxResponseBytes
+	budget := aggregateBudget{limit: limit}
+	if err := budget.add(int64(len(`{"id":"","object":"chat.completion","created":0,"model":"","choices":[]}`))); err != nil {
+		return nil, err
+	}
+	var input io.Reader = resp.Body
+	eventLimit := maxStreamEventBytes
+	if limit > 0 {
+		input = &aggregateReader{r: resp.Body, remaining: limit, limit: limit}
+		if limit < int64(eventLimit) {
+			eventLimit = int(limit)
+		}
+	}
+	sc := bufio.NewScanner(input)
+	sc.Buffer(make([]byte, 0, min(64*1024, eventLimit+1)), eventLimit+1)
 	d := &sseData{}
 	consume := func(data string) (bool, error) {
 		if strings.TrimSpace(data) == "[DONE]" {
 			return true, nil
+		}
+		if err := checkAggregateStructures(data, limit); err != nil {
+			return false, err
 		}
 		var cm streamChunk
 		if err := json.Unmarshal([]byte(data), &cm); err != nil {
@@ -249,12 +267,21 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 			return false, errors.New("upstream SSE payload has no choices or usage")
 		}
 		if cm.ID != "" {
+			if err := budget.add(quotedJSONSize(cm.ID) - quotedJSONSize(id)); err != nil {
+				return false, err
+			}
 			id = cm.ID
 		}
 		if cm.Model != "" {
+			if err := budget.add(quotedJSONSize(cm.Model) - quotedJSONSize(model)); err != nil {
+				return false, err
+			}
 			model = cm.Model
 		}
 		if cm.Created != 0 {
+			if err := budget.add(int64(len(strconv.FormatInt(cm.Created, 10)) - len(strconv.FormatInt(created, 10)))); err != nil {
+				return false, err
+			}
 			created = cm.Created
 		}
 		seen := make(map[int]bool, len(cm.Choices))
@@ -274,6 +301,13 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 			seen[idx] = true
 			choice := choices[idx]
 			if choice == nil {
+				size := len(aggregateChoiceJSON) + len(strconv.Itoa(idx)) - 1
+				if len(choiceOrder) > 0 {
+					size++
+				}
+				if err := budget.add(int64(size)); err != nil {
+					return false, err
+				}
 				choice = &choiceAgg{calls: make(map[int]*toolCallAgg)}
 				choices[idx] = choice
 				choiceOrder = append(choiceOrder, idx)
@@ -282,12 +316,26 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 				return false, errors.New("upstream choice carried data after finish_reason")
 			}
 			if c.Delta.Content != nil {
+				if err := budget.add(quotedJSONSize(*c.Delta.Content)); err != nil {
+					return false, err
+				}
 				choice.content.WriteString(*c.Delta.Content)
 			}
+			var reasoning string
 			if c.Delta.Reasoning != nil {
-				choice.reasoning.WriteString(*c.Delta.Reasoning)
+				reasoning = *c.Delta.Reasoning
 			} else if c.Delta.ReasoningText != nil {
-				choice.reasoning.WriteString(*c.Delta.ReasoningText)
+				reasoning = *c.Delta.ReasoningText
+			}
+			if reasoning != "" {
+				size := quotedJSONSize(reasoning)
+				if choice.reasoning.Len() == 0 {
+					size += int64(len(`,"reasoning_content":""`))
+				}
+				if err := budget.add(size); err != nil {
+					return false, err
+				}
+				choice.reasoning.WriteString(reasoning)
 			}
 			for _, tc := range c.Delta.ToolCalls {
 				if tc.Index == nil || *tc.Index < 0 {
@@ -296,9 +344,21 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 				idx := *tc.Index
 				agg := choice.calls[idx]
 				if agg == nil {
+					size := len(aggregateToolJSON)
+					if len(choice.callOrder) == 0 {
+						size += len(`,"tool_calls":[]`)
+					} else {
+						size++
+					}
+					if err := budget.add(int64(size)); err != nil {
+						return false, err
+					}
 					agg = &toolCallAgg{}
 					choice.calls[idx] = agg
 					choice.callOrder = append(choice.callOrder, idx)
+				}
+				if err := budget.add(quotedJSONSize(tc.ID) + quotedJSONSize(tc.Type) + quotedJSONSize(tc.Function.Name) + quotedJSONSize(tc.Function.Arguments)); err != nil {
+					return false, err
 				}
 				agg.append(tc)
 			}
@@ -311,10 +371,22 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 				if choice.finish != "" && choice.finish != *c.FinishReason {
 					return false, errors.New("upstream choice has conflicting finish_reason")
 				}
+				if err := budget.add(quotedJSONSize(*c.FinishReason) - quotedJSONSize(choice.finish)); err != nil {
+					return false, err
+				}
 				choice.finish = *c.FinishReason
 			}
 		}
 		if len(cm.Usage) > 0 && string(cm.Usage) != "null" && string(cm.Usage) != "{}" {
+			size := rawJSONSize(cm.Usage)
+			change := size - usageSize
+			if len(usage) == 0 {
+				change += int64(len(`,"usage":`))
+			}
+			if err := budget.add(change); err != nil {
+				return false, err
+			}
+			usageSize = size
 			usage = cm.Usage
 		}
 		return false, nil
@@ -353,7 +425,7 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 		return nil, errors.New("upstream stream omitted a requested choice")
 	}
 	sort.Ints(choiceOrder)
-	outChoices := make([]any, 0, len(choiceOrder))
+	outChoices := make([]aggregateChoice, 0, len(choiceOrder))
 	for _, index := range choiceOrder {
 		choice := choices[index]
 		if choice.finish == "" {
@@ -364,47 +436,28 @@ func (s *Server) aggregateStreamed(resp *http.Response, expectedChoices ...int) 
 		if (choice.finish == "tool_calls" || choice.finish == "function_call") && len(choice.callOrder) == 0 {
 			return nil, errors.New("stream reported tool_calls but carried no tool call")
 		}
-		msg := map[string]any{"role": "assistant", "content": choice.content.String()}
-		if choice.reasoning.Len() > 0 {
-			msg["reasoning_content"] = choice.reasoning.String()
-		}
+		msg := aggregateMessage{Role: "assistant", Content: choice.content.String(), ReasoningContent: choice.reasoning.String()}
 		if len(choice.callOrder) > 0 {
 			sort.Ints(choice.callOrder)
-			out := make([]any, 0, len(choice.callOrder))
+			out := make([]aggregateTool, 0, len(choice.callOrder))
 			for _, idx := range choice.callOrder {
 				agg := choice.calls[idx]
 				if !agg.valid() {
 					return nil, errors.New("upstream tool call is incomplete or invalid")
 				}
-				out = append(out, map[string]any{
-					"id":   agg.id,
-					"type": agg.typ,
-					"function": map[string]any{
-						"name":      agg.name,
-						"arguments": agg.args.String(),
-					},
-				})
+				out = append(out, aggregateTool{ID: agg.id, Type: agg.typ, Function: aggregateToolFunction{Name: agg.name, Arguments: agg.args.String()}})
 			}
-			msg["tool_calls"] = out
+			msg.ToolCalls = out
 		}
-		outChoices = append(outChoices, map[string]any{"index": index, "message": msg, "finish_reason": choice.finish})
+		outChoices = append(outChoices, aggregateChoice{Index: index, Message: msg, FinishReason: choice.finish})
 	}
-	out := map[string]any{
-		"id":      id,
-		"object":  "chat.completion",
-		"created": created,
-		"model":   model,
-		"choices": outChoices,
-	}
-	if len(usage) > 0 {
-		var u any
-		if err := json.Unmarshal(usage, &u); err == nil && u != nil {
-			out["usage"] = u
-		}
-	}
+	out := aggregateResponse{ID: id, Object: "chat.completion", Created: created, Model: model, Choices: outChoices, Usage: usage}
 	body, err := json.Marshal(out)
 	if err != nil {
 		return nil, err
+	}
+	if limit > 0 && int64(len(body)) > limit {
+		return nil, errors.New("aggregated upstream response exceeds body limit")
 	}
 	return &http.Response{
 		StatusCode: http.StatusOK,

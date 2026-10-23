@@ -121,19 +121,6 @@ func TestListenRefusesExistingAndInvalidPaths(t *testing.T) {
 	if _, err := Listen(strings.Repeat("a", 300)); err == nil {
 		t.Fatal("overlong socket path was accepted")
 	}
-	stalePath := shortSocket(t)
-	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: stalePath, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stale.SetUnlinkOnClose(false)
-	stale.Close()
-	if _, err := Listen(stalePath); err == nil {
-		t.Fatal("stale socket was silently replaced")
-	}
-	if _, err := os.Lstat(stalePath); os.IsNotExist(err) {
-		t.Fatal("stale socket was removed")
-	}
 	link := filepath.Join(filepath.Dir(path), "link.sock")
 	if err := os.Symlink(path, link); err == nil {
 		if _, err := Listen(link); err == nil {

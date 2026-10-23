@@ -13,6 +13,8 @@
 package vision
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 
@@ -45,6 +47,9 @@ func Load(path string) (*Registry, error) {
 	}
 	data, err := readFile(path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read vision registry %q: %w", path, err)
+		}
 		return base, nil
 	}
 	var r Registry
